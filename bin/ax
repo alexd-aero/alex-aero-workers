@@ -36,10 +36,21 @@ NGINX_PID_FILE="${RUNTIME_DIR}/nginx.pid"
 BACKEND_LOG_FILE="${RUNTIME_DIR}/backend.log"
 NGINX_TMP="/tmp/robo-workers-nginx"
 UNIT="alex-aero.service"
-VERSION="2.0.0"
+VERSION="2.1.0"
 
 export BACKEND_PORT="${BACKEND_PORT:-17156}"
 export PUBLIC_PORT="${PUBLIC_PORT:-27715}"
+
+# Front proxy: nginx when it's installed, otherwise Node serves the public port
+# itself ("direct"). Force one with AX_PROXY=nginx|direct.
+case "${AX_PROXY:-auto}" in
+  nginx) PROXY=nginx ;;
+  direct|none) PROXY=direct ;;
+  *) if command -v nginx >/dev/null 2>&1; then PROXY=nginx; else PROXY=direct; fi ;;
+esac
+if [ "$PROXY" = direct ]; then
+  export BACKEND_PORT="$PUBLIC_PORT" BIND_HOST="0.0.0.0"
+fi
 
 # alex-aero's own tunnel, exactly as server.js starts it; nothing else matches
 OWN_TUNNEL_RE='cloudflared tunnel --no-autoupdate run --token'
@@ -52,6 +63,8 @@ trap 'spin_stop; printf "%s\n" "$SHOW"; exit 130' INT TERM
 mkdir -p "$STORAGE_DIR" "$RUNTIME_DIR" "$WORKERS_DIR" "$NGINX_DIR"
 
 # --------------------------------------------------------------- toolchain
+[ -x "$ROOT_DIR/.node/bin/node" ] && [ -z "${AX_NODE:-}" ] && export AX_NODE="$ROOT_DIR/.node/bin/node"
+[ -d "$ROOT_DIR/.bin" ] && export PATH="$ROOT_DIR/.bin:$PATH"
 find_node() {
   local n
   for n in "${AX_NODE:-}" "$(command -v node 2>/dev/null || true)" \
@@ -78,18 +91,29 @@ jmerge() {  # jmerge FILE '{"a":1}'   shallow merge, atomic
 }
 jstr() { "$NODE" -e 'process.stdout.write(JSON.stringify(process.argv[1]))' "$1"; }
 
-local_ip() { local ip; ip="$(hostname -I 2>/dev/null | awk '{print $1}')"; echo "${ip:-127.0.0.1}"; }
+local_ip() {
+  local ip
+  ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  [ -n "$ip" ] || ip="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null)"
+  echo "${ip:-127.0.0.1}"
+}
 
 # ------------------------------------------------------- whose process is it
-cmdline() { tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null; }
-alive() { [ -n "${1:-}" ] && [ -d "/proc/$1" ]; }
+if [ -d /proc/self ]; then
+  cmdline() { { tr '\0' ' ' <"/proc/$1/cmdline"; } 2>/dev/null; }
+  parent_of() { awk '{print $4}' "/proc/$1/stat" 2>/dev/null; }
+else  # macOS / BSD
+  cmdline() { ps -o command= -p "$1" 2>/dev/null; }
+  parent_of() { ps -o ppid= -p "$1" 2>/dev/null | tr -d ' '; }
+fi
+alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
 is_ours() {  # a process is ours only if its command line names this folder or our tunnel
   local c; c="$(cmdline "$1")"
   case "$c" in
     *"$ROOT_DIR/server.js"*|*"$NGINX_DIR/nginx.conf"*|*"workerd serve $ROOT_DIR/"*) return 0 ;;
     *"$OWN_TUNNEL_RE"*) local t; t="$(own_token)"; [ -n "$t" ] && [[ "$c" == *"$t"* ]] ;;
     "nginx: worker process"*) # a worker belongs to whichever master spawned it
-      local pp; pp="$(awk '{print $4}' "/proc/$1/stat" 2>/dev/null)"; [ -n "$pp" ] && is_ours "$pp" ;;
+      local pp; pp="$(parent_of "$1")"; [ -n "$pp" ] && is_ours "$pp" ;;
     *) return 1 ;;
   esac
 }
@@ -109,7 +133,12 @@ tunnel_pid() {  # only the connector running alex-aero's own token
   pgrep -f -- "$OWN_TUNNEL_RE $t" 2>/dev/null | head -1
 }
 port_pids() {  # sudo first: without it, ss hides other users' (root, docker) listeners
-  { sudo -n ss -Hltnp "sport = :$1" 2>/dev/null || ss -Hltnp "sport = :$1" 2>/dev/null; } | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u; }
+  if command -v ss >/dev/null 2>&1; then
+    { sudo -n ss -Hltnp "sport = :$1" 2>/dev/null || ss -Hltnp "sport = :$1" 2>/dev/null; } | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u
+  else
+    { sudo -n lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null || lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null; } | sort -u
+  fi
+}
 port_who() {  # "name (pid N)" of whatever listens on a port, or nothing
   local p; p="$(port_pids "$1" | head -1)"
   [ -n "$p" ] && printf '%s (pid %s)' "$(ps -o comm= -p "$p" 2>/dev/null)" "$p"
@@ -121,21 +150,29 @@ healthy() { curl -fsS -m 2 "http://127.0.0.1:${BACKEND_PORT}/api/health" >/dev/n
 proxied() { curl -s -o /dev/null -m 2 -w '%{http_code}' "http://127.0.0.1:${PUBLIC_PORT}/" 2>/dev/null | grep -qv '^000$'; }
 uptime_of() { ps -o etime= -p "$1" 2>/dev/null | tr -d ' '; }
 
-autostart_on() { systemctl is-enabled --quiet "$UNIT" 2>/dev/null; }
+autostart_on() { command -v systemctl >/dev/null 2>&1 && systemctl is-enabled --quiet "$UNIT" 2>/dev/null; }
 # with autostart on, start/stop go through systemd so the two never fight
 use_service() { [ -z "${AX_FROM_SYSTEMD:-}" ] && autostart_on; }
 
 # ------------------------------------------------------------- dependencies
+pkg_install() {
+  if command -v apt-get >/dev/null 2>&1; then sudo -n apt-get update -qq >/dev/null 2>&1; sudo -n apt-get install -y -qq "$@" >/dev/null 2>&1
+  elif command -v dnf >/dev/null 2>&1; then sudo -n dnf install -y -q "$@" >/dev/null 2>&1
+  elif command -v pacman >/dev/null 2>&1; then sudo -n pacman -S --noconfirm --needed "$@" >/dev/null 2>&1
+  elif command -v apk >/dev/null 2>&1; then sudo -n apk add --no-cache "$@" >/dev/null 2>&1
+  elif command -v brew >/dev/null 2>&1; then brew install "$@" >/dev/null 2>&1
+  fi
+}
 ensure_deps() {
   local fix="${1:-1}"
-  if ! command -v nginx >/dev/null 2>&1; then
+  if [ "$PROXY" = nginx ] && ! command -v nginx >/dev/null 2>&1; then
     [ "$fix" = 1 ] || return 1
     spin_start "installing nginx"
-    sudo -n apt-get update -qq >/dev/null 2>&1; sudo -n apt-get install -y -qq nginx curl >/dev/null 2>&1
+    pkg_install nginx
     spin_stop
     # the package enables its own nginx on :80; that one was not asked for
     sudo -n systemctl disable --now nginx >/dev/null 2>&1 || true
-    command -v nginx >/dev/null 2>&1 && ok "nginx installed" || die "could not install nginx (sudo apt-get install nginx)"
+    command -v nginx >/dev/null 2>&1 && ok "nginx installed" || die "could not install nginx; install it, or run with AX_PROXY=direct"
   fi
   if ! command -v workerd >/dev/null 2>&1; then
     [ "$fix" = 1 ] || return 1
@@ -151,8 +188,13 @@ ensure_deps() {
     local a=amd64
     case "$(uname -m)" in aarch64|arm64) a=arm64 ;; arm*) a=arm ;; esac
     spin_start "installing cloudflared ($a)"
-    curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$a" -o /tmp/cloudflared.ax \
-      && chmod +x /tmp/cloudflared.ax && sudo -n mv /tmp/cloudflared.ax /usr/local/bin/cloudflared
+    if [ "$(uname -s)" = Darwin ]; then
+      brew install cloudflared >/dev/null 2>&1
+    else
+      mkdir -p "$ROOT_DIR/.bin"
+      curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$a" -o "$ROOT_DIR/.bin/cloudflared" \
+        && chmod +x "$ROOT_DIR/.bin/cloudflared" && export PATH="$ROOT_DIR/.bin:$PATH"
+    fi
     spin_stop
     command -v cloudflared >/dev/null 2>&1 && ok "cloudflared installed" || warn "cloudflared did not install; tunnels won't run"
   fi
@@ -255,6 +297,12 @@ http {
         ""      "";
     }
 
+    # pooled connections to the backend (was: a new TCP connection per request)
+    upstream ax_backend {
+        server 127.0.0.1:${BACKEND_PORT};
+        keepalive 64;
+    }
+
     server {
         listen 0.0.0.0:${PUBLIC_PORT} default_server;
         listen [::]:${PUBLIC_PORT} default_server;
@@ -266,7 +314,7 @@ http {
         proxy_pass_header WWW-Authenticate;
 
         location / {
-            proxy_pass http://127.0.0.1:${BACKEND_PORT};
+            proxy_pass http://ax_backend;
             proxy_http_version 1.1;
 
             proxy_set_header Host \$http_host;
@@ -331,7 +379,8 @@ cmd_down() {
 
 preflight_ports() {
   local port f
-  for port in "$PUBLIC_PORT" "$BACKEND_PORT"; do
+  local ports="$PUBLIC_PORT"; [ "$BACKEND_PORT" != "$PUBLIC_PORT" ] && ports="$ports $BACKEND_PORT"
+  for port in $ports; do
     f="$(port_foreign "$port" || true)"
     if [ -n "$f" ]; then
       bad "port $port is taken by ${B}$(port_who "$port")${NC}: $(cmdline "$f" | cut -c1-80)"
@@ -345,23 +394,28 @@ preflight_ports() {
 do_up() {
   preflight_ports || exit 1   # before stopping anything: a bad port changes nothing
   QUIET=1 do_down
-  write_nginx_conf
-
-  spin_start "starting nginx on :$PUBLIC_PORT"
-  local err
-  err="$(nginx -c "$NGINX_DIR/nginx.conf" -e "$RUNTIME_DIR/nginx-error.log" 2>&1)" ||
-    err="$(sudo -n nginx -c "$NGINX_DIR/nginx.conf" -e "$RUNTIME_DIR/nginx-error.log" 2>&1)" || {
-      spin_stop; bad "nginx would not start:"; printf '%s\n' "$err" | tail -3 | sed 's/^/      /'; exit 1; }
-  spin_stop; ok "nginx proxy on ${B}:$PUBLIC_PORT${NC}"
+  if [ "$PROXY" = nginx ]; then
+    write_nginx_conf
+    spin_start "starting nginx on :$PUBLIC_PORT"
+    local err
+    err="$(nginx -c "$NGINX_DIR/nginx.conf" -e "$RUNTIME_DIR/nginx-error.log" 2>&1)" ||
+      err="$(sudo -n nginx -c "$NGINX_DIR/nginx.conf" -e "$RUNTIME_DIR/nginx-error.log" 2>&1)" || {
+        spin_stop; bad "nginx would not start:"; printf '%s\n' "$err" | tail -3 | sed 's/^/      /'; exit 1; }
+    spin_stop; ok "nginx proxy on ${B}:$PUBLIC_PORT${NC}"
+  fi
 
   spin_start "starting the backend on :$BACKEND_PORT"
   : >"$BACKEND_LOG_FILE"
-  setsid nohup "$NODE" "$ROOT_DIR/server.js" >>"$BACKEND_LOG_FILE" 2>&1 </dev/null &
+  if command -v setsid >/dev/null 2>&1; then
+    setsid nohup "$NODE" "$ROOT_DIR/server.js" >>"$BACKEND_LOG_FILE" 2>&1 </dev/null &
+  else
+    nohup "$NODE" "$ROOT_DIR/server.js" >>"$BACKEND_LOG_FILE" 2>&1 </dev/null &
+  fi
   local bp=$! i
   echo "$bp" >"$BACKEND_PID_FILE"
   for i in $(seq 1 100); do healthy && break; alive "$bp" || break; sleep 0.1; done
   spin_stop
-  if healthy; then ok "backend on ${B}127.0.0.1:$BACKEND_PORT${NC} ${DIM}(pid $bp)${NC}"
+  if healthy; then ok "backend on ${B}${BIND_HOST:-127.0.0.1}:$BACKEND_PORT${NC} ${DIM}(pid $bp${PROXY:+, $PROXY})${NC}"
   else
     bad "the backend didn't come up. Last lines of its log:"
     tail -n 8 "$BACKEND_LOG_FILE" | sed 's/^/      /'
@@ -444,7 +498,9 @@ cmd_status() {
   if [ -n "$bp" ] && healthy; then row up backend "running · :$BACKEND_PORT · pid $bp · up $(uptime_of "$bp")"
   elif [ -n "$bp" ]; then row warn backend "pid $bp is alive but not answering · ax logs"
   else row down backend "stopped · ax up"; fi
-  if [ -n "$np" ] && proxied; then row up proxy "nginx · :$PUBLIC_PORT · pid $np"
+  if [ "$PROXY" = direct ]; then
+    if [ -n "$bp" ] && proxied; then row up proxy "direct · Node serves :$PUBLIC_PORT"; else row down proxy "direct · not answering on :$PUBLIC_PORT"; fi
+  elif [ -n "$np" ] && proxied; then row up proxy "nginx · :$PUBLIC_PORT · pid $np"
   elif [ -n "$np" ]; then row warn proxy "nginx up, backend not answering"
   else
     local f; f="$(port_foreign "$PUBLIC_PORT" || true)"
@@ -552,7 +608,8 @@ cmd_doctor() {
   if command -v workerd >/dev/null; then row up workerd "$(workerd --version 2>/dev/null | awk '{print $2}')"; else row down workerd "missing"; fi
   if command -v cloudflared >/dev/null; then row up cloudflared "$(cloudflared --version 2>/dev/null | awk '{print $3}')"; else row warn cloudflared "missing · only needed for a tunnel"; fi
   if sudo -n true 2>/dev/null; then row up sudo "passwordless"; else row warn sudo "asks for a password · nginx may need it"; fi
-  for port in "$PUBLIC_PORT" "$BACKEND_PORT"; do
+  local ports="$PUBLIC_PORT"; [ "$BACKEND_PORT" != "$PUBLIC_PORT" ] && ports="$ports $BACKEND_PORT"
+  for port in $ports; do
     f="$(port_foreign "$port" || true)"
     if [ -n "$f" ]; then row down ":$port" "taken by $(port_who "$port")"
     elif [ -n "$(port_pids "$port")" ]; then row up ":$port" "Alex-Aero"
@@ -568,6 +625,7 @@ cmd_autostart() {
   case "${1:-}" in
     on)
       need_node
+      command -v systemctl >/dev/null 2>&1 || die "autostart uses systemd. On macOS use Docker (restart: unless-stopped) or a launchd agent"
       sudo -n true 2>/dev/null || die "needs passwordless sudo to install a service"
       sudo -n tee "/etc/systemd/system/$UNIT" >/dev/null <<EOF
 [Unit]
@@ -584,6 +642,7 @@ Environment=AX_FROM_SYSTEMD=1
 Environment=AX_NODE=$NODE
 Environment=PUBLIC_PORT=$PUBLIC_PORT
 Environment=BACKEND_PORT=$BACKEND_PORT
+Environment=AX_PROXY=$PROXY
 ExecStart=$ROOT_DIR/bin/ax up --foreground
 ExecStop=$ROOT_DIR/bin/ax down --quiet
 Restart=always

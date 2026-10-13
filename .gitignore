@@ -1,0 +1,10 @@
+# everything a running install creates
+storage/
+.workerd-local/
+.node/
+.bin/
+node_modules/
+nginx/nginx.conf
+cloudflare-records.json
+.env
+*.log

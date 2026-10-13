@@ -1,0 +1,11 @@
+.git
+storage
+.workerd-local
+.node
+.bin
+node_modules
+nginx
+.orig
+.env
+*.log
+docs

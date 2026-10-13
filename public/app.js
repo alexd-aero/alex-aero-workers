@@ -47,6 +47,53 @@ function ago(iso) {
   if (h < 48) return `${h}h ago`;
   return `${Math.round(h / 24)}d ago`;
 }
+function until(iso) {
+  if (!iso) return 'never';
+  const s = Math.round((new Date(iso).getTime() - Date.now()) / 1000);
+  if (s <= 0) return 'now';
+  if (s < 60) return `in ${s}s`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `in ${m}m`;
+  const h = Math.round(m / 60);
+  if (h < 48) return `in ${h}h`;
+  return `in ${Math.round(h / 24)}d`;
+}
+// plain-English for the common cron shapes; anything else is shown as-is
+// Schedules run on the server's clock, so show their times in its zone.
+function serverTime(iso) {
+  const tz = S.overview && S.overview.system && S.overview.system.timezone;
+  const mine = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const opts = { weekday: 'short', hour: '2-digit', minute: '2-digit' };
+  try {
+    if (tz && tz !== mine) return `${new Date(iso).toLocaleString([], { ...opts, timeZone: tz })} ${tz} (server time)`;
+  } catch (_) {}
+  return new Date(iso).toLocaleString([], opts);
+}
+function describeCron(expr) {
+  const e = String(expr).trim().toLowerCase();
+  const alias = { '@hourly': 'Every hour', '@daily': 'Every day at midnight', '@midnight': 'Every day at midnight', '@weekly': 'Every Sunday at midnight', '@monthly': 'On the 1st of every month', '@yearly': 'Every 1 January', '@annually': 'Every 1 January' };
+  if (alias[e]) return alias[e];
+  const f = e.split(/\s+/);
+  if (f.length !== 5) return expr;
+  const [mi, h, dom, mo, dow] = f;
+  const pad = (n) => String(n).padStart(2, '0');
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  if (dom === '*' && mo === '*') {
+    if (mi === '*' && h === '*' && dow === '*') return 'Every minute';
+    const step = mi.match(/^\*\/(\d+)$/);
+    if (step && h === '*' && dow === '*') return `Every ${step[1]} minutes`;
+    if (/^\d+$/.test(mi) && h === '*' && dow === '*') return mi === '0' ? 'Every hour' : `Every hour at :${pad(mi)}`;
+    const hs = h.match(/^\*\/(\d+)$/);
+    if (/^\d+$/.test(mi) && hs && dow === '*') return `Every ${hs[1]} hours at :${pad(mi)}`;
+    if (/^\d+$/.test(mi) && /^\d+$/.test(h)) {
+      const at = `${pad(h)}:${pad(mi)}`;
+      if (dow === '*') return `Every day at ${at}`;
+      if (dow === '1-5') return `Weekdays at ${at}`;
+      if (/^\d$/.test(dow)) return `Every ${days[Number(dow)]} at ${at}`;
+    }
+  }
+  return expr;
+}
 function clock(iso) {
   return iso ? new Date(iso).toLocaleTimeString([], { hour12: false }) : '';
 }
@@ -759,6 +806,7 @@ const WTABS = [
   { id: 'code', label: 'Code' },
   { id: 'logs', label: 'Logs' },
   { id: 'deployments', label: 'Versions' },
+  { id: 'kv', label: 'Storage' },
   { id: 'settings', label: 'Settings' }
 ];
 
@@ -784,7 +832,7 @@ async function viewWorker(view, name, tab) {
     (t) =>
       `<a class="tab ${t.id === tab ? 'active' : ''}" role="tab" aria-selected="${t.id === tab}" href="#/w/${enc(w.name)}/${t.id}">${t.label}${
         t.id === 'deployments' && w.deployments.length ? `<span class="n">${w.deployments.length}</span>` : ''
-      }${t.id === 'overview' && w.summary.activeIssues ? `<span class="n err">${w.summary.activeIssues}</span>` : ''}</a>`
+      }${t.id === 'kv' && w.kv && w.kv.keys ? `<span class="n">${w.kv.keys}</span>` : ''}${t.id === 'overview' && w.summary.activeIssues ? `<span class="n err">${w.summary.activeIssues}</span>` : ''}</a>`
   ).join('')}</div>`;
   const head = `<div class="page-head" style="margin-bottom:18px"><div style="min-width:0"><h1 class="page-title">${esc(w.name)}</h1>
     <p class="page-sub"><span class="mono">${esc(w.summary.publishingPath)}</span> · ${esc(langName(w.language))} · ${esc(RUNTIME_OF(w.language))} · edited ${esc(ago(w.updatedAt))}</p></div></div>`;
@@ -802,6 +850,7 @@ async function viewWorker(view, name, tab) {
   if (tab === 'overview') renderWorkerOverview(body, w);
   if (tab === 'logs') renderWorkerLogs(body, w);
   if (tab === 'deployments') renderDeployments(body, w);
+  if (tab === 'kv') renderKv(body, w);
   if (tab === 'settings') renderSettings(body, w);
 }
 
@@ -1117,15 +1166,110 @@ function renderDeployments(body, w) {
   };
 }
 
+/* ------------------------------------------------------------------ storage */
+function renderKv(body, w) {
+  const base = `/api/workers/${enc(w.name)}/kv`;
+  body.innerHTML = `
+    <div class="figures three" id="kvFigs"></div>
+    <div class="grid2" style="align-items:start;margin-bottom:16px">
+      <div class="card">
+        <div class="card-head"><h3>Use it from your code</h3></div>
+        <div class="card-body"><pre class="code-view" style="max-height:none;background:var(--card)">${esc(`await env.KV.put('visits', String(n), { expirationTtl: 3600 });
+const visits = await env.KV.get('visits');            // string or null
+const prefs  = await env.KV.get('prefs', 'json');      // parsed JSON
+const { keys } = await env.KV.list({ prefix: 'user:' });
+await env.KV.delete('visits');`)}</pre>
+          <p class="hint" style="margin:10px 0 0">Python and Shell workers get <span class="mono">AX_KV_URL</span> and <span class="mono">AX_KV_TOKEN</span>: GET / PUT / DELETE <span class="mono">$AX_KV_URL/&lt;key&gt;</span> with header <span class="mono">x-ax-token</span>.</p></div>
+      </div>
+      <form class="card" id="kvAdd">
+        <div class="card-head"><h3>Add or change a key</h3></div>
+        <div class="card-body stack">
+          <div class="field"><label for="kvK">Key</label><input class="input mono" id="kvK" placeholder="user:42" required></div>
+          <div class="field"><label for="kvV">Value</label><textarea class="textarea mono" id="kvV" rows="3" placeholder='{"theme":"cream"}'></textarea></div>
+          <div class="row"><div class="field" style="width:160px"><label for="kvT">Expires after</label><select class="select" id="kvT"><option value="0">Never</option><option value="3600">1 hour</option><option value="86400">1 day</option><option value="604800">1 week</option></select></div><span class="grow"></span><button class="btn primary" style="align-self:flex-end">Save key</button></div>
+        </div>
+      </form>
+    </div>
+    <div class="card">
+      <div class="toolbar" style="margin:0;padding:14px 16px 8px"><div class="search">${icon('search')}<input class="input" id="kvQ" placeholder="Filter by prefix…" aria-label="Filter keys by prefix"></div><span class="grow"></span><button class="btn sm danger" id="kvClear" type="button">Delete all keys</button></div>
+      <div id="kvList"></div>
+    </div>`;
+  const load = async () => {
+    const d = await attempt(() => api('GET', `${base}?prefix=${enc($('#kvQ').value.trim())}&limit=100`));
+    if (!d) return;
+    $('#kvFigs').innerHTML = `
+      <div class="fig"><div class="k">Keys</div><div class="v">${num(d.totalKeys)}</div><div class="f">${d.list_complete ? 'All shown below' : 'First 100 shown'}</div></div>
+      <div class="fig"><div class="k">Size</div><div class="v">${bytes(d.totalBytes)}</div><div class="f">of 128 MB for this worker</div><div class="meter"><i style="width:${Math.min(100, (d.totalBytes / (128 * 1024 * 1024)) * 100)}%"></i></div></div>
+      <div class="fig"><div class="k">Stored at</div><div class="v" style="font-size:15px;padding-top:10px" class="mono">storage/kv/${esc(w.name)}.json</div><div class="f">Survives restarts and updates</div></div>`;
+    $('#kvList').innerHTML = d.keys.length
+      ? `<div class="table-scroll"><table class="table"><thead><tr><th>Key</th><th>Value</th><th class="num">Size</th><th>Expires</th><th></th></tr></thead><tbody>${d.keys
+          .map(
+            (k) => `<tr><td class="mono">${esc(k.name)}</td><td class="mono" style="max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-2)">${k.preview === null ? '<span class="hint">binary</span>' : esc(k.preview)}</td><td class="num">${bytes(k.size)}</td><td style="color:var(--muted)">${k.expiration ? esc(until(new Date(k.expiration * 1000).toISOString())) : 'never'}</td><td style="text-align:right;white-space:nowrap"><button class="icon-btn sm" data-edit="${esc(k.name)}" title="Edit">${icon('edit')}</button><button class="icon-btn sm" data-del="${esc(k.name)}" title="Delete">${icon('trash')}</button></td></tr>`
+          )
+          .join('')}</tbody></table></div>`
+      : `<div class="empty"><h4>No keys${$('#kvQ').value ? ' with that prefix' : ' yet'}</h4><p>Write some with <span class="mono">env.KV.put()</span> or the form above.</p></div>`;
+    body.__keys = d.keys;
+  };
+  $('#kvQ').addEventListener('input', debounce(load, 200));
+  $('#kvAdd').onsubmit = async (e) => {
+    e.preventDefault();
+    const r = await attempt(() => api('PUT', base, { key: $('#kvK').value.trim(), value: $('#kvV').value, ttl: Number($('#kvT').value) }), 'Key saved');
+    if (r) {
+      $('#kvV').value = '';
+      load();
+    }
+  };
+  $('#kvClear').onclick = async () => {
+    if (!(await confirmDialog({ title: 'Delete every key?', text: `This empties the KV store of <b>${esc(w.name)}</b>.`, ok: 'Delete all', danger: true, typeToConfirm: w.name }))) return;
+    if (await attempt(() => api('DELETE', `${base}?all=1`), 'All keys deleted')) load();
+  };
+  $('#kvList').onclick = async (e) => {
+    const del = e.target.closest('[data-del]');
+    if (del) {
+      if (await attempt(() => api('DELETE', `${base}?key=${enc(del.dataset.del)}`), 'Key deleted')) load();
+      return;
+    }
+    const ed = e.target.closest('[data-edit]');
+    if (ed) {
+      const k = (body.__keys || []).find((x) => x.name === ed.dataset.edit);
+      $('#kvK').value = ed.dataset.edit;
+      $('#kvV').value = k && k.preview !== null ? k.preview : '';
+      $('#kvV').focus();
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  };
+  load();
+}
+
 /* ---------------------------------------------------------------- settings */
 function renderSettings(body, w) {
   const files = (w.files || []).map((f) => f.name);
   const obs = w.observabilityConfig || {};
   const envs = Object.entries(w.bindings || {});
+  const crons = w.crons || [];
   body.innerHTML = `
     <div class="stack" style="gap:16px">
     <div class="card">
-      <div class="card-head" style="padding-bottom:0"><h3>General</h3></div>
+      <div class="card-head"><h3>Schedules</h3><span class="sub">Run this worker on a timer${RUNTIME_OF(w.language) === 'workerd' ? ' (calls <span class="mono">scheduled()</span>)' : ''}</span>
+        <span class="tools"><button class="btn sm ghost" type="button" id="cronTest">Run once now</button></span></div>
+      ${crons
+        .map(
+          (j) => `<div class="set-row"><div style="min-width:0"><h4>${esc(describeCron(j.expr))} <span class="mono hint" style="font-weight:400;margin-left:6px">${esc(j.expr)}</span></h4>
+          <p>Next ${esc(j.next ? `${until(j.next)} · ${serverTime(j.next)}` : 'never (check the fields)')}${j.lastRunAt ? ` · last ran ${esc(ago(j.lastRunAt))}, <span class="status ${statusClass(j.lastStatus)}">${esc(j.lastStatus)}</span> in ${esc(ms(j.lastMs))}` : ''}</p></div>
+          <div class="row"><button class="btn sm" type="button" data-cron-run="${esc(j.id)}">Run now</button><button class="icon-btn" type="button" data-cron-del="${esc(j.id)}" title="Remove schedule">${icon('x')}</button></div></div>`
+        )
+        .join('')}
+      <form class="card-body row" id="cronAdd" style="${crons.length ? 'border-top:1px solid var(--line);padding-top:16px' : ''}">
+        <select class="select" id="cronPreset" style="width:210px" aria-label="Schedule preset">
+          <option value="">Pick a schedule…</option><option>*/5 * * * *</option><option>*/15 * * * *</option><option>@hourly</option><option>0 9 * * *</option><option>0 9 * * 1-5</option><option>@daily</option><option>@weekly</option>
+        </select>
+        <input class="input mono grow" id="cronExpr" placeholder="or type one: minute hour day month weekday" aria-label="Cron expression">
+        <button class="btn">Add schedule</button>
+        <span class="hint" id="cronHint" style="width:100%"></span>
+      </form>
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>General</h3></div>
       <div class="set-row"><div><h4>Name</h4><p>Renaming also moves its default URL from /${esc(w.name)}.</p></div>
         <form class="row" id="fRename"><input class="input mono" style="width:220px" id="sName" value="${esc(w.name)}" aria-label="Worker name" maxlength="64"><button class="btn">Rename</button></form></div>
       <div class="set-row"><div><h4>Entry file</h4><p>The file that runs on each request. Its type decides the runtime (${esc(RUNTIME_OF(w.language))} now).</p></div>
@@ -1174,6 +1318,32 @@ function renderSettings(body, w) {
     </div>`;
 
   const base = `/api/workers/${enc(w.name)}`;
+  const cronApi = (payload, msg) => attempt(() => api('POST', `${base}/schedules`, payload), msg);
+  $('#cronPreset').onchange = (e) => {
+    $('#cronExpr').value = e.target.value;
+    $('#cronHint').textContent = e.target.value ? describeCron(e.target.value) : '';
+  };
+  $('#cronExpr').addEventListener('input', (e) => ($('#cronHint').textContent = e.target.value.trim() ? describeCron(e.target.value) : ''));
+  $('#cronAdd').onsubmit = async (e) => {
+    e.preventDefault();
+    const expr = $('#cronExpr').value.trim();
+    if (!expr) return $('#cronExpr').focus();
+    if (await cronApi({ add: expr }, `Scheduled: ${describeCron(expr)}`)) route();
+  };
+  $('#cronTest').onclick = async () => {
+    const r = await cronApi({ run: 'manual' });
+    if (r) toast('Ran once. See the Logs tab for output');
+  };
+  body.addEventListener('click', async (e) => {
+    const run = e.target.closest('[data-cron-run]');
+    if (run) {
+      run.disabled = true;
+      if (await cronApi({ run: run.dataset.cronRun }, 'Ran it')) route();
+      run.disabled = false;
+    }
+    const del = e.target.closest('[data-cron-del]');
+    if (del && (await cronApi({ remove: del.dataset.cronDel }, 'Schedule removed'))) route();
+  });
   $('#fRename').onsubmit = async (e) => {
     e.preventDefault();
     const n = $('#sName').value.trim();

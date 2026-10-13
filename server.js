@@ -28,6 +28,9 @@ const CF_RECORDS_FILE = path.join(ROOT_DIR, 'cloudflare-records.json');
 
 const BACKEND_PORT = parseInt(process.env.BACKEND_PORT || '17156', 10);
 const PUBLIC_PORT = parseInt(process.env.PUBLIC_PORT || '27715', 10);
+// 127.0.0.1 behind nginx (the default). Standalone/Docker: BIND_HOST=0.0.0.0 and
+// BACKEND_PORT=PUBLIC_PORT, so Node serves the public port itself.
+const BIND_HOST = process.env.BIND_HOST || '127.0.0.1';
 
 [STORAGE_DIR, WORKERS_DIR, RUNTIME_DIR, PUBLIC_DIR].forEach((dir) => {
   if (!fs.existsSync(dir)) {
@@ -1008,7 +1011,82 @@ function readWorkerCodeFromStorage(name, targetFile) {
   return '';
 }
 
+// ---- hot-path cache: a worker's files, entry code and routing facts are read
+// from disk once and reused until a file in its folder changes (fs.watch) or
+// the API edits it. (Was: every request re-read and re-hashed every file.)
+const bundleCache = new Map();
+const bundleWatchers = new Map();
+function watchWorkerDir(name) {
+  if (bundleWatchers.has(name)) return;
+  try {
+    const w = fs.watch(path.join(WORKERS_DIR, name), (_evt, file) => {
+      if (file === 'meta.json' || String(file || '').endsWith('.tmp')) return;
+      bundleCache.delete(name);
+    });
+    w.on('error', () => {
+      w.close();
+      bundleWatchers.delete(name);
+      bundleCache.delete(name);
+    });
+    bundleWatchers.set(name, w);
+  } catch (_) {}
+}
+function unwatchWorkerDir(name) {
+  const w = bundleWatchers.get(name);
+  if (w) w.close();
+  bundleWatchers.delete(name);
+}
+const JS_FILE_RE = /\.(js|mjs|cjs|ts|tsx|jsx)$/i;
+function getWorkerBundle(name) {
+  let b = bundleCache.get(name);
+  if (b) return b;
+  const meta = state.workers[name] || {};
+  const files = listWorkerFiles(name);
+  const entry = files.find((f) => f.name === meta.filename) || files[0];
+  const hasExecutableJsWorker = files.some(
+    (f) => JS_FILE_RE.test(f.name) && (/export\s+default\b/.test(f.content) || /addEventListener\s*\(\s*['"]fetch['"]/.test(f.content))
+  );
+  b = {
+    files,
+    filesMap: Object.fromEntries(files.map((f) => [f.name, f.content])),
+    rawCode: entry ? entry.content : '',
+    totalBytes: files.reduce((n, f) => n + (f.sizeBytes || 0), 0),
+    hasExecutableJsWorker,
+    htmlEntryFile: !hasExecutableJsWorker && files.find((f) => /\.html?$/i.test(f.name)),
+    mountPrefixes: Array.from(
+      new Set([
+        `/${name}`,
+        extractPublishingPath(meta.publishingLink || meta.publishingPath, name),
+        ...(Array.isArray(meta.customRoutes) ? meta.customRoutes.map((r) => extractPublishingPath(r.pattern || r.path, name)) : [])
+      ])
+    ).filter(Boolean)
+  };
+  bundleCache.set(name, b);
+  watchWorkerDir(name);
+  return b;
+}
+function workerLanguage(meta) {
+  const fileInferredLang = inferLanguageFromFilename(meta.filename);
+  return fileInferredLang && fileInferredLang !== 'plaintext' && meta.language === 'javascript' && !/\.(js|jsx|mjs|cjs)$/i.test(meta.filename || '')
+    ? fileInferredLang
+    : meta.language || fileInferredLang || 'javascript';
+}
+function isWorkerdWorker(name) {
+  const meta = state.workers[name];
+  return Boolean(meta) && getLangSpec(workerLanguage(meta)).runtime === 'workerd';
+}
+// Start the new version in the background right after a save, so the next
+// visitor doesn't pay for the cold start.
+function prewarmSoon(name) {
+  setTimeout(() => {
+    if (isWorkerdWorker(name)) ensureWorkerdInstance(name).catch(() => {});
+  }, 60).unref();
+}
+
 function invalidateWorkerRuntime(workerName, removeRunDir = false) {
+  bundleCache.delete(workerName);
+  if (!removeRunDir && state.workers[workerName]) prewarmSoon(workerName);
+  else unwatchWorkerDir(workerName);
   if (removeRunDir && workerName) {
     try {
       fs.rmSync(path.join(RUNTIME_DIR, workerName), { recursive: true, force: true });
@@ -1329,6 +1407,174 @@ function parseClientAndDevice(req, isDashboardHttp = false) {
 // ============================================================================
 const workerdPool = new Map();
 
+// Secret shared with this boot's worker processes (KV calls, cron triggers).
+const INTERNAL_TOKEN = crypto.randomBytes(24).toString('hex');
+
+// ============================================================================
+// KV: a Workers-KV-style key/value store per worker, persisted under storage/kv
+// ============================================================================
+const KV_DIR = path.join(STORAGE_DIR, 'kv');
+const KV_LIMITS = { keyBytes: 512, valueBytes: 4 * 1024 * 1024, workerBytes: 128 * 1024 * 1024, listMax: 1000 };
+const kvStores = new Map(); // worker -> { map: Map(key -> { v: base64, e: expiresAtMs }), bytes }
+const kvDirty = new Set();
+let kvFlushTimer = null;
+const kvFile = (name) => path.join(KV_DIR, `${name}.json`);
+function kvStore(name) {
+  let st = kvStores.get(name);
+  if (st) return st;
+  st = { map: new Map(), bytes: 0 };
+  try {
+    const raw = JSON.parse(fs.readFileSync(kvFile(name), 'utf8'));
+    for (const [k, v] of Object.entries(raw || {})) {
+      if (v && typeof v.v === 'string' && (!v.e || v.e > Date.now())) {
+        st.map.set(k, v);
+        st.bytes += Buffer.byteLength(k) + Buffer.byteLength(v.v, 'base64');
+      }
+    }
+  } catch (_) {}
+  kvStores.set(name, st);
+  return st;
+}
+function kvPersistSoon(name) {
+  kvDirty.add(name);
+  if (kvFlushTimer) return;
+  kvFlushTimer = setTimeout(kvFlush, 400);
+}
+function kvFlush() {
+  if (kvFlushTimer) clearTimeout(kvFlushTimer);
+  kvFlushTimer = null;
+  if (!kvDirty.size) return;
+  fs.mkdirSync(KV_DIR, { recursive: true });
+  for (const name of kvDirty) {
+    const st = kvStores.get(name);
+    if (!st) continue;
+    try {
+      writeJsonAtomic(kvFile(name), Object.fromEntries(st.map));
+    } catch (err) {
+      console.error(`KV write failed for ${name}:`, err.message);
+    }
+  }
+  kvDirty.clear();
+}
+function kvGetEntry(name, key) {
+  const st = kvStore(name);
+  const v = st.map.get(key);
+  if (!v) return null;
+  if (v.e && v.e <= Date.now()) {
+    st.map.delete(key);
+    st.bytes -= Buffer.byteLength(key) + Buffer.byteLength(v.v, 'base64');
+    kvPersistSoon(name);
+    return null;
+  }
+  return v;
+}
+function kvPut(name, key, buf, ttlSec) {
+  const st = kvStore(name);
+  if (Buffer.byteLength(key) > KV_LIMITS.keyBytes) throw new HttpError(413, `Key longer than ${KV_LIMITS.keyBytes} bytes`);
+  if (buf.length > KV_LIMITS.valueBytes) throw new HttpError(413, 'Value larger than 4 MB');
+  const old = st.map.get(key);
+  const oldBytes = old ? Buffer.byteLength(key) + Buffer.byteLength(old.v, 'base64') : 0;
+  const newBytes = Buffer.byteLength(key) + buf.length;
+  if (st.bytes - oldBytes + newBytes > KV_LIMITS.workerBytes) throw new HttpError(507, 'KV store full (128 MB per worker)');
+  st.map.set(key, { v: buf.toString('base64'), e: ttlSec ? Date.now() + ttlSec * 1000 : 0 });
+  st.bytes += newBytes - oldBytes;
+  kvPersistSoon(name);
+}
+function kvDelete(name, key) {
+  const st = kvStore(name);
+  const old = st.map.get(key);
+  if (!old) return false;
+  st.map.delete(key);
+  st.bytes -= Buffer.byteLength(key) + Buffer.byteLength(old.v, 'base64');
+  kvPersistSoon(name);
+  return true;
+}
+function kvList(name, prefix = '', limit = 1000, cursor = '') {
+  const st = kvStore(name);
+  const now = Date.now();
+  const keys = [...st.map.keys()].filter((k) => k.startsWith(prefix) && (!st.map.get(k).e || st.map.get(k).e > now)).sort();
+  const start = cursor ? keys.findIndex((k) => k > cursor) : 0;
+  const page = start < 0 ? [] : keys.slice(start, start + limit);
+  const complete = start < 0 || start + limit >= keys.length;
+  return {
+    keys: page.map((k) => {
+      const v = st.map.get(k);
+      return v.e ? { name: k, expiration: Math.floor(v.e / 1000) } : { name: k };
+    }),
+    list_complete: complete,
+    cursor: complete ? '' : page[page.length - 1]
+  };
+}
+function kvRename(oldName, newName) {
+  kvFlush();
+  const st = kvStores.get(oldName);
+  kvStores.delete(oldName);
+  if (st) kvStores.set(newName, st);
+  try {
+    if (fs.existsSync(kvFile(oldName))) fs.renameSync(kvFile(oldName), kvFile(newName));
+  } catch (_) {}
+}
+function kvDrop(name) {
+  kvStores.delete(name);
+  kvDirty.delete(name);
+  try {
+    fs.rmSync(kvFile(name), { force: true });
+  } catch (_) {}
+}
+
+async function handleKvRequest(req, res, parsedUrl) {
+  const token = String(req.headers['x-ax-token'] || '');
+  const ok = token.length === INTERNAL_TOKEN.length && crypto.timingSafeEqual(Buffer.from(token), Buffer.from(INTERNAL_TOKEN));
+  const parts = parsedUrl.pathname.split('/').slice(3); // ['', '__ax', 'kv', worker, key]
+  let worker = '';
+  let key;
+  try {
+    worker = decodeURIComponent(parts[0] || '');
+    key = parts.length > 1 ? decodeURIComponent(parts.slice(1).join('/')) : undefined;
+  } catch (_) {}
+  if (!ok || !state.workers[worker]) {
+    res.writeHead(404, { 'content-type': 'text/plain' });
+    res.end('Not found');
+    return;
+  }
+  try {
+    if (key === undefined && req.method === 'GET') {
+      const q = parsedUrl.searchParams;
+      const limit = Math.min(KV_LIMITS.listMax, Math.max(1, Number(q.get('limit')) || KV_LIMITS.listMax));
+      sendJson(res, 200, kvList(worker, q.get('prefix') || '', limit, q.get('cursor') || ''));
+      return;
+    }
+    if (key === undefined || key === '') throw new HttpError(400, 'Key required');
+    if (req.method === 'GET') {
+      const v = kvGetEntry(worker, key);
+      if (!v) {
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('');
+        return;
+      }
+      const buf = Buffer.from(v.v, 'base64');
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': buf.length });
+      res.end(buf);
+      return;
+    }
+    if (req.method === 'PUT' || req.method === 'POST') {
+      const buf = await readRequestBody(req);
+      const ttl = Math.max(0, Math.floor(Number(parsedUrl.searchParams.get('ttl')) || 0));
+      kvPut(worker, key, buf, ttl ? Math.max(60, ttl) : 0);
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (req.method === 'DELETE') {
+      kvDelete(worker, key);
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    throw new HttpError(405, 'Method not allowed');
+  } catch (err) {
+    sendJson(res, err.statusCode || 500, { error: err.message });
+  }
+}
+
 // Ask the kernel for a free port. The old counter started at 19100 and only
 // ever went up, so a second instance (or anything else on 191xx) collided.
 function getFreePort() {
@@ -1371,7 +1617,7 @@ function stripBasicTypeScriptTypes(code) {
     .replace(/\binterface\s+\w+\s*\{[^}]*\}/g, '');
 }
 
-function buildWorkerdWrappedScript(workerName, rawCode, language, bindings, filesMap, systemInfo, mountPrefixes) {
+function buildWorkerdWrappedScript(workerName, rawCode, language, bindings, filesMap, systemInfo, mountPrefixes, opts = {}) {
   let code = String(rawCode || '');
   if (language === 'typescript' || language === 'typescriptreact') {
     code = stripBasicTypeScriptTypes(code);
@@ -1441,8 +1687,9 @@ const __USER_DEFAULT_EXPORT__ = {
         const ct = typeof result === 'object' ? 'application/json; charset=utf-8' : 'text/plain; charset=utf-8';
         return new Response(body, { headers: { 'content-type': ct } });
       }
-      if (typeof __CURRENT_LOGS__ !== 'undefined' && Array.isArray(__CURRENT_LOGS__) && __CURRENT_LOGS__.length > 0) {
-        return new Response(__CURRENT_LOGS__.map((l) => l.message).join('\\n'), {
+      const __st = __als.getStore();
+      if (__st && __st.logs.length > 0) {
+        return new Response(__st.logs.map((l) => l.message).join('\\n'), {
           headers: { 'content-type': 'text/plain; charset=utf-8' }
         });
       }
@@ -1456,22 +1703,46 @@ const __USER_DEFAULT_EXPORT__ = {
 `;
   }
 
-  return `
-let __CURRENT_LOGS__ = [];
+  const jsFiles = Object.keys(filesMap || {}).filter((k) => /\.(js|mjs|cjs|ts|tsx|jsx)$/i.test(k));
+  return `import { AsyncLocalStorage as __ALS } from 'node:async_hooks';
+// Per-request log capture. (Was: console.* swapped globally on every request,
+// so overlapping requests mixed up or lost each other's logs.)
+const __als = new __ALS();
+const __fmt = (args) => args.map((a) => {
+  if (typeof a === 'string') return a;
+  if (a instanceof Error) return a.stack || String(a);
+  try { return JSON.stringify(a); } catch (_) { return String(a); }
+}).join(' ');
+for (const __lvl of ['log', 'info', 'warn', 'error', 'debug']) {
+  const __orig = typeof console[__lvl] === 'function' ? console[__lvl].bind(console) : () => {};
+  console[__lvl] = (...args) => {
+    const store = __als.getStore();
+    if (!store) return __orig(...args);
+    if (store.logs.length < 200) store.logs.push({ level: __lvl === 'debug' ? 'log' : __lvl, message: __fmt(args) });
+  };
+}
+
 ${userModuleCode}
+
+// Built once when the worker starts, not on every request.
+const __WORKER = ${JSON.stringify(workerName)};
+const __PREFIXES = ${JSON.stringify(mountPrefixes || [`/${workerName}`])};
+const __JS_FILES = new Set(${JSON.stringify(jsFiles)});
+const __BINDINGS = ${JSON.stringify(bindings || {})};
+const __FILES = Object.freeze(${JSON.stringify(filesMap || {})});
+const __SYS = Object.freeze(${JSON.stringify(systemInfo || {})});
+const __EXPECTS_PREFIX = ${JSON.stringify(Boolean(rawCode && rawCode.includes('/' + workerName)))};
+const __TOKEN = ${JSON.stringify(opts.token || '')};
+const __BACKEND_PORT = ${Number(opts.backendPort) || 0};
 
 function __normalizeToResponse(val) {
   if (val instanceof Response) return val;
-  if (typeof val === 'string') {
-    return new Response(val);
-  }
+  if (typeof val === 'string') return new Response(val);
   if (val instanceof ArrayBuffer || ArrayBuffer.isView(val) || (typeof ReadableStream !== 'undefined' && val instanceof ReadableStream)) {
     return new Response(val);
   }
   if (val !== null && typeof val === 'object') {
-    return new Response(JSON.stringify(val, null, 2), {
-      headers: { 'content-type': 'application/json; charset=utf-8' }
-    });
+    return new Response(JSON.stringify(val, null, 2), { headers: { 'content-type': 'application/json; charset=utf-8' } });
   }
   return new Response(val !== undefined ? String(val) : '');
 }
@@ -1488,148 +1759,157 @@ function __packLogs(logs) {
 }
 
 async function __invokeUserExport(req, env, ctx) {
-  if (typeof __USER_DEFAULT_EXPORT__ === 'function') {
-    return __normalizeToResponse(await __USER_DEFAULT_EXPORT__(req, env, ctx));
-  }
+  if (typeof __USER_DEFAULT_EXPORT__ === 'function') return __normalizeToResponse(await __USER_DEFAULT_EXPORT__(req, env, ctx));
   if (__USER_DEFAULT_EXPORT__ && typeof __USER_DEFAULT_EXPORT__.fetch === 'function') {
     return __normalizeToResponse(await __USER_DEFAULT_EXPORT__.fetch(req, env, ctx));
   }
   return __normalizeToResponse(__USER_DEFAULT_EXPORT__);
 }
 
-export default {
-  async fetch(request, env, ctx) {
-    const __logs = [];
-    __CURRENT_LOGS__ = __logs;
-    const origLog = console.log;
-    const origInfo = console.info;
-    const origWarn = console.warn;
-    const origError = console.error;
-    const fmt = (args) => args.map(a => {
-      if (typeof a === 'string') return a;
-      try { return JSON.stringify(a); } catch (_) { return String(a); }
-    }).join(' ');
-
-    console.log = (...args) => { __logs.push({ level: 'log', message: fmt(args) }); origLog(...args); };
-    console.info = (...args) => { __logs.push({ level: 'info', message: fmt(args) }); origInfo(...args); };
-    console.warn = (...args) => { __logs.push({ level: 'warn', message: fmt(args) }); origWarn(...args); };
-    console.error = (...args) => { __logs.push({ level: 'error', message: fmt(args) }); origError(...args); };
-
-    try {
-      let deviceInfo = {};
-      try {
-        const rawDeviceHeader = request.headers.get('x-internal-device');
-        if (rawDeviceHeader) {
-          deviceInfo = JSON.parse(rawDeviceHeader);
-        }
-      } catch (_) {}
-
-      const cleanHeaders = new Headers(request.headers);
-      cleanHeaders.delete('x-internal-device');
-
-      const workerSlug = ${JSON.stringify(workerName)};
-      const prefixes = ${JSON.stringify(mountPrefixes || [`/${workerName}`])};
-      const origUrl = new URL(request.url);
-      let strippedPath = origUrl.pathname;
-      for (const prefix of prefixes) {
-        if (!prefix || prefix === '/') continue;
-        if (strippedPath === prefix || strippedPath === prefix + '/') {
-          strippedPath = '/';
-          break;
-        } else if (strippedPath.startsWith(prefix + '/')) {
-          strippedPath = strippedPath.slice(prefix.length);
-          break;
-        }
-      }
-      const jsFileNames = ${JSON.stringify(Object.keys(filesMap || {}).filter((k) => /\.(js|mjs|cjs|ts|tsx|jsx)$/i.test(k)))};
-      if (strippedPath.startsWith('/') && jsFileNames.includes(strippedPath.slice(1))) {
-        strippedPath = '/';
-      }
-
-      const strippedUrl = new URL(origUrl.toString());
-      strippedUrl.pathname = strippedPath;
-
-      const reqBodyBuf = (request.method !== 'GET' && request.method !== 'HEAD')
-        ? await request.arrayBuffer()
-        : undefined;
-
-      const liveSysInfo = ${JSON.stringify(systemInfo || {})};
-      const cfProps = Object.assign(
-        {
-          clientIp: deviceInfo.ip || cleanHeaders.get('cf-connecting-ip') || '127.0.0.1',
-          httpProtocol: 'HTTP/1.1',
-          tlsVersion: deviceInfo.protocol === 'https' ? 'TLSv1.3' : '',
-          clientTcpRtt: 1,
-          timezone: liveSysInfo.timezone || 'America/New_York'
-        },
-        deviceInfo.cf || {}
-      );
-
-      const makeReq = (targetUrlStr) => {
-        const r = new Request(targetUrlStr, {
-          method: request.method,
-          headers: cleanHeaders,
-          body: reqBodyBuf ? reqBodyBuf.slice(0) : undefined,
-          cf: cfProps
-        });
-        try {
-          Object.defineProperty(r, 'cf', {
-            value: cfProps,
-            writable: false,
-            enumerable: true,
-            configurable: true
-          });
-        } catch (_) {}
-        return r;
-      };
-
-      const customBindings = ${JSON.stringify(bindings || {})};
-      const workerFilesMap = ${JSON.stringify(filesMap || {})};
-      const enrichedEnv = Object.assign({}, customBindings, env || {}, {
-        WORKER_NAME: workerSlug,
-        CLIENT_IP: deviceInfo.ip || cleanHeaders.get('x-client-ip') || '127.0.0.1',
-        CLIENT_DEVICE: deviceInfo,
-        FILES: workerFilesMap,
-        SYSTEM_INFO: liveSysInfo
-      });
-
-      const codeExpectsFullPrefix = ${JSON.stringify(Boolean(rawCode && rawCode.includes('/' + workerName)))};
-      const isRootMountRequest = origUrl.pathname === '/' + workerSlug || origUrl.pathname === '/' + workerSlug + '/';
-      const primaryUrlStr = (codeExpectsFullPrefix && isRootMountRequest) ? origUrl.toString() : strippedUrl.toString();
-      const secondaryUrlStr = (codeExpectsFullPrefix && isRootMountRequest) ? strippedUrl.toString() : origUrl.toString();
-
-      let resp = await __invokeUserExport(makeReq(primaryUrlStr), enrichedEnv, ctx);
-      if (resp.status === 404 && primaryUrlStr !== secondaryUrlStr) {
-        const fallbackResp = await __invokeUserExport(makeReq(secondaryUrlStr), enrichedEnv, ctx);
-        if (fallbackResp.status !== 404) {
-          resp = fallbackResp;
-        }
-      }
-
-      const headers = new Headers(resp.headers);
-      if (__logs.length > 0) {
-        headers.set('x-internal-logs', __packLogs(__logs));
-      }
-      return new Response(resp.body, {
-        status: resp.status,
-        statusText: resp.statusText,
-        headers
-      });
-    } catch (err) {
-      __logs.push({ level: 'error', message: err && err.stack ? err.stack : String(err) });
-      return new Response(err && err.stack ? err.stack : String(err), {
-        status: 500,
-        headers: {
-          'content-type': 'text/plain; charset=utf-8',
-          'x-internal-logs': __packLogs(__logs)
-        }
-      });
-    } finally {
-      console.log = origLog;
-      console.info = origInfo;
-      console.warn = origWarn;
-      console.error = origError;
+// env.KV: a Workers-KV-style store kept on this machine.
+function __kv(env) {
+  const call = (method, key, body, query) => {
+    const path = '/__ax/kv/' + encodeURIComponent(__WORKER) + (key !== undefined ? '/' + encodeURIComponent(key) : '') + (query || '');
+    const init = { method, headers: { 'x-ax-token': __TOKEN }, body };
+    return env && env.__AXKV ? env.__AXKV.fetch('http://kv' + path, init) : fetch('http://127.0.0.1:' + __BACKEND_PORT + path, init);
+  };
+  return {
+    async get(key, opt) {
+      const type = typeof opt === 'string' ? opt : (opt && opt.type) || 'text';
+      const r = await call('GET', String(key));
+      if (r.status === 404) return null;
+      if (!r.ok) throw new Error('KV get failed: ' + (await r.text()));
+      if (type === 'json') return r.json();
+      if (type === 'arrayBuffer') return r.arrayBuffer();
+      if (type === 'stream') return r.body;
+      return r.text();
+    },
+    async put(key, value, opt) {
+      let ttl = 0;
+      if (opt && opt.expirationTtl) ttl = opt.expirationTtl;
+      else if (opt && opt.expiration) ttl = opt.expiration - Math.floor(Date.now() / 1000);
+      const body = typeof value === 'string' || value instanceof ArrayBuffer || ArrayBuffer.isView(value) ? value : JSON.stringify(value);
+      const r = await call('PUT', String(key), body, ttl ? '?ttl=' + Math.max(1, Math.floor(ttl)) : '');
+      if (!r.ok) throw new Error('KV put failed: ' + (await r.text()));
+    },
+    async delete(key) {
+      await call('DELETE', String(key));
+    },
+    async list(opt) {
+      const q = new URLSearchParams();
+      if (opt && opt.prefix) q.set('prefix', opt.prefix);
+      if (opt && opt.limit) q.set('limit', String(opt.limit));
+      if (opt && opt.cursor) q.set('cursor', opt.cursor);
+      const r = await call('GET', undefined, undefined, '?' + q);
+      return r.json();
     }
+  };
+}
+
+function __env(env, deviceInfo, clientIp) {
+  return Object.assign({ KV: __kv(env) }, __BINDINGS, env || {}, {
+    WORKER_NAME: __WORKER,
+    CLIENT_IP: clientIp,
+    CLIENT_DEVICE: deviceInfo,
+    FILES: __FILES,
+    SYSTEM_INFO: __SYS
+  });
+}
+
+async function __scheduled(request, env, ctx, store) {
+  const cron = request.headers.get('x-ax-cron') || '';
+  const scheduledTime = Number(request.headers.get('x-ax-time')) || Date.now();
+  const mod = __USER_DEFAULT_EXPORT__;
+  const e = __env(env, {}, '127.0.0.1');
+  let status = 200;
+  let note = '';
+  if (mod && typeof mod.scheduled === 'function') {
+    const waits = [];
+    await mod.scheduled(
+      { cron, scheduledTime, type: 'scheduled', noRetry() {} },
+      e,
+      { waitUntil: (p) => waits.push(p), passThroughOnException() {} }
+    );
+    await Promise.allSettled(waits);
+    note = 'scheduled() ran';
+  } else if (mod && (typeof mod.fetch === 'function' || typeof mod === 'function')) {
+    const r = await __invokeUserExport(new Request('http://localhost/', { headers: { 'x-ax-cron': cron } }), e, ctx);
+    status = r.status;
+    note = 'no scheduled() export, ran fetch() instead';
+  } else {
+    status = 501;
+    note = 'this worker has no scheduled() or fetch() handler';
+  }
+  return new Response(note, { status, headers: { 'x-internal-logs': __packLogs(store.logs) } });
+}
+
+async function __handle(request, env, ctx, store) {
+  try {
+    let deviceInfo = {};
+    const rawDevice = request.headers.get('x-internal-device');
+    if (rawDevice) {
+      try { deviceInfo = JSON.parse(rawDevice); } catch (_) {}
+    }
+    const origUrl = new URL(request.url);
+    if (origUrl.pathname === '/__ax/scheduled' && __TOKEN && request.headers.get('x-ax-token') === __TOKEN) {
+      return await __scheduled(request, env, ctx, store);
+    }
+    const headers = new Headers(request.headers);
+    headers.delete('x-internal-device');
+    headers.delete('x-ax-token');
+
+    let strippedPath = origUrl.pathname;
+    for (const prefix of __PREFIXES) {
+      if (!prefix || prefix === '/') continue;
+      if (strippedPath === prefix || strippedPath === prefix + '/') { strippedPath = '/'; break; }
+      if (strippedPath.startsWith(prefix + '/')) { strippedPath = strippedPath.slice(prefix.length); break; }
+    }
+    if (__JS_FILES.has(strippedPath.slice(1))) strippedPath = '/';
+    const strippedUrl = new URL(origUrl);
+    strippedUrl.pathname = strippedPath;
+
+    const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
+    const bodyBuf = hasBody ? await request.arrayBuffer() : null;
+    const clientIp = deviceInfo.ip || headers.get('cf-connecting-ip') || '127.0.0.1';
+    const cfProps = Object.assign(
+      { clientIp, httpProtocol: 'HTTP/1.1', tlsVersion: deviceInfo.protocol === 'https' ? 'TLSv1.3' : '', clientTcpRtt: 1, timezone: __SYS.timezone || 'UTC' },
+      deviceInfo.cf || {}
+    );
+    const makeReq = (u) => {
+      const r = new Request(u, { method: request.method, headers, body: bodyBuf ? bodyBuf.slice(0) : undefined });
+      try { Object.defineProperty(r, 'cf', { value: cfProps, enumerable: true, configurable: true }); } catch (_) {}
+      return r;
+    };
+    const e = __env(env, deviceInfo, clientIp);
+    const isRootMount = origUrl.pathname === '/' + __WORKER || origUrl.pathname === '/' + __WORKER + '/';
+    const first = __EXPECTS_PREFIX && isRootMount ? origUrl : strippedUrl;
+    let resp = await __invokeUserExport(makeReq(first.toString()), e, ctx);
+    // Retry with the other URL only when the code visibly routes on its full
+    // path. (Was: every 404 ran the handler twice, side effects and all.)
+    if (resp.status === 404 && __EXPECTS_PREFIX) {
+      const second = first === origUrl ? strippedUrl : origUrl;
+      if (second.toString() !== first.toString()) {
+        const alt = await __invokeUserExport(makeReq(second.toString()), e, ctx);
+        if (alt.status !== 404) resp = alt;
+      }
+    }
+    if (!store.logs.length) return resp;
+    const out = new Headers(resp.headers);
+    out.set('x-internal-logs', __packLogs(store.logs));
+    return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers: out });
+  } catch (err) {
+    store.logs.push({ level: 'error', message: err && err.stack ? err.stack : String(err) });
+    return new Response(err && err.stack ? err.stack : String(err), {
+      status: 500,
+      headers: { 'content-type': 'text/plain; charset=utf-8', 'x-internal-logs': __packLogs(store.logs) }
+    });
+  }
+}
+
+export default {
+  fetch(request, env, ctx) {
+    const store = { logs: [] };
+    return __als.run(store, () => __handle(request, env, ctx, store));
   }
 };
 `;
@@ -1919,39 +2199,41 @@ function startNodeWorkerFallbackServer(port, compiledWorkerPath, workerName) {
   });
 }
 
-async function ensureWorkerdInstance(workerName, rawCode, language, bindings) {
-  const workerFiles = listWorkerFiles(workerName);
-  const filesMap = {};
-  for (const f of workerFiles) {
-    filesMap[f.name] = f.content;
-  }
-  const sysInfo = getLiveSystemTelemetry();
+const startingWorkers = new Map();
+async function ensureWorkerdInstance(workerName) {
   const meta = state.workers[workerName] || {};
-  const wholeWorkerCode = buildWholeWorkerJsCode(workerName, rawCode, meta, workerFiles);
-  const mountPrefixes = Array.from(
-    new Set([
-      `/${workerName}`,
-      extractPublishingPath(meta.publishingLink || meta.publishingPath, workerName),
-      ...(Array.isArray(meta.customRoutes)
-        ? meta.customRoutes.map((r) => extractPublishingPath(r.pattern || r.path, workerName))
-        : [])
-    ])
-  ).filter(Boolean);
-
-  const codeHash = crypto
-    .createHash('sha256')
-    .update(
-      `${language}:${wholeWorkerCode}:${JSON.stringify(bindings || {})}:${JSON.stringify(filesMap)}:${JSON.stringify(mountPrefixes)}`
-    )
-    .digest('hex');
-  const existing = workerdPool.get(workerName);
-
-  if (existing && existing.codeHash === codeHash) {
-    if ((existing.proc && !existing.proc.killed) || existing.fallbackServer) {
-      return existing.port;
-    }
+  const bundle = getWorkerBundle(workerName);
+  if (!bundle.codeHash) {
+    bundle.wholeWorkerCode = buildWholeWorkerJsCode(workerName, bundle.rawCode, meta, bundle.files);
+    bundle.codeHash = crypto
+      .createHash('sha256')
+      .update(`${workerLanguage(meta)}:${bundle.wholeWorkerCode}:${JSON.stringify(meta.bindings || {})}:${JSON.stringify(bundle.filesMap)}:${JSON.stringify(bundle.mountPrefixes)}`)
+      .digest('hex');
   }
+  const existing = workerdPool.get(workerName);
+  if (existing && existing.codeHash === bundle.codeHash && ((existing.proc && !existing.proc.killed) || existing.fallbackServer)) {
+    existing.lastUsed = Date.now();
+    return existing.port;
+  }
+  // single flight: concurrent first requests share one start (was: each
+  // spawned its own workerd and all but one were orphaned)
+  const key = `${workerName}:${bundle.codeHash}`;
+  if (!startingWorkers.has(key)) {
+    startingWorkers.set(key, startWorkerd(workerName, meta, bundle).finally(() => startingWorkers.delete(key)));
+  }
+  return startingWorkers.get(key);
+}
 
+async function startWorkerd(workerName, meta, bundle) {
+  const language = workerLanguage(meta);
+  const bindings = meta.bindings;
+  const workerFiles = bundle.files;
+  const filesMap = bundle.filesMap;
+  const wholeWorkerCode = bundle.wholeWorkerCode;
+  const mountPrefixes = bundle.mountPrefixes;
+  const codeHash = bundle.codeHash;
+  const sysInfo = getLiveSystemTelemetry();
+  const existing = workerdPool.get(workerName);
   if (existing) {
     if (existing.proc) {
       try {
@@ -2000,7 +2282,8 @@ async function ensureWorkerdInstance(workerName, rawCode, language, bindings) {
     bindings,
     filesMap,
     sysInfo,
-    mountPrefixes
+    mountPrefixes,
+    { token: INTERNAL_TOKEN, backendPort: BACKEND_PORT }
   );
   const compiledWorkerPath = path.join(runDir, 'entry.js');
   const capnpPath = path.join(runDir, 'config.capnp');
@@ -2012,6 +2295,7 @@ async function ensureWorkerdInstance(workerName, rawCode, language, bindings) {
 const config :Workerd.Config = (
   services = [
     (name = "main", worker = .mainWorker),
+    (name = "axkv", external = (address = "127.0.0.1:${BACKEND_PORT}", http = ())),
   ],
   sockets = [
     ( name = "http",
@@ -2028,6 +2312,8 @@ const mainWorker :Workerd.Worker = (
 ${extraModuleLines.join('\n')}
   ],
   compatibilityDate = "2025-01-01",
+  compatibilityFlags = ["nodejs_als"],
+  bindings = [ (name = "__AXKV", service = "axkv") ],
 );
 `;
   fs.writeFileSync(capnpPath, capnpConfig, 'utf8');
@@ -2096,7 +2382,7 @@ ${extraModuleLines.join('\n')}
   }
 
   if (workerdListening) {
-    workerdPool.set(workerName, { proc, port, codeHash, fallbackServer: null });
+    workerdPool.set(workerName, { proc, port, codeHash, fallbackServer: null, lastUsed: Date.now() });
     return port;
   }
 
@@ -2107,10 +2393,179 @@ ${extraModuleLines.join('\n')}
   }
 
   const fallbackServer = await startNodeWorkerFallbackServer(port, compiledWorkerPath, workerName);
-  workerdPool.set(workerName, { proc: null, port, codeHash, fallbackServer });
+  workerdPool.set(workerName, { proc: null, port, codeHash, fallbackServer, lastUsed: Date.now() });
   return port;
 }
 
+// ============================================================================
+// Cron triggers: standard 5-field schedules (plus @hourly, @daily, …).
+// JS workers get scheduled(controller, env, ctx) like on Cloudflare; other
+// runtimes are simply requested at their main path.
+// ============================================================================
+const CRON_ALIASES = {
+  '@yearly': '0 0 1 1 *',
+  '@annually': '0 0 1 1 *',
+  '@monthly': '0 0 1 * *',
+  '@weekly': '0 0 * * 0',
+  '@daily': '0 0 * * *',
+  '@midnight': '0 0 * * *',
+  '@hourly': '0 * * * *'
+};
+function parseCronField(field, min, max) {
+  const out = new Set();
+  for (const part of field.split(',')) {
+    const [range, stepStr] = part.split('/');
+    const step = stepStr === undefined ? 1 : Number(stepStr);
+    if (!Number.isInteger(step) || step < 1) throw new Error(`bad step in "${part}"`);
+    let lo;
+    let hi;
+    if (range === '*') {
+      lo = min;
+      hi = max;
+    } else if (range.includes('-')) {
+      [lo, hi] = range.split('-').map(Number);
+    } else {
+      lo = Number(range);
+      hi = stepStr === undefined ? lo : max;
+    }
+    if (![lo, hi].every(Number.isInteger) || lo < min || hi > max || lo > hi) throw new Error(`"${part}" isn't within ${min}-${max}`);
+    for (let v = lo; v <= hi; v += step) out.add(v);
+  }
+  return out;
+}
+function parseCron(expr) {
+  const raw = String(expr || '').trim().toLowerCase();
+  const fields = (CRON_ALIASES[raw] || raw).split(/\s+/);
+  if (fields.length !== 5) throw new HttpError(400, 'A schedule has 5 fields: minute hour day month weekday, e.g. */5 * * * *');
+  try {
+    const dow = parseCronField(fields[4], 0, 7);
+    if (dow.has(7)) dow.add(0);
+    return {
+      expr: String(expr).trim(),
+      minute: parseCronField(fields[0], 0, 59),
+      hour: parseCronField(fields[1], 0, 23),
+      dom: parseCronField(fields[2], 1, 31),
+      month: parseCronField(fields[3], 1, 12),
+      dow,
+      domStar: fields[2] === '*',
+      dowStar: fields[4] === '*'
+    };
+  } catch (err) {
+    throw new HttpError(400, `Invalid schedule: ${err.message}`);
+  }
+}
+function cronMatches(c, d) {
+  if (!c.minute.has(d.getMinutes()) || !c.hour.has(d.getHours()) || !c.month.has(d.getMonth() + 1)) return false;
+  const domOk = c.dom.has(d.getDate());
+  const dowOk = c.dow.has(d.getDay());
+  if (c.domStar && c.dowStar) return true;
+  if (c.domStar) return dowOk;
+  if (c.dowStar) return domOk;
+  return domOk || dowOk; // classic cron: either day field may match
+}
+function cronNext(c, from = new Date()) {
+  const d = new Date(from);
+  d.setSeconds(0, 0);
+  d.setMinutes(d.getMinutes() + 1);
+  for (let i = 0; i < 366 * 24 * 60; i++) {
+    if (cronMatches(c, d)) return d;
+    d.setMinutes(d.getMinutes() + 1);
+  }
+  return null;
+}
+
+async function runCron(name, job, manual = false) {
+  const meta = state.workers[name];
+  if (!meta) return null;
+  const url = isWorkerdWorker(name) ? '/__ax/scheduled' : extractPublishingPath(meta.publishingLink || meta.publishingPath, name);
+  const req = {
+    method: 'GET',
+    url,
+    headers: {
+      host: 'localhost',
+      'user-agent': 'alex-aero-cron',
+      'x-ax-token': INTERNAL_TOKEN,
+      'x-ax-cron': job.expr,
+      'x-ax-time': String(Date.now())
+    },
+    socket: { remoteAddress: '127.0.0.1' },
+    _cron: job.expr
+  };
+  const t0 = Date.now();
+  let status = 0;
+  try {
+    const r = await executeWorkerAction(name, req, Buffer.alloc(0), url);
+    status = r.status;
+    if (r.stream) {
+      let bytes = 0;
+      r.stream.on('data', (c) => (bytes += c.length));
+      await new Promise((done) => r.stream.on('end', done).on('error', done));
+      r.onEnd(bytes);
+    }
+  } catch (err) {
+    status = 500;
+    appendWorkerLog(name, 'error', `[cron ${job.expr}] ${err.message}`);
+  }
+  job.lastRunAt = new Date().toISOString();
+  job.lastStatus = status;
+  job.lastMs = Date.now() - t0;
+  appendWorkerLog(name, status && status < 400 ? 'info' : 'error', `${manual ? 'Ran' : 'Schedule'} ${job.expr} → ${status} in ${job.lastMs} ms`);
+  persistWorkerSoon(name);
+  return { status, ms: job.lastMs };
+}
+
+function scheduleTick() {
+  const now = new Date();
+  setTimeout(scheduleTick, 60000 - (now.getSeconds() * 1000 + now.getMilliseconds()) + 30).unref();
+  const slot = new Date(now);
+  slot.setSeconds(0, 0);
+  for (const [name, meta] of Object.entries(state.workers)) {
+    for (const job of Array.isArray(meta.crons) ? meta.crons : []) {
+      let c;
+      try {
+        c = parseCron(job.expr);
+      } catch (_) {
+        continue;
+      }
+      if (cronMatches(c, slot) && job.lastSlot !== slot.getTime()) {
+        job.lastSlot = slot.getTime();
+        runCron(name, job).catch(() => {});
+      }
+    }
+  }
+}
+
+function hasSchedules(name) {
+  const m = state.workers[name];
+  return Boolean(m && Array.isArray(m.crons) && m.crons.length);
+}
+
+// Idle workers give their memory back; the next request starts them again.
+const IDLE_REAP_MS = 15 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [name, e] of workerdPool.entries()) {
+    if (now - (e.lastUsed || now) < IDLE_REAP_MS || hasSchedules(name)) continue;
+    try {
+      if (e.proc) e.proc.kill('SIGTERM');
+      if (e.fallbackServer) e.fallbackServer.close();
+    } catch (_) {}
+    workerdPool.delete(name);
+  }
+}, 60 * 1000).unref();
+
+// Reused connections to the worker processes (was: a new TCP connection per request).
+const workerdAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 15000, maxSockets: 512, maxFreeSockets: 64 });
+function readAll(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on('data', (c) => chunks.push(c));
+    stream.on('end', () => resolve(Buffer.concat(chunks)));
+    stream.on('error', reject);
+  });
+}
+
+// Resolves as soon as the worker's headers arrive; the body is a stream.
 function forwardToWorkerd(port, req, bodyBuffer, deviceInfo, targetPathWithQuery) {
   return new Promise((resolve, reject) => {
     const forwardHeaders = { ...req.headers };
@@ -2171,17 +2626,14 @@ function forwardToWorkerd(port, req, bodyBuffer, deviceInfo, targetPathWithQuery
         path: targetPathWithQuery,
         method: req.method,
         headers: forwardHeaders,
+        agent: workerdAgent,
         timeout: 30000
       },
       (proxyRes) => {
-        const chunks = [];
-        proxyRes.on('data', (c) => chunks.push(c));
-        proxyRes.on('end', () => {
-          resolve({
-            status: proxyRes.statusCode || 200,
-            headers: proxyRes.headers,
-            body: Buffer.concat(chunks)
-          });
+        resolve({
+          status: proxyRes.statusCode || 200,
+          headers: proxyRes.headers,
+          stream: proxyRes
         });
       }
     );
@@ -2381,8 +2833,8 @@ function recordInvocation(workerName, meta, req, parsedUrl, deviceInfo, status, 
   meta.invocations.push({
     id: crypto.randomBytes(4).toString('hex'),
     timestamp: nowIso,
-    method: req.method || 'GET',
-    path: parsedUrl.pathname,
+    method: req._cron ? 'CRON' : req.method || 'GET',
+    path: req._cron ? req._cron : parsedUrl.pathname,
     url: `${deviceInfo.protocol || 'http'}://${deviceInfo.host}${req.url || '/' + workerName}`,
     status,
     outcome: isError ? 'exception' : 'ok',
@@ -2436,43 +2888,35 @@ async function executeWorkerAction(workerName, req, bodyBuffer, subPathAndQuery)
     };
   }
 
-  const rawCode = readWorkerCodeFromStorage(workerName);
+  const bundle = getWorkerBundle(workerName);
+  const rawCode = bundle.rawCode;
   const deviceInfo = parseClientAndDevice(req, false);
   const parsedUrl = new URL(req.url || `/${workerName}`, `http://${deviceInfo.host}`);
   const queryObj = Object.fromEntries(parsedUrl.searchParams.entries());
-  const fileInferredLang = inferLanguageFromFilename(meta.filename);
-  const languageId =
-    fileInferredLang && fileInferredLang !== 'plaintext' && meta.language === 'javascript' && !/\.(js|jsx|mjs|cjs)$/i.test(meta.filename || '')
-      ? fileInferredLang
-      : meta.language || fileInferredLang || 'javascript';
+  const languageId = workerLanguage(meta);
   const langSpec = getLangSpec(languageId);
   const codeFilePath = getWorkerCodePath(workerName);
-  const workerFiles = listWorkerFiles(workerName);
-  const totalWorkerBytes = workerFiles.reduce((acc, f) => acc + (f.sizeBytes || Buffer.byteLength(f.content || '')), 0) || Buffer.byteLength(rawCode);
-  const hasExecutableJsWorker = workerFiles.some(
-    (f) => /\.(js|mjs|cjs|ts|tsx|jsx)$/i.test(f.name) && (/export\s+default\b/.test(f.content) || /addEventListener\s*\(\s*['"]fetch['"]/.test(f.content))
-  );
-
-  // If the worker is a multi-file HTML/CSS/JS frontend project without a Cloudflare Worker fetch export,
-  // bundle the whole project (HTML + CSS + JS) together when previewing the worker root.
-  const htmlEntryFile = !hasExecutableJsWorker && workerFiles.find((f) => /\.html?$/i.test(f.name));
-
-  // Check if the request targets a static asset inside this worker's storage folder
-  const workerPrefixes = Array.from(
-    new Set([
-      `/${workerName}`,
-      extractPublishingPath(meta.publishingLink || meta.publishingPath, workerName),
-      ...(Array.isArray(meta.customRoutes)
-        ? meta.customRoutes.map((r) => extractPublishingPath(r.pattern || r.path, workerName))
-        : [])
-    ])
-  ).filter((p) => p && p !== '/');
+  const workerFiles = bundle.files;
+  const hasExecutableJsWorker = bundle.hasExecutableJsWorker;
+  // A multi-file HTML/CSS/JS project without a fetch() export is served as one bundled page.
+  const htmlEntryFile = bundle.htmlEntryFile;
+  // Static asset paths inside this worker's folder
+  const workerPrefixes = bundle.mountPrefixes.filter((p) => p && p !== '/');
+  const wantsUserInfo =
+    parsedUrl.searchParams.get('userInfo') === '1' ||
+    parsedUrl.searchParams.get('userInfo') === 'true' ||
+    parsedUrl.searchParams.get('user_info') === '1' ||
+    req.headers['x-request-user-info'] === '1';
 
   let fallbackStaticAsset = null;
   for (const basePrefix of workerPrefixes) {
     const slashPrefix = `${basePrefix}/`;
     if (parsedUrl.pathname.startsWith(slashPrefix)) {
-      const requestedSubFile = sanitizeFileName(decodeURIComponent(parsedUrl.pathname.slice(slashPrefix.length)));
+      let sub = parsedUrl.pathname.slice(slashPrefix.length);
+      try {
+        sub = decodeURIComponent(sub);
+      } catch (_) {}
+      const requestedSubFile = sanitizeFileName(sub);
       const matchingFile =
         requestedSubFile &&
         workerFiles.find(
@@ -2487,7 +2931,11 @@ async function executeWorkerAction(workerName, req, bodyBuffer, subPathAndQuery)
     }
   }
 
-  const bareTopSegment = sanitizeFileName(decodeURIComponent(parsedUrl.pathname.replace(/^\/+/, '')));
+  let topSeg = parsedUrl.pathname.replace(/^\/+/, '');
+  try {
+    topSeg = decodeURIComponent(topSeg);
+  } catch (_) {}
+  const bareTopSegment = sanitizeFileName(topSeg);
   if (!fallbackStaticAsset && bareTopSegment && !parsedUrl.pathname.slice(1).includes('/')) {
     const directAsset = workerFiles.find(
       (f) =>
@@ -2568,7 +3016,7 @@ async function executeWorkerAction(workerName, req, bodyBuffer, subPathAndQuery)
 
   try {
     if (langSpec.runtime === 'workerd') {
-      const port = await ensureWorkerdInstance(workerName, rawCode, languageId, meta.bindings);
+      const port = await ensureWorkerdInstance(workerName);
       const execHrStart = process.hrtime.bigint();
       const workerdResp = await forwardToWorkerd(
         port,
@@ -2596,7 +3044,32 @@ async function executeWorkerAction(workerName, req, bodyBuffer, subPathAndQuery)
         } catch (_) {}
         delete resHeaders['x-internal-logs'];
       }
-      resBodyBuffer = workerdResp.body;
+
+      // Stream straight through when the worker set a real content type:
+      // nothing needs sniffing, so nothing needs buffering.
+      const ct = String(resHeaders['content-type'] || '').toLowerCase();
+      if (ct && !ct.startsWith('text/plain') && !ct.startsWith('application/octet-stream') && !(status === 404 && fallbackStaticAsset) && !wantsUserInfo) {
+        delete resHeaders['transfer-encoding'];
+        delete resHeaders['connection'];
+        delete resHeaders['keep-alive'];
+        for (const hk of Object.keys(resHeaders)) {
+          const l = hk.toLowerCase();
+          if (l === 'x-frame-options' || l === 'content-security-policy') delete resHeaders[hk];
+        }
+        resHeaders['content-disposition'] = resHeaders['content-disposition'] || 'inline';
+        resHeaders['cache-control'] = resHeaders['cache-control'] || 'no-store';
+        resHeaders['access-control-allow-origin'] = resHeaders['access-control-allow-origin'] || '*';
+        const finalStatus = status;
+        const errMsg = capturedErrorMessage;
+        return {
+          status: finalStatus,
+          headers: resHeaders,
+          stream: workerdResp.stream,
+          onEnd: (bytes) => recordInvocation(workerName, meta, req, parsedUrl, deviceInfo, finalStatus, hrStart, bytes, errMsg),
+          deviceInfo
+        };
+      }
+      resBodyBuffer = await readAll(workerdResp.stream);
 
       // If the worker returned 404 and the request matched a static asset file in the worker folder, serve it
       if (status === 404 && fallbackStaticAsset) {
@@ -2631,7 +3104,9 @@ async function executeWorkerAction(workerName, req, bodyBuffer, subPathAndQuery)
         REQUEST_PATH: parsedUrl.pathname,
         REQUEST_URL: req.url || `/${workerName}`,
         REQUEST_QUERY_JSON: JSON.stringify(queryObj),
-        REQUEST_HEADERS_JSON: JSON.stringify(req.headers || {})
+        REQUEST_HEADERS_JSON: JSON.stringify(req.headers || {}),
+        AX_KV_URL: `http://127.0.0.1:${BACKEND_PORT}/__ax/kv/${encodeURIComponent(workerName)}`,
+        AX_KV_TOKEN: INTERNAL_TOKEN
       };
 
       const cmd = langSpec.runtime === 'python3' ? 'python3' : langSpec.runtime === 'bash' ? 'bash' : 'node';
@@ -2691,14 +3166,8 @@ async function executeWorkerAction(workerName, req, bodyBuffer, subPathAndQuery)
 
   let bodyStr = resBodyBuffer.toString('utf8');
 
-  // If the caller explicitly requested user info from the reverse proxy via ?userInfo=1 / X-Request-User-Info: 1
-  const explicitlyRequestedUserInfo =
-    parsedUrl.searchParams.get('userInfo') === '1' ||
-    parsedUrl.searchParams.get('userInfo') === 'true' ||
-    parsedUrl.searchParams.get('user_info') === '1' ||
-    req.headers['x-request-user-info'] === '1';
-
-  if (explicitlyRequestedUserInfo) {
+  // ?userInfo=1 / X-Request-User-Info: 1 appends the caller's details to a JSON body
+  if (wantsUserInfo) {
     try {
       const parsed = JSON.parse(bodyStr);
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && !parsed.ip && !parsed.client) {
@@ -3199,8 +3668,17 @@ async function readJsonBody(req) {
   throw new HttpError(400, 'Request body must be JSON');
 }
 
+// Forwarding headers are only believed from a local proxy (nginx, cloudflared).
+// Otherwise anyone could send X-Real-IP and dodge the sign-in lockout.
+function isLoopback(addr) {
+  const a = String(addr || '').replace(/^::ffff:/, '');
+  return a === '127.0.0.1' || a === '::1' || a.startsWith('127.');
+}
 function clientIpOf(req) {
-  return String(req.headers['x-real-ip'] || req.socket?.remoteAddress || '').replace(/^::ffff:/, '');
+  const peer = String(req.socket?.remoteAddress || '').replace(/^::ffff:/, '');
+  if (!isLoopback(peer)) return peer;
+  const fwd = String(req.headers['x-real-ip'] || req.headers['cf-connecting-ip'] || String(req.headers['x-forwarded-for'] || '').split(',')[0] || '').trim();
+  return fwd || peer;
 }
 
 // What the dashboard needs about a worker, without file contents, logs or the
@@ -3248,7 +3726,19 @@ function workerDetail(w) {
       fileNames: filesSnapshot ? Object.keys(filesSnapshot) : [d.filename]
     })),
     summary: workerSummary(w),
-    isDefault: state.defaultWorker === w.name
+    isDefault: state.defaultWorker === w.name,
+    crons: (w.crons || []).map((j) => {
+      let next = null;
+      try {
+        const n = cronNext(parseCron(j.expr));
+        next = n ? n.toISOString() : null;
+      } catch (_) {}
+      return { ...j, next };
+    }),
+    kv: (() => {
+      const st = kvStore(w.name);
+      return { keys: st.map.size, bytes: st.bytes };
+    })()
   };
 }
 
@@ -3333,6 +3823,13 @@ const server = http.createServer(async (req, res) => {
   try {
     const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const pathname = parsedUrl.pathname;
+
+    // KV calls from worker processes (secret per-boot token; 404 to anyone else)
+    if (pathname.startsWith('/__ax/kv/') && isLoopback(req.socket?.remoteAddress) && !req.headers['x-real-ip'] && !req.headers['cf-connecting-ip']) {
+      await handleKvRequest(req, res, parsedUrl);
+      return;
+    }
+
     const isManagement = isProtectedManagementPath(pathname);
 
     if (req.method === 'OPTIONS') {
@@ -3803,7 +4300,47 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Worker Routes, Issues, Observability, and Deployments Endpoints
-    const subActionMatch = pathname.match(/^\/api\/workers\/([^/]+)\/(routes|issues|observability|deployments)$/);
+    // KV browser for the dashboard
+    const kvMatch = pathname.match(/^\/api\/workers\/([^/]+)\/kv$/);
+    if (kvMatch) {
+      const name = decodeURIComponent(kvMatch[1]);
+      if (!state.workers[name]) throw new HttpError(404, 'Worker not found');
+      if (req.method === 'GET') {
+        const q = parsedUrl.searchParams;
+        const page = kvList(name, q.get('prefix') || '', Math.min(200, Number(q.get('limit')) || 100), q.get('cursor') || '');
+        const st = kvStore(name);
+        sendJson(res, 200, {
+          ...page,
+          totalKeys: st.map.size,
+          totalBytes: st.bytes,
+          keys: page.keys.map((k) => {
+            const buf = Buffer.from(st.map.get(k.name).v, 'base64');
+            const text = buf.toString('utf8');
+            const printable = !text.includes('�');
+            return { ...k, size: buf.length, preview: printable ? text.slice(0, 300) : null };
+          })
+        });
+        return;
+      }
+      if (req.method === 'PUT') {
+        const body = await readJsonBody(req);
+        if (!body.key) throw new HttpError(400, 'Key required');
+        kvPut(name, String(body.key), Buffer.from(String(body.value ?? ''), 'utf8'), Number(body.ttl) || 0);
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+      if (req.method === 'DELETE') {
+        if (parsedUrl.searchParams.get('all') === '1') {
+          for (const k of [...kvStore(name).map.keys()]) kvDelete(name, k);
+        } else {
+          kvDelete(name, String(parsedUrl.searchParams.get('key') || ''));
+        }
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+    }
+
+    const subActionMatch = pathname.match(/^\/api\/workers\/([^/]+)\/(routes|issues|observability|deployments|schedules)$/);
     if (subActionMatch && req.method === 'POST') {
       const targetName = decodeURIComponent(subActionMatch[1]);
       const actionType = subActionMatch[2];
@@ -3856,6 +4393,19 @@ const server = http.createServer(async (req, res) => {
         if (body.clearResolved && Array.isArray(meta.issues)) {
           meta.issues = meta.issues.filter((i) => i.status !== 'resolved');
         }
+      } else if (actionType === 'schedules') {
+        if (!Array.isArray(meta.crons)) meta.crons = [];
+        if (body.add) {
+          const c = parseCron(body.add);
+          if (meta.crons.length >= 20) throw new HttpError(400, 'Up to 20 schedules per worker');
+          if (meta.crons.some((j) => j.expr === c.expr)) throw new HttpError(409, 'That schedule already exists');
+          meta.crons.push({ id: crypto.randomBytes(4).toString('hex'), expr: c.expr, createdAt: new Date().toISOString() });
+        }
+        if (body.remove) meta.crons = meta.crons.filter((j) => j.id !== body.remove);
+        if (body.run) {
+          const job = meta.crons.find((j) => j.id === body.run) || { id: 'manual', expr: 'manual run' };
+          await runCron(targetName, job, true);
+        }
       } else if (actionType === 'observability') {
         meta.observabilityConfig = {
           ...(meta.observabilityConfig || {}),
@@ -3902,6 +4452,7 @@ const server = http.createServer(async (req, res) => {
       if (fs.existsSync(workerDir)) {
         writeJsonAtomic(path.join(workerDir, 'meta.json'), meta);
       }
+      if (actionType === 'routes') invalidateWorkerRuntime(targetName);
       saveState();
       const files = listWorkerFiles(targetName);
       sendJson(res, 200, {
@@ -3953,6 +4504,7 @@ const server = http.createServer(async (req, res) => {
         if (invalid) throw new HttpError(400, invalid);
         if (state.workers[candidate]) throw new HttpError(409, `Worker "${candidate}" already exists`);
         invalidateWorkerRuntime(targetName, true);
+        kvRename(targetName, candidate);
         if (state.defaultWorker === targetName) state.defaultWorker = candidate;
         const oldDir = path.join(WORKERS_DIR, targetName);
         const newDir = path.join(WORKERS_DIR, candidate);
@@ -4016,6 +4568,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       invalidateWorkerRuntime(targetName, true);
+      kvDrop(targetName);
       const workerDir = path.join(WORKERS_DIR, targetName);
       if (fs.existsSync(workerDir)) {
         fs.rmSync(workerDir, { recursive: true, force: true });
@@ -4143,6 +4696,18 @@ const server = http.createServer(async (req, res) => {
     if (matchedWorker) {
       const bodyBuf = await readRequestBody(req);
       const result = await executeWorkerAction(matchedWorker, req, bodyBuf, req.url);
+      if (result.stream) {
+        res.writeHead(result.status, result.headers);
+        let bytes = 0;
+        result.stream.on('data', (c) => (bytes += c.length));
+        result.stream.on('end', () => result.onEnd(bytes));
+        result.stream.on('error', () => res.destroy());
+        res.on('close', () => {
+          if (!result.stream.complete) result.stream.destroy();
+        });
+        result.stream.pipe(res);
+        return;
+      }
       res.writeHead(result.status, result.headers);
       res.end(result.body);
       return;
@@ -4179,6 +4744,7 @@ function cleanupPool() {
 function shutdown() {
   try {
     flushPendingWrites();
+    kvFlush();
   } catch (_) {}
   cleanupPool();
   process.exit(0);
@@ -4192,12 +4758,28 @@ process.on('unhandledRejection', (err) => {
   console.error('[workerd-runtime] Unhandled rejection:', err);
 });
 
+server.keepAliveTimeout = 65000; // longer than nginx's upstream keep-alive
+server.headersTimeout = 66000;
 server.on('error', (err) => {
   console.error(`[alex-aero] cannot listen on 127.0.0.1:${BACKEND_PORT}: ${err.message}`);
   process.exit(1);
 });
-server.listen(BACKEND_PORT, '127.0.0.1', () => {
-  console.log(`[alex-aero] backend listening on http://127.0.0.1:${BACKEND_PORT}`);
+// First boot in Docker etc.: create the login from the environment.
+if (!fs.existsSync(AUTH_FILE) && process.env.AX_ADMIN_PASSWORD) {
+  writeAuthFile(process.env.AX_ADMIN_USER || 'admin', process.env.AX_ADMIN_PASSWORD)
+    .then(() => console.log(`[alex-aero] login created for ${process.env.AX_ADMIN_USER || 'admin'}`))
+    .catch((err) => console.error('[alex-aero] could not create the login:', err.message));
+}
+
+server.listen(BACKEND_PORT, BIND_HOST, () => {
+  console.log(`[alex-aero] listening on http://${BIND_HOST}:${BACKEND_PORT}`);
   manageTunnelConnector(); // used to start only after saving settings, never at boot
+  scheduleTick();
+  // zero cold starts for anything used this week
+  const recent = Object.values(state.workers)
+    .filter((w) => w.lastRunAt && Date.now() - new Date(w.lastRunAt).getTime() < 7 * 86400e3)
+    .sort((a, b) => String(b.lastRunAt).localeCompare(String(a.lastRunAt)))
+    .slice(0, 8);
+  recent.forEach((w, i) => setTimeout(() => isWorkerdWorker(w.name) && ensureWorkerdInstance(w.name).catch(() => {}), 500 + i * 400).unref());
   setInterval(manageTunnelConnector, 60 * 1000).unref();
 });

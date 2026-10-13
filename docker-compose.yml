@@ -1,0 +1,19 @@
+# docker compose up -d   (./install.sh --docker writes the .env for you)
+services:
+  alex-aero:
+    build: .
+    image: alex-aero:latest
+    container_name: alex-aero
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${AX_PORT:-27715}:27715"
+    environment:
+      AX_ADMIN_USER: ${AX_ADMIN_USER:-admin}
+      AX_ADMIN_PASSWORD: ${AX_ADMIN_PASSWORD:?set AX_ADMIN_PASSWORD in .env (see .env.example)}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - alex-aero-data:/app/storage
+
+volumes:
+  alex-aero-data:
