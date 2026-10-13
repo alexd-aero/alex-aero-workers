@@ -130,6 +130,7 @@ const P = {
   layers: '<path d="m12 2 10 5-10 5L2 7z"/><path d="m2 17 10 5 10-5M2 12l10 5 10-5"/>',
   shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
   disk: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/>',
+  logout: '<path d="M15 4h4a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1h-4"/><path d="m10 17 5-5-5-5M15 12H3"/>',
   dots: '<circle cx="5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="19" cy="12" r="1.2"/>'
 };
 const icon = (name, cls = '') =>
@@ -183,6 +184,10 @@ async function api(method, url, body) {
     res = await fetch(url, opts);
   } catch (_) {
     throw new ApiError("Can't reach the Pi. Is Alex-Aero running?");
+  }
+  if (res.status === 401 && !url.startsWith('/api/account')) {
+    location.replace('/' + location.hash);
+    throw new ApiError('Signed out');
   }
   let data = null;
   try {
@@ -588,6 +593,7 @@ async function viewWorkers(view) {
     <div class="page-head">
       <div><h1 class="page-title">Workers</h1><p class="page-sub">Small programs running on ${esc(S.overview.system.hostname || 'this box')}. Save in the editor and they're live.</p></div>
     </div>
+    ${S.overview.authEnabled ? '' : `<div class="card card-pad row" style="margin-bottom:18px"><span class="tag warn"><span class="d"></span>No login</span><span class="grow hint" style="color:var(--text-2)">Anyone who can reach this page can run code on ${esc(S.overview.system.hostname || 'this machine')}.</span><a class="btn sm primary" href="#/system">Set a login</a></div>`}
     <div class="figures" id="stats"></div>
     <div class="toolbar">
       <div class="search">${icon('search')}<input class="input" id="wSearch" placeholder="Filter workers…" aria-label="Filter workers" value="${esc(store.get('ax-filter', ''))}"></div>
@@ -1982,6 +1988,7 @@ async function viewSystem(view) {
           }
         </div>
       </div>
+      <div class="card" style="margin-top:16px" id="account"></div>
       <div class="card" style="margin-top:16px"><div class="card-head"><h3>Command line</h3><span class="sub">on the Pi</span></div><div class="card-body stack" style="gap:8px">
         ${[['ax', 'menu: status, logs, restart, login, domain'], ['ax status', 'what’s running'], ['ax logs -f', 'follow the backend log'], ['ax passwd', 'change the dashboard login'], ['ax autostart on', 'start at boot, restart on crash']]
           .map(([c, d]) => `<div class="copy-line"><span>${esc(c)} <span style="color:var(--muted)"># ${esc(d)}</span></span><button class="icon-btn sm" data-copy="${esc(c)}">${icon('copy')}</button></div>`)
@@ -1995,6 +2002,7 @@ async function viewSystem(view) {
   };
   let data = await api('GET', '/api/system');
   paint(data);
+  renderAccount();
   view.onclick = (e) => {
     const c = e.target.closest('[data-copy]');
     if (c) return copy(c.dataset.copy);
@@ -2007,9 +2015,60 @@ async function viewSystem(view) {
   poll(async () => {
     try {
       data = await api('GET', '/api/system');
-      if (S.route.page === 'system' && !document.querySelector('.overlay')) paint(data);
+      if (S.route.page === 'system' && !document.querySelector('.overlay') && !$('#account')?.contains(document.activeElement)) {
+        paint(data);
+        renderAccount();
+      }
     } catch (_) {}
   }, 5000);
+}
+
+/* ============================================================ account */
+let accountCache = null;
+async function renderAccount() {
+  const box = $('#account');
+  if (!box) return;
+  if (!accountCache) accountCache = await api('GET', '/api/account').catch(() => null);
+  const a = accountCache;
+  if (!a) return;
+  box.innerHTML = `<div class="card-head"><h3>Login</h3><span class="sub">${a.authEnabled ? `Signed in as <b class="mono">${esc(a.username)}</b> · ${plural(a.sessions, 'signed-in device')}` : 'Not set: the dashboard is open to anyone who can reach it'}</span>
+      ${a.authEnabled ? `<span class="tools"><button class="btn sm ghost" id="accOthers">Sign out other devices</button></span>` : ''}</div>
+    <form class="card-body stack" id="accForm" autocomplete="off">
+      <div class="grid2">
+        <div class="field"><label for="accUser">Username</label><input class="input mono" id="accUser" value="${esc(a.username || 'admin')}" autocomplete="username"></div>
+        ${a.authEnabled ? `<div class="field"><label for="accCur">Current password</label><input class="input" id="accCur" type="password" autocomplete="current-password"></div>` : '<div></div>'}
+      </div>
+      <div class="grid2">
+        <div class="field"><label for="accNew">New password</label><input class="input" id="accNew" type="password" autocomplete="new-password" placeholder="At least 8 characters"></div>
+        <div class="field"><label for="accNew2">New password again</label><input class="input" id="accNew2" type="password" autocomplete="new-password"></div>
+      </div>
+      <div class="row"><span class="grow hint">${a.authEnabled ? 'Changing it signs out every other device.' : 'Once set, the dashboard asks for this login.'}</span><button class="btn primary">${a.authEnabled ? 'Change login' : 'Set login'}</button></div>
+    </form>`;
+  $('#accForm').onsubmit = async (e) => {
+    e.preventDefault();
+    if ($('#accNew').value !== $('#accNew2').value) return toast("The new passwords don't match", 'err');
+    const r = await attempt(() =>
+      api('POST', '/api/account', { username: $('#accUser').value.trim(), currentPassword: $('#accCur') ? $('#accCur').value : '', newPassword: $('#accNew').value })
+    );
+    if (r) {
+      toast(a.authEnabled ? 'Login changed' : 'Login set. You are signed in');
+      accountCache = null;
+      loadOverview().catch(() => {});
+      renderAccount();
+    }
+  };
+  const others = $('#accOthers');
+  if (others)
+    others.onclick = async () => {
+      if (await attempt(() => api('DELETE', '/api/account/sessions'), 'Other devices signed out')) {
+        accountCache = null;
+        renderAccount();
+      }
+    };
+}
+async function signOut() {
+  await fetch('/api/logout', { method: 'POST' }).catch(() => {});
+  location.replace('/');
 }
 
 /* ============================================================ palette */
@@ -2018,6 +2077,7 @@ function openPalette() {
   const items = [
     ...NAV.map((n) => ({ label: n.label, sec: 'Page', ico: icon(n.icon), go: () => (location.hash = n.href) })),
     { label: 'New worker', sec: 'Action', ico: icon('plus'), go: () => newWorkerDialog() },
+    { label: 'Sign out', sec: 'Action', ico: icon('logout'), go: signOut },
     { label: `Switch to ${S.theme === 'dark' ? 'light' : 'dark'} theme`, sec: 'Action', ico: icon(S.theme === 'dark' ? 'sun' : 'moon'), go: toggleTheme },
     {
       label: `Use the ${store.get('ax-editor', 'monaco') === 'basic' ? 'full (Monaco)' : 'basic, offline'} editor`,
@@ -2107,6 +2167,8 @@ function boot() {
   $('#menuBtn').onclick = openNav;
   $('#scrim').onclick = closeNav;
   $('#paletteBtn').onclick = openPalette;
+  $('#signOutBtn').innerHTML = icon('logout');
+  $('#signOutBtn').onclick = signOut;
   document.addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
       e.preventDefault();

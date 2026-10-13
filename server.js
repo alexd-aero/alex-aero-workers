@@ -2974,9 +2974,20 @@ function serveStaticFile(res, filePath, contentType) {
   res.end(content);
 }
 
+// ============================================================================
+// Sign-in: a real login page + session cookies. HTTP Basic still works for
+// scripts (curl -u), but browsers never see the native popup any more (it
+// autofilled junk usernames and locked people out).
+// ============================================================================
 let authCfgCache = { mtimeMs: -1, data: null };
-const authOkCache = new Map(); // Authorization header -> expiry
-const authFailures = new Map(); // client ip -> { count, first, lockedUntil }
+const basicOkCache = new Map(); // Authorization header -> expiry
+const loginFailures = new Map(); // client ip -> { attempts:Set, first, lockedUntil }
+const LOCK_AFTER = 8; // distinct wrong passwords
+const LOCK_WINDOW_MS = 15 * 60 * 1000;
+const LOCK_FOR_MS = 10 * 60 * 1000;
+const SESSION_COOKIE = 'ax_session';
+const SESSION_TTL_MS = 30 * 24 * 3600 * 1000;
+const SESSIONS_FILE = path.join(STORAGE_DIR, 'sessions.json');
 
 function loadAuthConfig() {
   let mtimeMs = 0;
@@ -2984,7 +2995,7 @@ function loadAuthConfig() {
     mtimeMs = fs.statSync(AUTH_FILE).mtimeMs;
   } catch (_) {
     authCfgCache = { mtimeMs: 0, data: null };
-    authOkCache.clear();
+    basicOkCache.clear();
     return null;
   }
   if (mtimeMs !== authCfgCache.mtimeMs) {
@@ -2994,100 +3005,159 @@ function loadAuthConfig() {
       if (parsed && parsed.authEnabled && parsed.username && parsed.passwordHash && parsed.salt) data = parsed;
     } catch (_) {}
     authCfgCache = { mtimeMs, data };
-    authOkCache.clear(); // a new password signs everyone out
+    basicOkCache.clear();
   }
   return authCfgCache.data;
 }
+// Changes whenever the password does, which invalidates every session.
+const passwordStamp = (cfg) => crypto.createHash('sha256').update(`${cfg.username}:${cfg.passwordHash}`).digest('hex').slice(0, 16);
 
 function scryptAsync(pass, salt) {
   return new Promise((resolve, reject) =>
     crypto.scrypt(pass, salt, 64, (err, key) => (err ? reject(err) : resolve(key)))
   );
 }
-
-// Was: a synchronous scrypt (tens of ms on a Pi) on *every* dashboard request,
-// re-reading auth.json each time, with no limit on guesses.
-async function checkBasicAuth(req, clientIp) {
-  const authCfg = loadAuthConfig();
-  if (!authCfg) {
-    return { authenticated: true, username: config.username || 'admin', authRequired: false };
-  }
-  const header = req.headers['authorization'] || '';
-  if (!header.toLowerCase().startsWith('basic ')) {
-    return { authenticated: false, authRequired: true };
-  }
-  const cachedUntil = authOkCache.get(header);
-  if (cachedUntil && cachedUntil > Date.now()) {
-    return { authenticated: true, username: authCfg.username, authRequired: true };
-  }
-
-  const fail = authFailures.get(clientIp);
-  if (fail && fail.lockedUntil > Date.now()) {
-    return { authenticated: false, authRequired: true, locked: true };
-  }
-
-  let ok = false;
+async function verifyPassword(cfg, user, pass) {
   try {
-    const decoded = Buffer.from(header.slice(6).trim(), 'base64').toString('utf8');
-    const colonIdx = decoded.indexOf(':');
-    if (colonIdx !== -1) {
-      const user = decoded.slice(0, colonIdx);
-      const pass = decoded.slice(colonIdx + 1);
-      const a = await scryptAsync(pass, authCfg.salt);
-      const b = Buffer.from(authCfg.passwordHash, 'hex');
-      const userOk = crypto.timingSafeEqual(
-        crypto.createHash('sha256').update(user).digest(),
-        crypto.createHash('sha256').update(authCfg.username).digest()
-      );
-      ok = userOk && a.length === b.length && crypto.timingSafeEqual(a, b);
-    }
-  } catch (_) {}
-
-  if (ok) {
-    authFailures.delete(clientIp);
-    if (authOkCache.size > 500) authOkCache.clear();
-    authOkCache.set(header, Date.now() + 10 * 60 * 1000);
-    return { authenticated: true, username: authCfg.username, authRequired: true };
+    const a = await scryptAsync(String(pass), cfg.salt);
+    const b = Buffer.from(cfg.passwordHash, 'hex');
+    const userOk = crypto.timingSafeEqual(
+      crypto.createHash('sha256').update(String(user)).digest(),
+      crypto.createHash('sha256').update(cfg.username).digest()
+    );
+    return userOk && a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch (_) {
+    return false;
   }
-
-  const now = Date.now();
-  const entry = fail && now - fail.first < 15 * 60 * 1000 ? fail : { count: 0, first: now, lockedUntil: 0 };
-  entry.count += 1;
-  if (entry.count >= 10) entry.lockedUntil = now + 15 * 60 * 1000;
-  authFailures.set(clientIp, entry);
-  if (authFailures.size > 5000) authFailures.clear();
-  await new Promise((r) => setTimeout(r, 400)); // slow down guessing
-  return { authenticated: false, authRequired: true };
+}
+async function writeAuthFile(username, password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const passwordHash = (await scryptAsync(password, salt)).toString('hex');
+  writeJsonAtomic(AUTH_FILE, { authEnabled: true, username, salt, passwordHash, updatedAt: new Date().toISOString() }, 0o600);
+  loadAuthConfig();
 }
 
-function sendBasicAuthChallenge(res, locked = false) {
-  if (locked) {
-    res.writeHead(429, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'Retry-After': '900' });
-    res.end('Too many wrong passwords. Try again in 15 minutes.');
-    return;
+// ---- lockout: the same wrong password retried over and over counts once
+function lockRemaining(ip) {
+  const f = loginFailures.get(ip);
+  return f && f.lockedUntil > Date.now() ? Math.ceil((f.lockedUntil - Date.now()) / 1000) : 0;
+}
+function recordFailure(ip, user, pass) {
+  const now = Date.now();
+  let f = loginFailures.get(ip);
+  if (!f || now - f.first > LOCK_WINDOW_MS) f = { attempts: new Set(), first: now, lockedUntil: 0 };
+  f.attempts.add(crypto.createHash('sha256').update(`${user}\u0000${pass}`).digest('hex').slice(0, 16));
+  if (f.attempts.size >= LOCK_AFTER) f.lockedUntil = now + LOCK_FOR_MS;
+  loginFailures.set(ip, f);
+  if (loginFailures.size > 5000) loginFailures.clear();
+  return LOCK_AFTER - f.attempts.size;
+}
+
+// ---- sessions (only a hash of each token is stored)
+let sessions = new Map();
+try {
+  const raw = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
+  for (const [k, v] of Object.entries(raw || {})) if (v && v.expires > Date.now()) sessions.set(k, v);
+} catch (_) {}
+const saveSessionsSoon = (() => {
+  let t = null;
+  return () => {
+    if (t) return;
+    t = setTimeout(() => {
+      t = null;
+      try {
+        writeJsonAtomic(SESSIONS_FILE, Object.fromEntries(sessions), 0o600);
+      } catch (_) {}
+    }, 500);
+  };
+})();
+const tokenHash = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
+function parseCookies(req) {
+  const out = {};
+  for (const part of String(req.headers.cookie || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
   }
-  res.writeHead(401, {
-    'WWW-Authenticate': 'Basic realm="Alex-Aero", charset="UTF-8"',
-    'Content-Type': 'text/plain; charset=utf-8',
-    'Cache-Control': 'no-store'
+  return out;
+}
+function isHttps(req) {
+  return String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+}
+function sessionCookie(req, token, maxAgeSec) {
+  return `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSec}${isHttps(req) ? '; Secure' : ''}`;
+}
+function createSession(req, cfg) {
+  const token = crypto.randomBytes(32).toString('base64url');
+  sessions.set(tokenHash(token), {
+    user: cfg.username,
+    stamp: passwordStamp(cfg),
+    created: Date.now(),
+    expires: Date.now() + SESSION_TTL_MS,
+    ua: String(req.headers['user-agent'] || '').slice(0, 160)
   });
-  res.end('Sign-in required to access Alex-Aero (ax.).');
+  if (sessions.size > 200) {
+    const oldest = [...sessions.entries()].sort((a, b) => a[1].created - b[1].created).slice(0, sessions.size - 200);
+    oldest.forEach(([k]) => sessions.delete(k));
+  }
+  saveSessionsSoon();
+  return token;
+}
+function sessionFor(req, cfg) {
+  const token = parseCookies(req)[SESSION_COOKIE];
+  if (!token) return null;
+  const h = tokenHash(token);
+  const s = sessions.get(h);
+  if (!s) return null;
+  if (s.expires < Date.now() || s.stamp !== passwordStamp(cfg)) {
+    sessions.delete(h);
+    saveSessionsSoon();
+    return null;
+  }
+  return s;
+}
+
+// { ok, user, open } | { ok:false, locked:seconds }
+async function authenticate(req, clientIp) {
+  const cfg = loadAuthConfig();
+  if (!cfg) return { ok: true, user: config.username || 'admin', open: true };
+  const s = sessionFor(req, cfg);
+  if (s) return { ok: true, user: s.user };
+  const header = String(req.headers['authorization'] || '');
+  if (!header.toLowerCase().startsWith('basic ')) return { ok: false };
+  const cached = basicOkCache.get(header);
+  if (cached && cached > Date.now()) return { ok: true, user: cfg.username };
+  const locked = lockRemaining(clientIp);
+  if (locked) return { ok: false, locked };
+  const decoded = Buffer.from(header.slice(6).trim(), 'base64').toString('utf8');
+  const i = decoded.indexOf(':');
+  const user = i === -1 ? decoded : decoded.slice(0, i);
+  const pass = i === -1 ? '' : decoded.slice(i + 1);
+  if (await verifyPassword(cfg, user, pass)) {
+    loginFailures.delete(clientIp);
+    if (basicOkCache.size > 500) basicOkCache.clear();
+    basicOkCache.set(header, Date.now() + 10 * 60 * 1000);
+    return { ok: true, user: cfg.username };
+  }
+  recordFailure(clientIp, user, pass);
+  await new Promise((r) => setTimeout(r, 400));
+  return { ok: false };
 }
 
 const DASHBOARD_FILES = {
   '/': ['index.html', 'text/html; charset=utf-8'],
   '/index.html': ['index.html', 'text/html; charset=utf-8'],
   '/editor': ['index.html', 'text/html; charset=utf-8'],
-  '/styles.css': ['styles.css', 'text/css; charset=utf-8'],
-  '/app.js': ['app.js', 'application/javascript; charset=utf-8'],
-  '/lang-icons.js': ['lang-icons.js', 'application/javascript; charset=utf-8']
+  '/styles.css': ['styles.css', 'text/css; charset=utf-8', true],
+  '/app.js': ['app.js', 'application/javascript; charset=utf-8', true],
+  '/lang-icons.js': ['lang-icons.js', 'application/javascript; charset=utf-8', true],
+  '/login': ['login.html', 'text/html; charset=utf-8', true]
 };
+const PUBLIC_API = new Set(['/api/health', '/api/login', '/api/logout', '/api/session']);
 
 function isProtectedManagementPath(pathname) {
-  // Every /api/* route except the health probe. (The old allow-list missed
-  // routes as they were added.)
-  if (DASHBOARD_FILES[pathname]) return true;
-  return pathname.startsWith('/api/') && pathname !== '/api/health';
+  // The dashboard page and every /api/* route except the sign-in ones.
+  if (DASHBOARD_FILES[pathname]) return !DASHBOARD_FILES[pathname][2];
+  return pathname.startsWith('/api/') && !PUBLIC_API.has(pathname);
 }
 
 // The dashboard uses HTTP Basic auth, which the browser attaches to *any*
@@ -3282,17 +3352,68 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Sign-in (browser Basic auth) on the dashboard and every management API
-    // route; worker routes (/example, …) stay public.
-    if (isManagement) {
-      const auth = await checkBasicAuth(req, clientIpOf(req));
-      if (!auth.authenticated) {
-        sendBasicAuthChallenge(res, auth.locked);
+    const clientIp = clientIpOf(req);
+
+    // ---- sign-in endpoints (public, but same-origin only)
+    if (PUBLIC_API.has(pathname) && pathname !== '/api/health') {
+      if (req.method !== 'GET' && isCrossSiteRequest(req)) throw new HttpError(403, 'Cross-site request blocked');
+      const cfg = loadAuthConfig();
+      if (pathname === '/api/session' && req.method === 'GET') {
+        const auth = await authenticate(req, clientIp);
+        sendJson(res, 200, { authEnabled: Boolean(cfg), signedIn: auth.ok, username: auth.ok ? auth.user : null, lockedFor: lockRemaining(clientIp) });
         return;
       }
-      if (auth.username && config.username !== auth.username) {
-        config.username = auth.username;
+      if (pathname === '/api/login' && req.method === 'POST') {
+        const body = await readJsonBody(req);
+        if (!cfg) {
+          sendJson(res, 200, { ok: true, open: true });
+          return;
+        }
+        const locked = lockRemaining(clientIp);
+        if (locked) throw Object.assign(new HttpError(429, `Too many wrong passwords. Try again in ${Math.ceil(locked / 60)} min.`), { retryAfter: locked });
+        const user = String(body.username || '').trim();
+        const pass = String(body.password || '');
+        if (await verifyPassword(cfg, user, pass)) {
+          loginFailures.delete(clientIp);
+          const token = createSession(req, cfg);
+          res.setHeader('Set-Cookie', sessionCookie(req, token, Math.floor(SESSION_TTL_MS / 1000)));
+          sendJson(res, 200, { ok: true, username: cfg.username });
+          return;
+        }
+        const left = recordFailure(clientIp, user, pass);
+        await new Promise((r) => setTimeout(r, 400));
+        const lockedNow = lockRemaining(clientIp);
+        if (lockedNow) throw Object.assign(new HttpError(429, `Too many wrong passwords. Try again in ${Math.ceil(lockedNow / 60)} min.`), { retryAfter: lockedNow });
+        throw new HttpError(401, left <= 3 ? `Wrong username or password. ${left} more ${left === 1 ? 'try' : 'tries'} before a 10-minute pause.` : 'Wrong username or password.');
       }
+      if (pathname === '/api/logout' && req.method === 'POST') {
+        const token = parseCookies(req)[SESSION_COOKIE];
+        if (token) {
+          sessions.delete(tokenHash(token));
+          saveSessionsSoon();
+        }
+        res.setHeader('Set-Cookie', sessionCookie(req, '', 0));
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+    }
+
+    // Sign-in on the dashboard and every management API route; worker routes
+    // (/example, …) stay public.
+    if (isManagement) {
+      const auth = await authenticate(req, clientIp);
+      if (!auth.ok) {
+        if (DASHBOARD_FILES[pathname] && req.method === 'GET') {
+          serveStaticFile(res, path.join(PUBLIC_DIR, 'login.html'), 'text/html; charset=utf-8');
+        } else if (auth.locked) {
+          res.setHeader('Retry-After', String(auth.locked));
+          sendJson(res, 429, { error: 'Too many wrong passwords', retryAfter: auth.locked });
+        } else {
+          sendJson(res, 401, { error: 'Sign in required' });
+        }
+        return;
+      }
+      if (auth.user && config.username !== auth.user) config.username = auth.user;
       if (req.method !== 'GET' && req.method !== 'HEAD' && isCrossSiteRequest(req)) {
         sendJson(res, 403, { error: 'Cross-site request blocked' });
         return;
@@ -3303,6 +3424,41 @@ const server = http.createServer(async (req, res) => {
       const [file, type] = DASHBOARD_FILES[pathname];
       if (file === 'index.html') parseClientAndDevice(req, true);
       serveStaticFile(res, path.join(PUBLIC_DIR, file), type);
+      return;
+    }
+
+    // ---- account: set / change the login from the dashboard
+    if (pathname === '/api/account' && req.method === 'GET') {
+      const cfg = loadAuthConfig();
+      sendJson(res, 200, { authEnabled: Boolean(cfg), username: cfg ? cfg.username : null, sessions: cfg ? [...sessions.values()].filter((x) => x.stamp === passwordStamp(cfg)).length : 0 });
+      return;
+    }
+    if (pathname === '/api/account' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      const cfg = loadAuthConfig();
+      const username = String(body.username || (cfg && cfg.username) || 'admin').trim();
+      const password = String(body.newPassword || '');
+      if (!/^[A-Za-z0-9._@-]{1,64}$/.test(username)) throw new HttpError(400, 'Username: letters, digits, . _ @ - only');
+      if (password.length < 8) throw new HttpError(400, 'Use at least 8 characters for the password');
+      if (cfg && !(await verifyPassword(cfg, cfg.username, body.currentPassword || ''))) {
+        recordFailure(clientIp, cfg.username, String(body.currentPassword || ''));
+        throw new HttpError(401, 'Current password is wrong');
+      }
+      await writeAuthFile(username, password);
+      const fresh = loadAuthConfig();
+      sessions.clear(); // everyone else is signed out
+      const token = createSession(req, fresh);
+      res.setHeader('Set-Cookie', sessionCookie(req, token, Math.floor(SESSION_TTL_MS / 1000)));
+      sendJson(res, 200, { ok: true, username });
+      return;
+    }
+    if (pathname === '/api/account/sessions' && req.method === 'DELETE') {
+      const keep = parseCookies(req)[SESSION_COOKIE];
+      const mine = keep && sessions.get(tokenHash(keep));
+      sessions.clear();
+      if (mine) sessions.set(tokenHash(keep), mine);
+      saveSessionsSoon();
+      sendJson(res, 200, { ok: true });
       return;
     }
 
@@ -4001,7 +4157,8 @@ const server = http.createServer(async (req, res) => {
       res.end();
       return;
     }
-    sendJson(res, status, { error: status >= 500 ? 'Internal server error' : err.message, message: err.message });
+    if (err.retryAfter) res.setHeader('Retry-After', String(err.retryAfter));
+    sendJson(res, status, { error: status >= 500 ? 'Internal server error' : err.message, message: err.message, retryAfter: err.retryAfter });
   }
 });
 

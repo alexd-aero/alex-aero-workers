@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sign in · Alex·Aero</title>
+  <meta name="color-scheme" content="dark light" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%2032%2032%22%3E%3Crect%20width%3D%2232%22%20height%3D%2232%22%20rx%3D%229%22%20fill%3D%22%23ecdcbf%22/%3E%3Cpath%20fill%3D%22%231b1915%22%20d%3D%22M15.2%205.4%20L15.2%2020.7%20L4.6%2026.2%20Z%22/%3E%3Cpath%20fill%3D%22%231b1915%22%20fill-opacity%3D%22.5%22%20d%3D%22M16.8%205.4%20L27.4%2026.2%20L16.8%2020.7%20Z%22/%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400..700&display=swap" />
+  <link rel="stylesheet" href="/styles.css" />
+  <script>
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem('ax-theme'); } catch (_) {}
+      if (!t) t = window.matchMedia && matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+      document.documentElement.dataset.theme = t;
+    })();
+  </script>
+  <style>
+    body { display: grid; place-items: center; min-height: 100vh; padding: 24px 16px; }
+    .signin { width: 100%; max-width: 380px; animation: rise 0.5s var(--ease); }
+    .signin .card { padding: 30px 28px 26px; background: var(--card); border: 1px solid var(--line); box-shadow: var(--shadow); border-radius: 22px; }
+    .signin .mark { width: 44px; height: 44px; display: block; margin-bottom: 22px; }
+    .signin h1 { margin: 0; font: 600 22px/1.25 var(--display); letter-spacing: -0.025em; }
+    .signin p.lead { margin: 6px 0 24px; color: var(--muted); }
+    .signin form { display: flex; flex-direction: column; gap: 14px; }
+    .signin .input { height: 44px; background: var(--well); font-size: 14.5px; }
+    .signin .btn.primary { height: 44px; margin-top: 6px; font-size: 14.5px; }
+    .signin .msg { min-height: 20px; font-size: 13px; color: var(--err); margin: 2px 0 0; transition: opacity 0.25s; }
+    .signin .msg:empty { opacity: 0; }
+    .signin .foot { margin-top: 18px; text-align: center; font-size: 12.5px; color: var(--muted); }
+    .signin .foot code { background: var(--well); padding: 2px 7px; border-radius: 6px; }
+    .shake { animation: shake 0.42s var(--ease); }
+    @keyframes shake { 20%, 60% { transform: translateX(-6px); } 40%, 80% { transform: translateX(6px); } }
+    .mark .tile { fill: var(--ac); } .mark .g { fill: var(--ac-ink); } .mark .s { fill: var(--ac-ink); opacity: 0.5; }
+  </style>
+</head>
+<body>
+  <main class="signin">
+    <div class="card">
+      <svg class="mark" viewBox="0 0 32 32" aria-hidden="true"><rect class="tile" width="32" height="32" rx="9"/><path class="g" d="M15.2 5.4 L15.2 20.7 L4.6 26.2 Z"/><path class="s" d="M16.8 5.4 L27.4 26.2 L16.8 20.7 Z"/></svg>
+      <h1>Sign in to Alex·Aero</h1>
+      <p class="lead">Your workers dashboard.</p>
+      <form id="f" autocomplete="on" novalidate>
+        <div class="field"><label for="u">Username</label><input class="input" id="u" name="username" autocomplete="username" autocapitalize="off" spellcheck="false" required></div>
+        <div class="field"><label for="p">Password</label><input class="input" id="p" name="password" type="password" autocomplete="current-password" required></div>
+        <p class="msg" id="m" role="alert"></p>
+        <button class="btn primary" id="go" type="submit">Sign in</button>
+      </form>
+    </div>
+    <p class="foot">Forgot it? On the Pi run <code>ax passwd</code></p>
+  </main>
+  <script>
+    (function () {
+      var f = document.getElementById('f'), u = document.getElementById('u'), p = document.getElementById('p');
+      var m = document.getElementById('m'), go = document.getElementById('go'), card = document.querySelector('.card');
+      var timer = null;
+      function lock(sec) {
+        clearInterval(timer);
+        go.disabled = true;
+        var end = Date.now() + sec * 1000;
+        (function tick() {
+          var left = Math.max(0, Math.round((end - Date.now()) / 1000));
+          if (!left) { clearInterval(timer); go.disabled = false; m.textContent = ''; return; }
+          m.textContent = 'Too many wrong passwords. Try again in ' + Math.floor(left / 60) + ':' + String(left % 60).padStart(2, '0') + '.';
+          if (!timer) timer = setInterval(tick, 1000);
+        })();
+      }
+      fetch('/api/session').then(function (r) { return r.json(); }).then(function (s) {
+        if (s.signedIn || !s.authEnabled) return location.replace('/');
+        if (s.lockedFor) lock(s.lockedFor);
+      }).catch(function () {});
+      try { var last = localStorage.getItem('ax-user'); if (last) u.value = last; } catch (_) {}
+      (u.value ? p : u).focus();
+      f.addEventListener('submit', function (e) {
+        e.preventDefault();
+        if (!u.value.trim() || !p.value) { m.textContent = 'Enter your username and password.'; return; }
+        go.disabled = true; go.textContent = 'Signing in…'; m.textContent = '';
+        fetch('/api/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: u.value.trim(), password: p.value }) })
+          .then(function (r) { return r.json().then(function (d) { return { r: r, d: d }; }); })
+          .then(function (x) {
+            if (x.r.ok) {
+              try { localStorage.setItem('ax-user', u.value.trim()); } catch (_) {}
+              location.replace('/' + location.hash);
+              return;
+            }
+            go.disabled = false; go.textContent = 'Sign in';
+            card.classList.remove('shake'); void card.offsetWidth; card.classList.add('shake');
+            p.value = ''; p.focus();
+            if (x.r.status === 429 && x.d.retryAfter) return lock(x.d.retryAfter);
+            m.textContent = x.d.message || x.d.error || 'Sign-in failed.';
+          })
+          .catch(function () { go.disabled = false; go.textContent = 'Sign in'; m.textContent = "Can't reach Alex·Aero."; });
+      });
+    })();
+  </script>
+</body>
+</html>
