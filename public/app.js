@@ -686,7 +686,8 @@ function renderStats() {
     return acc;
   }, { ms: 0, n: 0 });
   const memPct = sys.memoryTotalMb ? Math.round((sys.memoryUsedMb / sys.memoryTotalMb) * 100) : 0;
-  const errRate = o.totals.requestsToday ? ((o.totals.errorsToday / o.totals.requestsToday) * 100).toFixed(1) : '0';
+  const rate = o.totals.requestsToday ? (o.totals.errorsToday / o.totals.requestsToday) * 100 : 0;
+  const errRate = rate > 0 && rate < 0.1 ? '<0.1' : rate.toFixed(1);
   const lastHour = merged[new Date().toISOString().slice(0, 13)];
   const temp = sys.cpuTempC !== null && sys.cpuTempC !== undefined;
   $('#stats').innerHTML = `
