@@ -739,33 +739,118 @@ function inferLanguageFromFilename(filename) {
   return byExt ? byExt.id : 'plaintext';
 }
 
+// A file's name inside its worker folder, as a relative path: "a/b/c.js".
+// Each segment is cleaned on its own, so ".." and dotfiles can never get through.
+const MAX_FILE_DEPTH = 8;
 function sanitizeFileName(rawFile) {
-  const base = path.basename(String(rawFile || '').trim());
-  const cleaned = base.replace(/[^a-zA-Z0-9._-]/g, '-').replace(/^-+|-+$/g, '');
-  if (!cleaned || cleaned === 'meta.json' || cleaned.startsWith('.')) {
-    return null;
+  const parts = String(rawFile || '')
+    .trim()
+    .replace(/\\/g, '/')
+    .split('/')
+    .filter((p) => p && p !== '.');
+  if (!parts.length || parts.length > MAX_FILE_DEPTH) return null;
+  const clean = [];
+  for (const part of parts) {
+    const seg = part.replace(/[^a-zA-Z0-9._-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 80);
+    if (!seg || seg.startsWith('.')) return null;
+    clean.push(seg);
   }
-  return cleaned.slice(0, 80);
+  const rel = clean.join('/');
+  return rel === 'meta.json' ? null : rel;
+}
+
+// Path of a sanitized file inside a worker folder, with its parent folders made.
+function workerFilePath(workerDir, safeName, makeParents = false) {
+  const full = path.join(workerDir, safeName);
+  if (makeParents) fs.mkdirSync(path.dirname(full), { recursive: true });
+  return full;
+}
+
+// Text vs binary: a NUL byte in the first 8 KB, like git.
+const UPLOAD_IMAGE_TYPES = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  avif: 'image/avif',
+  ico: 'image/x-icon',
+  bmp: 'image/bmp'
+};
+// Content types for binary files a worker serves from its folder.
+const BINARY_TYPES = {
+  ...UPLOAD_IMAGE_TYPES,
+  pdf: 'application/pdf',
+  woff: 'font/woff',
+  woff2: 'font/woff2',
+  ttf: 'font/ttf',
+  otf: 'font/otf',
+  mp3: 'audio/mpeg',
+  wav: 'audio/wav',
+  ogg: 'audio/ogg',
+  mp4: 'video/mp4',
+  webm: 'video/webm',
+  zip: 'application/zip',
+  wasm: 'application/wasm'
+};
+
+function looksBinary(buf) {
+  return buf.subarray(0, 8192).includes(0);
+}
+
+const SKIP_DIRS = new Set(['node_modules', '__pycache__']);
+const MAX_LISTED_FILES = 2000;
+// Every file (recursively) and every folder in a worker's directory.
+function walkWorkerDir(workerDir) {
+  const files = [];
+  const dirs = [];
+  const walk = (abs, rel, depth) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(abs, { withFileTypes: true });
+    } catch (_) {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue;
+      const r = rel ? `${rel}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        if (SKIP_DIRS.has(entry.name) || depth >= MAX_FILE_DEPTH - 1) continue;
+        dirs.push(r);
+        walk(path.join(abs, entry.name), r, depth + 1);
+      } else if (entry.isFile() && r !== 'meta.json' && files.length < MAX_LISTED_FILES) {
+        files.push(r);
+      }
+    }
+  };
+  walk(workerDir, '', 0);
+  return { files, dirs };
+}
+
+function listWorkerFolders(workerName) {
+  const workerDir = path.join(WORKERS_DIR, workerName);
+  if (!fs.existsSync(workerDir)) return [];
+  return walkWorkerDir(workerDir).dirs.sort();
 }
 
 function listWorkerFiles(workerName) {
   const workerDir = path.join(WORKERS_DIR, workerName);
   if (!fs.existsSync(workerDir)) return [];
-  const entries = fs.readdirSync(workerDir, { withFileTypes: true });
   const files = [];
-  for (const entry of entries) {
-    if (!entry.isFile()) continue;
-    if (entry.name === 'meta.json' || entry.name.startsWith('.')) continue;
-    const fullPath = path.join(workerDir, entry.name);
+  for (const rel of walkWorkerDir(workerDir).files) {
+    const fullPath = path.join(workerDir, rel);
     try {
       const stat = fs.statSync(fullPath);
-      const content = fs.readFileSync(fullPath, 'utf8');
+      const buf = fs.readFileSync(fullPath);
+      const binary = looksBinary(buf);
       files.push({
-        name: entry.name,
+        name: rel,
         sizeBytes: stat.size,
         updatedAt: stat.mtime.toISOString(),
-        language: inferLanguageFromFilename(entry.name),
-        content
+        language: binary ? 'binary' : inferLanguageFromFilename(rel),
+        binary,
+        // binary files are served straight from disk and never edited as text
+        content: binary ? '' : buf.toString('utf8')
       });
     } catch (_) {}
   }
@@ -999,10 +1084,9 @@ function readWorkerCodeFromStorage(name, targetFile) {
     } catch (_) {}
   }
   if (fs.existsSync(workerDir)) {
-    const files = fs
-      .readdirSync(workerDir, { withFileTypes: true })
-      .filter((e) => e.isFile() && e.name !== 'meta.json' && !e.name.startsWith('.'))
-      .map((e) => e.name);
+    const files = listWorkerFiles(name)
+      .filter((f) => !f.binary)
+      .map((f) => f.name);
     if (files.length > 0) {
       meta.filename = files[0];
       return fs.readFileSync(path.join(workerDir, files[0]), 'utf8');
@@ -1019,7 +1103,7 @@ const bundleWatchers = new Map();
 function watchWorkerDir(name) {
   if (bundleWatchers.has(name)) return;
   try {
-    const w = fs.watch(path.join(WORKERS_DIR, name), (_evt, file) => {
+    const w = fs.watch(path.join(WORKERS_DIR, name), { recursive: true }, (_evt, file) => {
       if (file === 'meta.json' || String(file || '').endsWith('.tmp')) return;
       bundleCache.delete(name);
     });
@@ -1048,7 +1132,7 @@ function getWorkerBundle(name) {
   );
   b = {
     files,
-    filesMap: Object.fromEntries(files.map((f) => [f.name, f.content])),
+    filesMap: Object.fromEntries(files.filter((f) => !f.binary).map((f) => [f.name, f.content])),
     rawCode: entry ? entry.content : '',
     totalBytes: files.reduce((n, f) => n + (f.sizeBytes || 0), 0),
     hasExecutableJsWorker,
@@ -1123,10 +1207,7 @@ function createOrUpdateWorker(rawName, options = {}) {
     fs.mkdirSync(workerDir, { recursive: true });
   }
 
-  const existingDiskFiles = fs
-    .readdirSync(workerDir, { withFileTypes: true })
-    .filter((e) => e.isFile() && e.name !== 'meta.json' && !e.name.startsWith('.'))
-    .map((e) => e.name);
+  const existingDiskFiles = walkWorkerDir(workerDir).files;
 
   const safeOptionFilename = sanitizeFileName(options.filename);
   const safeTarget = options.targetFilename ? sanitizeFileName(options.targetFilename) : '';
@@ -1146,7 +1227,7 @@ function createOrUpdateWorker(rawName, options = {}) {
   }
 
   const oldFilename = existing.filename;
-  const newFilePath = path.join(workerDir, filename);
+  const newFilePath = workerFilePath(workerDir, filename, true);
   const eol = options.eol || existing.eol || 'LF';
   const normalizeEol = (str) =>
     eol === 'CRLF' ? String(str || '').replace(/\r?\n/g, '\r\n') : String(str || '').replace(/\r\n/g, '\n');
@@ -1157,14 +1238,14 @@ function createOrUpdateWorker(rawName, options = {}) {
       if (!f || typeof f.content !== 'string') continue;
       const safeSubName = sanitizeFileName(f.name);
       if (safeSubName) {
-        fs.writeFileSync(path.join(workerDir, safeSubName), normalizeEol(f.content), 'utf8');
+        fs.writeFileSync(workerFilePath(workerDir, safeSubName, true), normalizeEol(f.content), 'utf8');
       }
     }
   }
 
   // If a specific file was edited, save it to its own file on disk
   if (safeTarget && typeof options.targetFileContent === 'string') {
-    fs.writeFileSync(path.join(workerDir, safeTarget), normalizeEol(options.targetFileContent), 'utf8');
+    fs.writeFileSync(workerFilePath(workerDir, safeTarget, true), normalizeEol(options.targetFileContent), 'utf8');
   }
 
   let codeToWrite = options.code;
@@ -1285,11 +1366,24 @@ function createOrUpdateWorker(rawName, options = {}) {
 // with big assets doesn't balloon meta.json; past the cap only the entry
 // file is kept (the old behaviour).
 const SNAPSHOT_LIMIT_BYTES = 512 * 1024;
+// Binary files are kept as { b64 } so a rollback restores uploads too.
 function snapshotWorkerFiles(name) {
   const files = listWorkerFiles(name);
-  const total = files.reduce((n, f) => n + Buffer.byteLength(f.content || ''), 0);
-  if (total > SNAPSHOT_LIMIT_BYTES) return null;
-  return Object.fromEntries(files.map((f) => [f.name, f.content]));
+  const dir = path.join(WORKERS_DIR, name);
+  let total = 0;
+  const snap = {};
+  for (const f of files) {
+    if (f.binary) {
+      const b64 = fs.readFileSync(path.join(dir, f.name)).toString('base64');
+      total += b64.length;
+      snap[f.name] = { b64 };
+    } else {
+      total += Buffer.byteLength(f.content || '');
+      snap[f.name] = f.content;
+    }
+    if (total > SNAPSHOT_LIMIT_BYTES) return null;
+  }
+  return snap;
 }
 
 function appendWorkerLog(name, level, message) {
@@ -2259,8 +2353,8 @@ async function startWorkerd(workerName, meta, bundle) {
   const extraModuleLines = [];
 
   for (const f of workerFiles) {
-    if (f.name === primaryFile || f.name === 'entry.js' || f.name === 'config.capnp' || f.name === 'package.json') continue;
-    const safeDiskPath = path.join(runDir, f.name);
+    if (f.binary || f.name === primaryFile || f.name === 'entry.js' || f.name === 'config.capnp' || f.name === 'package.json') continue;
+    const safeDiskPath = workerFilePath(runDir, f.name, true);
     let modContent = f.content;
     if (f.name.endsWith('.ts') || f.name.endsWith('.tsx')) {
       modContent = stripBasicTypeScriptTypes(modContent);
@@ -2948,6 +3042,30 @@ async function executeWorkerAction(workerName, req, bodyBuffer, subPathAndQuery)
     }
   }
 
+  // Uploaded binary files (images, fonts, ...) come straight off the disk for
+  // every kind of worker: they can't be code, and the runtimes only see text.
+  if (fallbackStaticAsset && fallbackStaticAsset.binary) {
+    let body;
+    try {
+      body = fs.readFileSync(path.join(WORKERS_DIR, workerName, fallbackStaticAsset.name));
+    } catch (_) {
+      body = Buffer.alloc(0);
+    }
+    const ext = path.extname(fallbackStaticAsset.name).slice(1).toLowerCase();
+    recordInvocation(workerName, meta, req, parsedUrl, deviceInfo, 200, hrStart, body.length, null);
+    return {
+      status: 200,
+      headers: {
+        'content-type': BINARY_TYPES[ext] || 'application/octet-stream',
+        'content-disposition': 'inline',
+        'cache-control': 'no-store',
+        'access-control-allow-origin': '*'
+      },
+      body,
+      deviceInfo
+    };
+  }
+
   if (fallbackStaticAsset && !hasExecutableJsWorker) {
     const renderedContent = /\.(html|htm|css|svg|xml|csv|md|yaml|yml|txt|json)$/i.test(fallbackStaticAsset.name)
       ? interpolateTemplate(fallbackStaticAsset.content, workerName, req, deviceInfo, queryObj, /\.(html?|svg|xml|xsl)$/i.test(fallbackStaticAsset.name))
@@ -3089,7 +3207,7 @@ async function executeWorkerAction(workerName, req, bodyBuffer, subPathAndQuery)
       }
     } else if (langSpec.runtime === 'python3' || langSpec.runtime === 'bash' || langSpec.runtime === 'node') {
       const filesMap = {};
-      for (const f of workerFiles) filesMap[f.name] = f.content;
+      for (const f of workerFiles) if (!f.binary) filesMap[f.name] = f.content;
       const envVars = {
         ...(meta.bindings || {}),
         WORKER_NAME: workerName,
@@ -3370,7 +3488,8 @@ function listLocalStorageFiles() {
     if (!stat.isFile()) return;
     let preview = '';
     try {
-      preview = fs.readFileSync(absPath, 'utf8').slice(0, 1200);
+      const buf = fs.readFileSync(absPath);
+      preview = looksBinary(buf) ? '(binary file)' : buf.toString('utf8').slice(0, 1200);
     } catch (_) {}
     results.push({
       path: relPath,
@@ -3389,8 +3508,8 @@ function listLocalStorageFiles() {
     for (const entry of fs.readdirSync(WORKERS_DIR, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       const wDir = path.join(WORKERS_DIR, entry.name);
-      for (const f of fs.readdirSync(wDir)) {
-        if (f.startsWith('.')) continue;
+      addFile(`storage/workers/${entry.name}/meta.json`, path.join(wDir, 'meta.json'), `Worker (${entry.name})`);
+      for (const f of walkWorkerDir(wDir).files) {
         addFile(`storage/workers/${entry.name}/${f}`, path.join(wDir, f), `Worker (${entry.name})`);
       }
     }
@@ -3801,7 +3920,9 @@ function restoreDeployment(name, meta, dep) {
       const safe = sanitizeFileName(fname);
       if (!safe) continue;
       keep.add(safe);
-      fs.writeFileSync(path.join(dir, safe), String(content), 'utf8');
+      const target = workerFilePath(dir, safe, true);
+      if (content && typeof content === 'object' && typeof content.b64 === 'string') fs.writeFileSync(target, Buffer.from(content.b64, 'base64'));
+      else fs.writeFileSync(target, String(content), 'utf8');
     }
     for (const f of listWorkerFiles(name)) {
       if (!keep.has(f.name)) fs.rmSync(path.join(dir, f.name), { force: true });
@@ -4052,7 +4173,15 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, {
         ok: true,
         id: dep.id,
-        files: dep.filesSnapshot || (typeof dep.codeSnapshot === 'string' ? { [dep.filename]: dep.codeSnapshot } : {})
+        files: dep.filesSnapshot
+          ? Object.fromEntries(
+              Object.entries(dep.filesSnapshot).map(([n, c]) =>
+                c && typeof c === 'object' ? [n, `(binary file, ${Math.floor((String(c.b64 || '').length * 3) / 4)} bytes)`] : [n, c]
+              )
+            )
+          : typeof dep.codeSnapshot === 'string'
+          ? { [dep.filename]: dep.codeSnapshot }
+          : {}
       });
       return;
     }
@@ -4091,6 +4220,52 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // Upload one file as raw bytes: POST /api/workers/:name/upload?path=dir/file.png
+    // Download one: GET /api/workers/:name/raw?path=dir/file.png
+    const fileIoMatch = pathname.match(/^\/api\/workers\/([^/]+)\/(upload|raw)$/);
+    if (fileIoMatch) {
+      const targetName = decodeURIComponent(fileIoMatch[1]);
+      const meta = state.workers[targetName];
+      if (!meta) throw new HttpError(404, 'Worker not found');
+      const workerDir = path.join(WORKERS_DIR, targetName);
+      const safeName = sanitizeFileName(parsedUrl.searchParams.get('path'));
+      if (!safeName) throw new HttpError(400, 'Invalid file path');
+
+      if (fileIoMatch[2] === 'raw' && req.method === 'GET') {
+        const filePath = path.join(workerDir, safeName);
+        if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) throw new HttpError(404, 'File not found');
+        const ext = path.extname(safeName).slice(1).toLowerCase();
+        const image = UPLOAD_IMAGE_TYPES[ext];
+        res.writeHead(200, {
+          'content-type': image || 'application/octet-stream',
+          'content-disposition': `${image ? 'inline' : 'attachment'}; filename="${path.basename(safeName)}"`,
+          'content-security-policy': 'sandbox',
+          'x-content-type-options': 'nosniff',
+          'cache-control': 'no-store'
+        });
+        res.end(fs.readFileSync(filePath));
+        return;
+      }
+
+      if (fileIoMatch[2] === 'upload' && req.method === 'POST') {
+        const buf = await readRequestBody(req);
+        if (safeName === meta.filename && looksBinary(buf)) throw new HttpError(400, `${safeName} is the entry file and can't be replaced by a binary file`);
+        const targetPath = workerFilePath(workerDir, safeName, true);
+        const existed = fs.existsSync(targetPath);
+        if (existed && fs.statSync(targetPath).isDirectory()) throw new HttpError(400, `"${safeName}" is a folder`);
+        fs.writeFileSync(targetPath, buf);
+        invalidateWorkerRuntime(targetName);
+        meta.updatedAt = new Date().toISOString();
+        writeJsonAtomic(path.join(workerDir, 'meta.json'), meta);
+        saveState();
+        appendWorkerLog(targetName, 'info', `${existed ? 'Replaced' : 'Uploaded'} "${safeName}" (${buf.length} B)`);
+        const files = listWorkerFiles(targetName);
+        sendJson(res, 200, { ok: true, file: files.find((f) => f.name === safeName), replaced: existed });
+        return;
+      }
+      throw new HttpError(405, 'Method not allowed');
+    }
+
     // Worker File Explorer CRUD Endpoints: /api/workers/:name/files
     const filesRouteMatch = pathname.match(/^\/api\/workers\/([^/]+)\/files$/);
     if (filesRouteMatch) {
@@ -4110,12 +4285,65 @@ const server = http.createServer(async (req, res) => {
           ok: true,
           worker: targetName,
           primaryFile: meta.filename,
-          files: listWorkerFiles(targetName)
+          files: listWorkerFiles(targetName),
+          folders: listWorkerFolders(targetName)
         });
         return;
       }
 
       const body = await readJsonBody(req);
+
+      // Folders: create, rename/move, delete (with everything inside)
+      if (body.folder || parsedUrl.searchParams.get('folder')) {
+        const safeFolder = sanitizeFileName(body.folder || parsedUrl.searchParams.get('folder'));
+        if (!safeFolder) throw new HttpError(400, 'Invalid folder name');
+        const folderPath = path.join(workerDir, safeFolder);
+        const inFolder = (f) => f === safeFolder || String(f || '').startsWith(`${safeFolder}/`);
+        if (req.method === 'POST') {
+          if (fs.existsSync(folderPath)) throw new HttpError(400, `"${safeFolder}" already exists in ${targetName}`);
+          fs.mkdirSync(folderPath, { recursive: true });
+          appendWorkerLog(targetName, 'info', `Created folder "${safeFolder}/" in ${targetName}`);
+        } else if (req.method === 'PUT') {
+          const renamed = sanitizeFileName(body.newFolder);
+          if (!renamed) throw new HttpError(400, 'Invalid new folder name');
+          if (renamed === safeFolder || renamed.startsWith(`${safeFolder}/`)) throw new HttpError(400, "A folder can't move inside itself");
+          const renamedPath = path.join(workerDir, renamed);
+          if (!fs.existsSync(folderPath) || !fs.statSync(folderPath).isDirectory()) throw new HttpError(404, `No folder "${safeFolder}"`);
+          if (fs.existsSync(renamedPath)) throw new HttpError(400, `"${renamed}" already exists in ${targetName}`);
+          fs.mkdirSync(path.dirname(renamedPath), { recursive: true });
+          fs.renameSync(folderPath, renamedPath);
+          if (inFolder(meta.filename)) meta.filename = renamed + meta.filename.slice(safeFolder.length);
+          appendWorkerLog(targetName, 'info', `Moved folder "${safeFolder}/" to "${renamed}/"`);
+        } else if (req.method === 'DELETE') {
+          fs.rmSync(folderPath, { recursive: true, force: true });
+          appendWorkerLog(targetName, 'warn', `Deleted folder "${safeFolder}/" from ${targetName}`);
+        } else {
+          throw new HttpError(405, 'Method not allowed');
+        }
+        let remaining = listWorkerFiles(targetName);
+        if (!remaining.some((f) => !f.binary)) {
+          // keep the worker runnable
+          fs.writeFileSync(path.join(workerDir, 'worker.js'), buildJsWorkerTemplate(targetName), 'utf8');
+          meta.filename = 'worker.js';
+          meta.language = 'javascript';
+          remaining = listWorkerFiles(targetName);
+        } else if (!remaining.some((f) => f.name === meta.filename && !f.binary)) {
+          const next = remaining.find((f) => !f.binary);
+          meta.filename = next.name;
+          meta.language = next.language;
+        }
+        invalidateWorkerRuntime(targetName);
+        meta.updatedAt = new Date().toISOString();
+        writeJsonAtomic(path.join(workerDir, 'meta.json'), meta);
+        saveState();
+        sendJson(res, 200, {
+          ok: true,
+          files: remaining,
+          folders: listWorkerFolders(targetName),
+          worker: { ...meta, code: readWorkerCodeFromStorage(targetName), files: remaining }
+        });
+        return;
+      }
 
       if (req.method === 'POST') {
         const rawFilename = body.filename || 'new-file.js';
@@ -4124,7 +4352,7 @@ const server = http.createServer(async (req, res) => {
           sendJson(res, 400, { error: 'Invalid filename' });
           return;
         }
-        const targetPath = path.join(workerDir, safeName);
+        const targetPath = workerFilePath(workerDir, safeName, true);
         if (fs.existsSync(targetPath) && !body.overwrite) {
           sendJson(res, 400, { error: `File "${safeName}" already exists in ${targetName}` });
           return;
@@ -4199,7 +4427,11 @@ const server = http.createServer(async (req, res) => {
             sendJson(res, 400, { error: 'Invalid new filename' });
             return;
           }
-          const renamedPath = path.join(workerDir, renamed);
+          const renamedPath = workerFilePath(workerDir, renamed, true);
+          if (renamed !== safeName && fs.existsSync(renamedPath)) {
+            sendJson(res, 400, { error: `"${renamed}" already exists in ${targetName}` });
+            return;
+          }
           if (renamed !== safeName && fs.existsSync(oldPath)) {
             fs.renameSync(oldPath, renamedPath);
           }
@@ -4210,8 +4442,14 @@ const server = http.createServer(async (req, res) => {
           finalFileName = renamed;
         }
 
-        const writePath = path.join(workerDir, finalFileName);
-        if (typeof body.content === 'string') {
+        const writePath = workerFilePath(workerDir, finalFileName, true);
+        // binary files (uploads) are never overwritten by a text save or rename
+        let isBinaryOnDisk = false;
+        try {
+          isBinaryOnDisk = fs.statSync(writePath).isFile() && looksBinary(fs.readFileSync(writePath));
+        } catch (_) {}
+        if (body.setAsEntrypoint && isBinaryOnDisk) throw new HttpError(400, "A binary file can't be the entry file");
+        if (typeof body.content === 'string' && !isBinaryOnDisk) {
           const eol = body.eol || meta.eol || 'LF';
           const normalized = eol === 'CRLF' ? body.content.replace(/\r?\n/g, '\r\n') : body.content.replace(/\r\n/g, '\n');
           fs.writeFileSync(writePath, normalized, 'utf8');
@@ -4270,7 +4508,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         let remaining = listWorkerFiles(targetName);
-        if (remaining.length === 0) {
+        if (!remaining.some((f) => !f.binary)) {
           // Always keep at least one runnable file so the worker remains runnable
           const fallbackFile = 'worker.js';
           const fallbackCode = buildJsWorkerTemplate(targetName);
@@ -4279,8 +4517,9 @@ const server = http.createServer(async (req, res) => {
           meta.language = 'javascript';
           remaining = listWorkerFiles(targetName);
         } else if (meta.filename === safeName || !remaining.some((f) => f.name === meta.filename)) {
-          meta.filename = remaining[0].name;
-          meta.language = remaining[0].language || inferLanguageFromFilename(remaining[0].name);
+          const next = remaining.find((f) => !f.binary);
+          meta.filename = next.name;
+          meta.language = next.language || inferLanguageFromFilename(next.name);
         }
 
         invalidateWorkerRuntime(targetName);

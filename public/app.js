@@ -178,7 +178,12 @@ const P = {
   shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
   disk: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/>',
   logout: '<path d="M15 4h4a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1h-4"/><path d="m10 17 5-5-5-5M15 12H3"/>',
-  dots: '<circle cx="5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="19" cy="12" r="1.2"/>'
+  dots: '<circle cx="5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="19" cy="12" r="1.2"/>',
+  folder: '<path d="M3 6.5A1.5 1.5 0 0 1 4.5 5H9l2 2h8.5A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z"/>',
+  folderPlus: '<path d="M3 6.5A1.5 1.5 0 0 1 4.5 5H9l2 2h8.5A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z"/><path d="M12 10v6M9 13h6"/>',
+  folderUp: '<path d="M3 6.5A1.5 1.5 0 0 1 4.5 5H9l2 2h8.5A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z"/><path d="M12 16v-6M9.5 12.5 12 10l2.5 2.5"/>',
+  upload: '<path d="M12 15V4M7 9l5-5 5 5"/><path d="M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/>',
+  download: '<path d="M12 4v11M7 10l5 5 5-5"/><path d="M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/>'
 };
 const icon = (name, cls = '') =>
   `<svg class="${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name] || ''}</svg>`;
@@ -1632,13 +1637,46 @@ function basicBackend(host, ide) {
   };
 }
 
+// Walk dropped FileSystemEntries (files and folders) into [{ file, path }].
+async function collectEntries(entries) {
+  const out = [];
+  const readAll = (reader) =>
+    new Promise((resolve) => {
+      const all = [];
+      const next = () =>
+        reader.readEntries(
+          (batch) => {
+            if (!batch.length) return resolve(all);
+            all.push(...batch);
+            next();
+          },
+          () => resolve(all)
+        );
+      next();
+    });
+  const walk = async (entry, prefix) => {
+    if (entry.isFile) {
+      const file = await new Promise((resolve, reject) => entry.file(resolve, reject)).catch(() => null);
+      if (file) out.push({ file, path: prefix + entry.name });
+    } else if (entry.isDirectory) {
+      for (const child of await readAll(entry.createReader())) await walk(child, `${prefix}${entry.name}/`);
+    }
+  };
+  for (const e of entries) await walk(e, '');
+  return out;
+}
+
 class Ide {
   constructor(root, w) {
     this.root = root;
     this.name = w.name;
     this.worker = w;
     this.entry = w.filename;
-    this.files = new Map((w.files || []).map((f) => [f.name, { saved: f.content, current: f.content, size: f.sizeBytes }]));
+    this.files = new Map((w.files || []).map((f) => [f.name, { saved: f.content, current: f.content, size: f.sizeBytes, binary: Boolean(f.binary) }]));
+    // folders: every parent of a file, plus empty ones (loaded in init)
+    this.folders = new Set();
+    this.files.forEach((_, f) => this.addParents(f));
+    this.collapsed = new Set(store.get(`ax-collapsed-${w.name}`, []));
     this.tabs = [];
     this.active = null;
     this.autosave = store.get('ax-autosave', true);
@@ -1668,8 +1706,16 @@ class Ide {
         <button class="btn sm primary" id="ideSave" title="Save (Ctrl+S)">Save</button>`;
     this.root.innerHTML = `<div class="ide">
       <aside class="files" aria-label="Files">
-        <div class="files-head">Files<span class="tools"><button class="icon-btn sm" id="ideNewFile" title="New file" aria-label="New file">${icon('plus')}</button></span></div>
+        <div class="files-head">Files<span class="tools">
+          <button class="icon-btn sm" id="ideNewFile" title="New file" aria-label="New file">${icon('plus')}</button>
+          <button class="icon-btn sm" id="ideNewFolder" title="New folder" aria-label="New folder">${icon('folderPlus')}</button>
+          <button class="icon-btn sm" id="ideUpload" title="Upload files" aria-label="Upload files">${icon('upload')}</button>
+          <button class="icon-btn sm" id="ideUploadDir" title="Upload a folder" aria-label="Upload a folder">${icon('folderUp')}</button>
+        </span></div>
+        <input type="file" id="ideUploadInput" multiple hidden>
+        <input type="file" id="ideUploadDirInput" webkitdirectory multiple hidden>
         <div class="files-list" id="ideFiles"></div>
+        <div class="upload-progress" id="ideUploadState" hidden></div>
       </aside>
       <section class="editor-col">
         <div class="editor-tabs" id="ideTabs" role="tablist" aria-label="Open files"></div>
@@ -1689,8 +1735,14 @@ class Ide {
       </section>
     </div>`;
     // tabs: entry first, then the rest
-    this.tabs = [this.entry, ...[...this.files.keys()].filter((f) => f !== this.entry)].filter((f) => this.files.has(f)).slice(0, 6);
+    this.tabs = [this.entry, ...[...this.files.keys()].filter((f) => f !== this.entry)].filter((f) => this.files.has(f) && !this.files.get(f).binary).slice(0, 6);
     this.renderFiles();
+    api('GET', `/api/workers/${enc(this.name)}/files`)
+      .then((r) => {
+        (r.folders || []).forEach((d) => this.folders.add(d));
+        if (this.root.isConnected) this.renderFiles();
+      })
+      .catch(() => {});
     this.renderPanel();
     this.wire();
     slideInd($('.side-panel .tabs', this.root));
@@ -1704,7 +1756,7 @@ class Ide {
       if (store.get('ax-editor', 'monaco') !== 'basic') toast(`Using the basic editor: ${err.message}`, 'err');
     }
     if (!this.root.isConnected) return this.ed.dispose(); // navigated away while loading
-    this.open(this.entry && this.files.has(this.entry) ? this.entry : [...this.files.keys()][0]);
+    this.open(this.entry && this.files.has(this.entry) ? this.entry : [...this.files.keys()].find((f) => !this.files.get(f).binary));
 
     this.tail = createTail({
       box: $('#ideLog'),
@@ -1736,9 +1788,43 @@ class Ide {
       const r = await attempt(() => api('POST', `/api/workers/${enc(this.name)}/deployments`, { source: 'Created from editor' }));
       if (r) toast(`Version ${r.worker.deployId} created. Roll back to it any time from Versions`);
     };
-    $('#ideNewFile').onclick = () => this.newFileInput();
+    $('#ideNewFile').onclick = () => this.newFileInput('');
+    $('#ideNewFolder').onclick = () => this.newFileInput('', true);
+    $('#ideUpload').onclick = () => {
+      this.uploadTarget = '';
+      $('#ideUploadInput').click();
+    };
+    $('#ideUploadDir').onclick = () => {
+      this.uploadTarget = '';
+      $('#ideUploadDirInput').click();
+    };
+    $('#ideUploadInput').onchange = (e) => {
+      const list = [...e.target.files].map((file) => ({ file, path: file.name }));
+      e.target.value = '';
+      this.upload(list, this.uploadTarget);
+    };
+    $('#ideUploadDirInput').onchange = (e) => {
+      const list = [...e.target.files].map((file) => ({ file, path: file.webkitRelativePath || file.name }));
+      e.target.value = '';
+      this.upload(list, this.uploadTarget);
+    };
     $('#ideFiles').onclick = (e) => {
       const act = e.target.closest('[data-fact]');
+      const dirRow = e.target.closest('[data-folder]');
+      if (dirRow) {
+        const d = dirRow.dataset.folder;
+        if (act) {
+          e.stopPropagation();
+          if (act.dataset.fact === 'new') return this.newFileInput(d, false, dirRow);
+          if (act.dataset.fact === 'upload') {
+            this.uploadTarget = d;
+            return $('#ideUploadInput').click();
+          }
+          if (act.dataset.fact === 'rename') return this.renameFolderInput(d, dirRow);
+          if (act.dataset.fact === 'delete') return this.deleteFolder(d);
+        }
+        return this.toggleFolder(d);
+      }
       const row = e.target.closest('[data-file]');
       if (!row) return;
       const f = row.dataset.file;
@@ -1750,6 +1836,13 @@ class Ide {
       }
       this.open(f);
     };
+    $('#ideFiles').onkeydown = (e) => {
+      if ((e.key === 'Enter' || e.key === ' ') && e.target.matches('[data-file], [data-folder]')) {
+        e.preventDefault();
+        e.target.click();
+      }
+    };
+    this.wireDrop();
     $('#ideTabs').onclick = (e) => {
       const t = e.target.closest('[data-tab]');
       if (t) this.open(t.dataset.tab);
@@ -1773,6 +1866,7 @@ class Ide {
   }
   open(f) {
     if (!f || !this.files.has(f)) return;
+    if (this.files.get(f).binary) return this.showBinary(f);
     this.active = f;
     if (!this.tabs.includes(f)) this.tabs.push(f);
     if (this.tabs.length > 8) this.tabs = this.tabs.filter((t) => t === f || t !== this.tabs[0]).slice(-8);
@@ -1787,22 +1881,68 @@ class Ide {
     this.renderState();
     this.autosaveSoon();
   }
+  addParents(f) {
+    const parts = f.split('/');
+    for (let i = 1; i < parts.length; i++) this.folders.add(parts.slice(0, i).join('/'));
+  }
+  toggleFolder(d) {
+    if (this.collapsed.has(d)) this.collapsed.delete(d);
+    else this.collapsed.add(d);
+    store.set(`ax-collapsed-${this.name}`, [...this.collapsed]);
+    this.renderFiles();
+  }
   renderFiles() {
-    const names = [...this.files.keys()].sort((a, b) => (a === this.entry ? -1 : b === this.entry ? 1 : a.localeCompare(b)));
-    $('#ideFiles').innerHTML = names
-      .map((f) => {
-        const file = this.files.get(f);
-        const dirty = file.current !== file.saved;
-        return `<div class="file ${f === this.active ? 'active' : ''}" data-file="${esc(f)}" role="button" tabindex="0" title="${esc(f)}">
-          ${langIcon(langOfFile(f), 'sm')}<span class="nm">${esc(f)}</span>
-          ${dirty ? '<span class="dirty" title="Unsaved"></span>' : f === this.entry ? '<span class="entry" title="Runs on each request">ENTRY</span>' : ''}
+    // Build the tree: folders first at each level, the entry file on top.
+    const root = { dirs: new Map(), files: [] };
+    const nodeOf = (p) => {
+      let n = root;
+      if (p) for (const seg of p.split('/')) {
+        if (!n.dirs.has(seg)) n.dirs.set(seg, { dirs: new Map(), files: [] });
+        n = n.dirs.get(seg);
+      }
+      return n;
+    };
+    this.folders.forEach((d) => nodeOf(d));
+    for (const f of this.files.keys()) {
+      const i = f.lastIndexOf('/');
+      nodeOf(i < 0 ? '' : f.slice(0, i)).files.push(f);
+    }
+    // file rows skip the chevron's width so their icons line up with folder icons
+    const pad = (depth, file = false) => `style="padding-left:${8 + depth * 14 + (file ? 18 : 0)}px"`;
+    const fileRow = (f, depth) => {
+      const file = this.files.get(f);
+      const dirty = file.current !== file.saved;
+      const base = f.slice(f.lastIndexOf('/') + 1);
+      return `<div class="file ${f === this.active ? 'active' : ''}" data-file="${esc(f)}" role="button" tabindex="0" title="${esc(f)}" ${pad(depth, true)}>
+          ${file.binary ? `<svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${P.file}</svg>` : langIcon(langOfFile(f), 'sm')}<span class="nm">${esc(base)}</span>
+          ${dirty ? '<span class="dirty" title="Unsaved"></span>' : f === this.entry ? '<span class="entry" title="Runs on each request">ENTRY</span>' : file.binary ? `<span class="bin">${bytes(file.size || 0)}</span>` : ''}
           <span class="acts">
-            ${f !== this.entry ? `<button class="icon-btn sm" data-fact="entry" title="Make this the entry file">${icon('star')}</button>` : ''}
-            <button class="icon-btn sm" data-fact="rename" title="Rename">${icon('edit')}</button>
+            ${f !== this.entry && !file.binary ? `<button class="icon-btn sm" data-fact="entry" title="Make this the entry file">${icon('star')}</button>` : ''}
+            <button class="icon-btn sm" data-fact="rename" title="Rename or move">${icon('edit')}</button>
             ${this.files.size > 1 ? `<button class="icon-btn sm" data-fact="delete" title="Delete">${icon('trash')}</button>` : ''}
           </span></div>`;
-      })
-      .join('');
+    };
+    const rows = [];
+    const walk = (n, prefix, depth) => {
+      const files = n.files.sort((a, b) => (a === this.entry ? -1 : b === this.entry ? 1 : a.localeCompare(b)));
+      if (!prefix && files[0] === this.entry) rows.push(fileRow(files.shift(), depth));
+      for (const name of [...n.dirs.keys()].sort((a, b) => a.localeCompare(b))) {
+        const d = prefix ? `${prefix}/${name}` : name;
+        const open = !this.collapsed.has(d);
+        rows.push(`<div class="file folder ${open ? '' : 'closed'}" data-folder="${esc(d)}" role="button" tabindex="0" aria-expanded="${open}" title="${esc(d)}/" ${pad(depth)}>
+          ${icon('chevDown', 'chev')}${icon('folder', 'ficon')}<span class="nm">${esc(name)}</span>
+          <span class="acts">
+            <button class="icon-btn sm" data-fact="new" title="New file in ${esc(name)}">${icon('plus')}</button>
+            <button class="icon-btn sm" data-fact="upload" title="Upload into ${esc(name)}">${icon('upload')}</button>
+            <button class="icon-btn sm" data-fact="rename" title="Rename or move">${icon('edit')}</button>
+            <button class="icon-btn sm" data-fact="delete" title="Delete folder">${icon('trash')}</button>
+          </span></div>`);
+        if (open) walk(n.dirs.get(name), d, depth + 1);
+      }
+      files.forEach((f) => rows.push(fileRow(f, depth)));
+    };
+    walk(root, '', 0);
+    $('#ideFiles').innerHTML = rows.join('') + `<div class="files-hint">Drop files or folders here to upload</div>`;
     $('#ideTabs').innerHTML = this.tabs
       .filter((f) => this.files.has(f))
       .map((f) => {
@@ -1857,19 +1997,38 @@ class Ide {
       }
     }
   }
-  newFileInput() {
+  // New file (or folder) inside `folder` ('' = top level). Names may contain
+  // slashes: "lib/util.js" makes the lib folder too.
+  newFileInput(folder, isFolder = false, afterRow = null) {
     const list = $('#ideFiles');
     if ($('.file-input', list)) return $('.file-input', list).focus();
-    list.insertAdjacentHTML('afterbegin', `<input class="input mono file-input" placeholder="name.js" aria-label="New file name">`);
+    if (folder && this.collapsed.has(folder)) {
+      this.toggleFolder(folder);
+      afterRow = $(`[data-folder="${CSS.escape(folder)}"]`, list);
+    }
+    const html = `<input class="input mono file-input" placeholder="${isFolder ? 'folder-name' : 'name.js'}" aria-label="New ${isFolder ? 'folder' : 'file'} name${folder ? ` in ${esc(folder)}` : ''}">`;
+    if (afterRow) afterRow.insertAdjacentHTML('afterend', html);
+    else list.insertAdjacentHTML('afterbegin', html);
     const inp = $('.file-input', list);
     inp.focus();
+    let finished = false;
     const done = async (commit) => {
-      const n = inp.value.trim();
+      if (finished) return;
+      finished = true;
+      const n = inp.value.trim().replace(/^\/+|\/+$/g, '');
       inp.remove();
       if (!commit || !n) return;
-      const r = await attempt(() => api('POST', `/api/workers/${enc(this.name)}/files`, { filename: n, content: '' }));
+      const full = folder ? `${folder}/${n}` : n;
+      if (isFolder) {
+        const r = await attempt(() => api('POST', `/api/workers/${enc(this.name)}/files`, { folder: full }));
+        if (!r) return;
+        (r.folders || []).forEach((d) => this.folders.add(d));
+        return this.renderFiles();
+      }
+      const r = await attempt(() => api('POST', `/api/workers/${enc(this.name)}/files`, { filename: full, content: '' }));
       if (!r || !r.file) return;
-      this.files.set(r.file.name, { saved: r.file.content, current: r.file.content, size: r.file.sizeBytes });
+      this.files.set(r.file.name, { saved: r.file.content, current: r.file.content, size: r.file.sizeBytes, binary: false });
+      this.addParents(r.file.name);
       this.open(r.file.name);
     };
     inp.addEventListener('keydown', (e) => {
@@ -1878,11 +2037,196 @@ class Ide {
     });
     inp.addEventListener('blur', () => done(Boolean(inp.value.trim())));
   }
+  renameFolderInput(d, row) {
+    row.outerHTML = `<input class="input mono file-input" value="${esc(d)}" aria-label="New name for folder ${esc(d)}">`;
+    const inp = $('.file-input', $('#ideFiles'));
+    inp.focus();
+    inp.setSelectionRange(d.lastIndexOf('/') + 1, d.length);
+    let finished = false;
+    const done = async (commit) => {
+      if (finished) return;
+      finished = true;
+      const n = inp.value.trim().replace(/^\/+|\/+$/g, '');
+      if (!commit || !n || n === d) return this.renderFiles();
+      const r = await attempt(() => api('PUT', `/api/workers/${enc(this.name)}/files`, { folder: d, newFolder: n }));
+      if (!r) return this.renderFiles();
+      // move open files (unsaved edits included) to their new paths
+      const moved = new Map();
+      for (const [f, file] of [...this.files.entries()]) {
+        if (!f.startsWith(`${d}/`)) continue;
+        const nf = n + f.slice(d.length);
+        this.files.delete(f);
+        this.files.set(nf, file);
+        moved.set(f, nf);
+        if (this.ed) this.ed.drop(f);
+      }
+      this.tabs = this.tabs.map((t) => moved.get(t) || t);
+      if (moved.has(this.entry)) this.entry = moved.get(this.entry);
+      this.folders = new Set(r.folders || []);
+      this.files.forEach((_, f) => this.addParents(f));
+      const active = moved.get(this.active) || this.active;
+      this.active = null;
+      this.open(active);
+      this.renderState();
+    };
+    inp.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') done(true);
+      if (e.key === 'Escape') done(false);
+    });
+    inp.addEventListener('blur', () => done(true));
+  }
+  async deleteFolder(d) {
+    const inside = [...this.files.keys()].filter((f) => f.startsWith(`${d}/`));
+    if (
+      !(await confirmDialog({
+        title: `Delete ${d}/?`,
+        text: `The folder${inside.length ? ` and the ${plural(inside.length, 'file')} in it are` : ' is'} removed from <b>${esc(this.name)}</b> right away. Older versions keep their copy.`,
+        ok: 'Delete',
+        danger: true
+      }))
+    )
+      return;
+    const r = await attempt(() => api('DELETE', `/api/workers/${enc(this.name)}/files?folder=${enc(d)}`));
+    if (!r) return;
+    for (const f of inside) {
+      this.files.delete(f);
+      if (this.ed) this.ed.drop(f);
+    }
+    this.tabs = this.tabs.filter((t) => this.files.has(t));
+    this.entry = r.worker.filename;
+    for (const nf of r.files || []) if (!this.files.has(nf.name)) this.files.set(nf.name, { saved: nf.content, current: nf.content, size: nf.sizeBytes, binary: Boolean(nf.binary) });
+    this.folders = new Set(r.folders || []);
+    this.files.forEach((_, f) => this.addParents(f));
+    if (!this.files.has(this.active)) this.open(this.entry);
+    else this.renderFiles();
+    this.reloadPreview();
+  }
+  showBinary(f) {
+    const file = this.files.get(f);
+    const raw = `/api/workers/${enc(this.name)}/raw?path=${enc(f)}`;
+    const live = `${this.worker.summary.publishingPath.replace(/\/$/, '')}/${f.split('/').map(enc).join('/')}`;
+    const image = /\.(png|jpe?g|gif|webp|avif|ico|bmp)$/i.test(f);
+    modal({
+      title: f,
+      wide: image,
+      body: `<div class="bin-preview">
+        ${image ? `<img src="${esc(raw)}" alt="${esc(f)}">` : `<p class="hint">Binary file · ${bytes(file.size || 0)}. It can't be edited here, but your worker serves it as is.</p>`}
+        <div class="row" style="gap:8px">
+          <a class="btn sm" href="${esc(live)}" target="_blank" rel="noopener">${icon('external')} Open live URL</a>
+          <a class="btn sm" href="${esc(raw)}" download="${esc(f.split('/').pop())}">${icon('download')} Download</a>
+        </div>
+        <p class="hint mono">${esc(live)}</p>
+      </div>`
+    });
+  }
+  // [{ file: File, path: 'relative/path' }] into `folder`
+  async upload(list, folder = '') {
+    if (!list.length) return;
+    const targets = list.map((x) => ({ ...x, target: folder ? `${folder}/${x.path}` : x.path }));
+    const clashes = targets.filter((t) => this.files.has(t.target));
+    if (
+      clashes.length &&
+      !(await confirmDialog({
+        title: `Replace ${plural(clashes.length, 'file')}?`,
+        text: `${clashes
+          .slice(0, 5)
+          .map((c) => `<b>${esc(c.target)}</b>`)
+          .join(', ')}${clashes.length > 5 ? ` and ${clashes.length - 5} more` : ''} already exist${clashes.length === 1 ? 's' : ''}. Uploading replaces ${clashes.length === 1 ? 'it' : 'them'} and goes live straight away.`,
+        ok: 'Replace'
+      }))
+    )
+      return;
+    const state = $('#ideUploadState');
+    const failed = [];
+    const uploaded = [];
+    let i = 0;
+    for (const t of targets) {
+      i++;
+      if (state) {
+        state.hidden = false;
+        state.textContent = `Uploading ${i} of ${targets.length}: ${t.target}`;
+      }
+      try {
+        const res = await fetch(`/api/workers/${enc(this.name)}/upload?path=${enc(t.target)}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/octet-stream' },
+          body: t.file
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.message || data.error || `HTTP ${res.status}`);
+        uploaded.push(data.file);
+      } catch (err) {
+        failed.push(`${t.target}: ${err.message}`);
+      }
+    }
+    if (state) state.hidden = true;
+    for (const nf of uploaded) {
+      if (!nf) continue;
+      // an upload replaces whatever was open, unsaved edits included
+      if (this.ed) this.ed.drop(nf.name);
+      this.files.set(nf.name, { saved: nf.content, current: nf.content, size: nf.sizeBytes, binary: Boolean(nf.binary) });
+      this.addParents(nf.name);
+      if (folder) this.collapsed.delete(folder);
+    }
+    if (this.active && uploaded.some((nf) => nf && nf.name === this.active)) {
+      const a = this.active;
+      this.active = null;
+      this.open(a);
+    }
+    this.renderFiles();
+    this.renderState();
+    this.reloadPreview();
+    if (failed.length) toast(`${plural(failed.length, 'upload')} failed: ${failed[0]}`, 'err');
+    else toast(`Uploaded ${uploaded.length === 1 ? uploaded[0].name : plural(uploaded.length, 'file')}`);
+  }
+  // Drag files or whole folders from the desktop onto the list or onto a folder.
+  wireDrop() {
+    const pane = $('.ide .files', this.root);
+    const targetOf = (e) => {
+      const dirRow = e.target.closest && e.target.closest('[data-folder]');
+      if (dirRow) return dirRow;
+      return null;
+    };
+    let mark = null;
+    const clear = () => {
+      pane.classList.remove('drop');
+      if (mark) mark.classList.remove('drop-target');
+      mark = null;
+    };
+    pane.addEventListener('dragover', (e) => {
+      if (![...(e.dataTransfer.types || [])].includes('Files')) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+      const row = targetOf(e);
+      if (row !== mark) {
+        if (mark) mark.classList.remove('drop-target');
+        mark = row;
+        if (mark) mark.classList.add('drop-target');
+      }
+      pane.classList.toggle('drop', !row);
+    });
+    pane.addEventListener('dragleave', (e) => {
+      if (!pane.contains(e.relatedTarget)) clear();
+    });
+    pane.addEventListener('drop', async (e) => {
+      if (![...(e.dataTransfer.types || [])].includes('Files')) return;
+      e.preventDefault();
+      const row = targetOf(e);
+      const folder = row ? row.dataset.folder : '';
+      clear();
+      // entries must be taken synchronously, before any await
+      const entries = [...(e.dataTransfer.items || [])].map((it) => (it.webkitGetAsEntry ? it.webkitGetAsEntry() : null)).filter(Boolean);
+      const plain = [...e.dataTransfer.files];
+      const list = entries.length ? await collectEntries(entries) : plain.map((file) => ({ file, path: file.name }));
+      this.upload(list, folder);
+    });
+  }
   renameInput(f, row) {
     row.outerHTML = `<input class="input mono file-input" value="${esc(f)}" aria-label="New name for ${esc(f)}">`;
     const inp = $('.file-input', $('#ideFiles'));
     inp.focus();
-    inp.setSelectionRange(0, f.lastIndexOf('.') > 0 ? f.lastIndexOf('.') : f.length);
+    const baseStart = f.lastIndexOf('/') + 1;
+    inp.setSelectionRange(baseStart, f.lastIndexOf('.') > baseStart ? f.lastIndexOf('.') : f.length);
     let finished = false;
     const done = async (commit) => {
       if (finished) return;
@@ -1890,11 +2234,15 @@ class Ide {
       const n = inp.value.trim();
       if (!commit || !n || n === f) return this.renderFiles();
       const file = this.files.get(f);
-      const r = await attempt(() => api('PUT', `/api/workers/${enc(this.name)}/files`, { filename: f, newFilename: n, content: file.current }));
+      const r = await attempt(() =>
+        api('PUT', `/api/workers/${enc(this.name)}/files`, file.binary ? { filename: f, newFilename: n } : { filename: f, newFilename: n, content: file.current })
+      );
       if (!r) return this.renderFiles();
       const newName = r.filename;
       this.files.delete(f);
-      this.files.set(newName, { saved: file.current, current: file.current, size: file.size });
+      this.files.set(newName, { saved: file.current, current: file.current, size: file.size, binary: file.binary });
+      this.addParents(newName);
+      if (file.binary) return this.renderFiles();
       if (this.entry === f) this.entry = newName;
       this.tabs = this.tabs.map((t) => (t === f ? newName : t));
       if (this.ed) this.ed.drop(f);
@@ -1916,7 +2264,7 @@ class Ide {
     if (this.ed) this.ed.drop(f);
     this.entry = r.worker.filename;
     // the server keeps at least one file (it may have created worker.js)
-    for (const nf of r.files || []) if (!this.files.has(nf.name)) this.files.set(nf.name, { saved: nf.content, current: nf.content, size: nf.sizeBytes });
+    for (const nf of r.files || []) if (!this.files.has(nf.name)) this.files.set(nf.name, { saved: nf.content, current: nf.content, size: nf.sizeBytes, binary: Boolean(nf.binary) });
     if (this.active === f) this.open(this.entry);
     else this.renderFiles();
     this.reloadPreview();

@@ -373,6 +373,18 @@ h1.page-title { margin: 0; font: 600 30px/1.15 var(--display); letter-spacing: -
 .file:hover .acts { display: flex; }
 .file:hover .entry, .file:hover .dirty { display: none; }
 .file-input { margin: 2px 0; height: 32px; font-size: 13px; }
+.file .chev { flex: none; width: 14px; height: 14px; margin-right: -4px; color: var(--muted); transition: transform 0.2s var(--ease); }
+.file.folder.closed .chev { transform: rotate(-90deg); }
+.file .ficon { flex: none; width: 16px; height: 16px; color: var(--muted); }
+.file.folder .nm { color: var(--text-2); }
+.file .bin { margin-left: auto; font-size: 11px; color: var(--muted); }
+.file:hover .bin { display: none; }
+.files.drop { box-shadow: inset 0 0 0 2px var(--chart); }
+.file.drop-target { background: var(--well-2); box-shadow: inset 0 0 0 1px var(--chart); }
+.files-hint { padding: 6px 10px 2px; font-size: 11.5px; color: var(--muted); }
+.upload-progress { padding: 6px 10px; font-size: 12px; color: var(--muted); }
+.bin-preview { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+.bin-preview img { max-width: 100%; max-height: 60vh; border-radius: 10px; background: repeating-conic-gradient(#8882 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
 
 .editor-tabs { display: flex; align-items: center; gap: 2px; padding: 6px 6px 0; overflow-x: auto; scrollbar-width: none; min-height: 40px; flex: none; }
 .etab {
@@ -404,7 +416,9 @@ h1.page-title { margin: 0; font: 600 30px/1.15 var(--display); letter-spacing: -
 .urlbar { display: flex; gap: 6px; padding: 8px; align-items: center; }
 .urlbar .input { height: 32px; font-family: var(--mono); font-size: 12px; border-radius: 999px; background: var(--card); }
 .urlbar .select { height: 32px; width: 96px; font-size: 12.5px; font-weight: 500; border-radius: 999px; background-color: var(--card); }
-.preview-frame { flex: 1; width: calc(100% - 12px); margin: 0 6px 6px; border: 0; border-radius: 10px; background: #fff; }
+/* The frame is always white, so its page must render light even in dark mode:
+   otherwise a plain-text response inherits the dark scheme (light text on white). */
+.preview-frame { flex: 1; width: calc(100% - 12px); margin: 0 6px 6px; border: 0; border-radius: 10px; background: #fff; color-scheme: light; }
 .req-section { padding: 6px 12px 10px; display: flex; flex-direction: column; gap: 8px; }
 .kv-edit { display: grid; grid-template-columns: 1fr 1fr 26px; gap: 6px; align-items: center; }
 .kv-edit .input { height: 30px; font-size: 12px; font-family: var(--mono); background: var(--card); }
