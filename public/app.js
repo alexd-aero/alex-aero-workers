@@ -189,13 +189,6 @@ const icon = (name, cls = '') =>
   `<svg class="${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name] || ''}</svg>`;
 
 /* ================================================================ languages */
-const EXT_TO_MONACO = {
-  js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'javascript',
-  ts: 'typescript', tsx: 'typescript', py: 'python', sh: 'shell', bash: 'shell',
-  json: 'json', jsonc: 'json', html: 'html', htm: 'html', css: 'css', scss: 'scss', less: 'less',
-  md: 'markdown', yaml: 'yaml', yml: 'yaml', xml: 'xml', svg: 'xml', sql: 'sql', txt: 'plaintext',
-  go: 'go', rs: 'rust', rb: 'ruby', php: 'php', lua: 'lua', c: 'c', cpp: 'cpp'
-};
 const EXT_TO_LANGID = {
   js: 'javascript', mjs: 'javascript', jsx: 'javascriptreact', ts: 'typescript', tsx: 'typescriptreact',
   py: 'python', sh: 'shellscript', json: 'json', html: 'html', htm: 'html', css: 'css', md: 'markdown',
@@ -1434,158 +1427,173 @@ function envRow(k, v) {
 }
 
 /* ===================================================================== IDE */
-const MONACO_BASE = 'https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min';
-let monacoPromise = null;
-function loadMonaco() {
-  if (window.monaco) return Promise.resolve(window.monaco);
-  if (store.get('ax-editor', 'monaco') === 'basic') return Promise.reject(new Error('basic editor chosen'));
-  if (monacoPromise) return monacoPromise;
-  monacoPromise = new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('Monaco took too long to load')), 9000);
+// Ace, from the CDN like the fonts. Themes are ours: warm greys and cream.
+const ACE_BASE = 'https://cdn.jsdelivr.net/npm/ace-builds@1.44.0/src-min-noconflict';
+let acePromise = null;
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
     const s = document.createElement('script');
-    s.src = `${MONACO_BASE}/vs/loader.js`;
-    s.onerror = () => {
-      clearTimeout(timer);
-      reject(new Error('Monaco could not be loaded (offline?)'));
-    };
-    s.onload = () => {
-      // workers from a CDN need a same-origin data: shim
-      window.MonacoEnvironment = {
-        getWorkerUrl() {
-          return `data:text/javascript;charset=utf-8,${encodeURIComponent(
-            `self.MonacoEnvironment={baseUrl:'${MONACO_BASE}/'};importScripts('${MONACO_BASE}/vs/base/worker/workerMain.js');`
-          )}`;
-        }
-      };
-      window.require.config({ paths: { vs: `${MONACO_BASE}/vs` } });
-      window.require(
-        ['vs/editor/editor.main'],
-        () => {
-          clearTimeout(timer);
-          defineMonacoThemes(window.monaco);
-          resolve(window.monaco);
-        },
-        (err) => {
-          clearTimeout(timer);
-          reject(err);
-        }
-      );
-    };
+    s.src = src;
+    s.onload = resolve;
+    s.onerror = () => reject(new Error('The code editor could not be loaded (offline?)'));
     document.head.appendChild(s);
-  }).catch((err) => {
-    monacoPromise = null;
+  });
+}
+function loadAce() {
+  if (store.get('ax-editor', 'ace') === 'basic') return Promise.reject(new Error('basic editor chosen'));
+  if (acePromise) return acePromise;
+  let timer;
+  acePromise = Promise.race([
+    (async () => {
+      if (!window.ace) await loadScript(`${ACE_BASE}/ace.js`);
+      await loadScript(`${ACE_BASE}/ext-language_tools.js`);
+      window.ace.config.set('basePath', ACE_BASE);
+      defineAceThemes(window.ace);
+      clearTimeout(timer);
+      return window.ace;
+    })(),
+    new Promise((_, reject) => (timer = setTimeout(() => reject(new Error('The code editor took too long to load')), 9000)))
+  ]).catch((err) => {
+    acePromise = null;
     throw err;
   });
-  return monacoPromise;
+  return acePromise;
 }
-function defineMonacoThemes(monaco) {
-  monaco.editor.defineTheme('ax-dark', {
-    base: 'vs-dark',
-    inherit: true,
-    rules: [
-      { token: '', foreground: 'e9e3d8' },
-      { token: 'comment', foreground: '6f695f', fontStyle: 'italic' },
-      { token: 'keyword', foreground: 'd9c3a0' },
-      { token: 'string', foreground: 'b7c99f' },
-      { token: 'number', foreground: 'e6b98a' },
-      { token: 'regexp', foreground: 'e6b98a' },
-      { token: 'type', foreground: 'c9b6e0' },
-      { token: 'delimiter', foreground: '9a9286' }
-    ],
-    colors: {
-      'editor.background': '#1a1917',
-      'editor.foreground': '#e9e3d8',
-      'editor.lineHighlightBackground': '#211f1d',
-      'editor.lineHighlightBorder': '#00000000',
-      'editorLineNumber.foreground': '#4f4a43',
-      'editorLineNumber.activeForeground': '#b9b1a4',
-      'editor.selectionBackground': '#ecdcbf33',
-      'editor.inactiveSelectionBackground': '#ecdcbf1c',
-      'editorCursor.foreground': '#ecdcbf',
-      'editorIndentGuide.background1': '#2a2826',
-      'editorIndentGuide.activeBackground1': '#3a3734',
-      'editorWidget.background': '#211f1d',
-      'editorWidget.border': '#33302c',
-      'editorSuggestWidget.selectedBackground': '#2c2a27',
-      'scrollbarSlider.background': '#ecdcbf1a',
-      'scrollbarSlider.hoverBackground': '#ecdcbf2e'
-    }
-  });
-  monaco.editor.defineTheme('ax-light', {
-    base: 'vs',
-    inherit: true,
-    rules: [
-      { token: '', foreground: '2a251e' },
-      { token: 'comment', foreground: 'a0968a', fontStyle: 'italic' },
-      { token: 'keyword', foreground: '8a5a2b' },
-      { token: 'string', foreground: '4f7a3f' },
-      { token: 'number', foreground: 'a3601f' },
-      { token: 'type', foreground: '6b4f8a' }
-    ],
-    colors: {
-      'editor.background': '#f9f6f1',
-      'editor.lineHighlightBackground': '#f1ece4',
-      'editor.lineHighlightBorder': '#00000000',
-      'editorLineNumber.foreground': '#c4baab',
-      'editorLineNumber.activeForeground': '#6d6355',
-      'editor.selectionBackground': '#2a251e1f',
-      'editorCursor.foreground': '#2a251e',
-      'editorIndentGuide.background1': '#e8e1d6'
-    }
-  });
+
+// One palette per theme; the CSS below is built from it.
+const ACE_PALETTES = {
+  'ax-dark': {
+    dark: true, bg: '#1a1917', fg: '#e9e3d8', gutter: '#1a1917', gutterFg: '#4f4a43', gutterActive: '#b9b1a4',
+    line: '#211f1d', sel: 'rgba(236, 220, 191, 0.2)', cursor: '#ecdcbf', guide: '#2a2826', bracket: 'rgba(236, 220, 191, 0.35)',
+    comment: '#6f695f', keyword: '#d9c3a0', string: '#b7c99f', number: '#e6b98a', type: '#c9b6e0', fn: '#e8d3ad', punct: '#9a9286',
+    tag: '#d9c3a0', attr: '#c9b6e0', invalid: '#e69a8b',
+    pop: '#211f1d', popBorder: '#33302c', popSel: '#2c2a27', popHover: '#262422', popMatch: '#ecdcbf', popMeta: '#6f695f'
+  },
+  'ax-light': {
+    dark: false, bg: '#f9f6f1', fg: '#2a251e', gutter: '#f9f6f1', gutterFg: '#c2b8aa', gutterActive: '#6e655a',
+    line: '#f1ece3', sel: 'rgba(138, 90, 43, 0.16)', cursor: '#2a251e', guide: '#ebe4d8', bracket: 'rgba(138, 90, 43, 0.35)',
+    comment: '#a0968a', keyword: '#8a5a2b', string: '#4f7a3f', number: '#a3601f', type: '#6b4f8a', fn: '#5c4320', punct: '#8a8174',
+    tag: '#8a5a2b', attr: '#6b4f8a', invalid: '#b3452f',
+    pop: '#fbf9f5', popBorder: '#e2dacd', popSel: '#efe8dc', popHover: '#f4efe7', popMatch: '#8a5a2b', popMeta: '#a0968a'
+  }
+};
+function aceThemeCss(cls, p) {
+  const c = `.${cls}`;
+  // Ace's own popup rules are .ace_dark.ace_editor.ace_autocomplete …, so ours repeat the class to win
+  const pop = `.ace_editor.ace_autocomplete${c}${c}`;
+  return `
+${c} { background: ${p.bg}; color: ${p.fg}; }
+${c} .ace_gutter { background: ${p.gutter}; color: ${p.gutterFg}; }
+${c} .ace_gutter-active-line { background: transparent; color: ${p.gutterActive}; }
+${c} .ace_gutter-cell.ace_error, ${c} .ace_gutter-cell.ace_warning, ${c} .ace_gutter-cell.ace_info { background-position: 4px center; }
+${c} .ace_print-margin { display: none; }
+${c} .ace_cursor { color: ${p.cursor}; border-left-width: 2px; }
+${c} .ace_marker-layer .ace_selection { background: ${p.sel}; border-radius: 3px; }
+${c}.ace_multiselect .ace_selection.ace_start { box-shadow: 0 0 3px 0 ${p.bg}; }
+${c} .ace_marker-layer .ace_active-line { background: ${p.line}; }
+${c} .ace_marker-layer .ace_selected-word { background: ${p.sel}; border: 0; }
+${c} .ace_marker-layer .ace_bracket { margin: 0; border: 1px solid ${p.bracket}; border-radius: 2px; }
+${c} .ace_indent-guide { background: none; box-shadow: inset 1px 0 0 ${p.guide}; }
+${c} .ace_indent-guide-active { box-shadow: inset 1px 0 0 ${p.bracket}; }
+${c} .ace_fold { background: ${p.line}; border-color: ${p.gutterFg}; }
+${c} .ace_comment { color: ${p.comment}; font-style: italic; }
+${c} .ace_keyword, ${c} .ace_storage, ${c} .ace_keyword.ace_operator.ace_word { color: ${p.keyword}; }
+${c} .ace_keyword.ace_operator, ${c} .ace_punctuation, ${c} .ace_paren { color: ${p.punct}; }
+${c} .ace_string, ${c} .ace_string.ace_regexp { color: ${p.string}; }
+${c} .ace_string.ace_regexp, ${c} .ace_constant.ace_numeric, ${c} .ace_constant.ace_language, ${c} .ace_constant.ace_character { color: ${p.number}; }
+${c} .ace_support.ace_type, ${c} .ace_support.ace_class, ${c} .ace_entity.ace_name.ace_type, ${c} .ace_storage.ace_type { color: ${p.type}; }
+${c} .ace_entity.ace_name.ace_function, ${c} .ace_support.ace_function { color: ${p.fn}; }
+${c} .ace_variable.ace_parameter { font-style: italic; }
+${c} .ace_meta.ace_tag, ${c} .ace_entity.ace_name.ace_tag { color: ${p.tag}; }
+${c} .ace_entity.ace_other.ace_attribute-name { color: ${p.attr}; }
+${c} .ace_markup.ace_heading { color: ${p.keyword}; font-weight: 600; }
+${c} .ace_invalid { color: ${p.invalid}; background: none; }
+${c} .ace_scrollbar-v::-webkit-scrollbar, ${c} .ace_scrollbar-h::-webkit-scrollbar { width: 10px; height: 10px; }
+${pop} { background: ${p.pop}; color: ${p.fg}; border: 1px solid ${p.popBorder}; border-radius: 10px; box-shadow: 0 18px 40px -16px rgba(0, 0, 0, ${p.dark ? 0.7 : 0.25}); }
+${pop} .ace_marker-layer .ace_active-line { background: ${p.popSel}; border-radius: 6px; }
+${pop} .ace_line-hover { background: ${p.popHover}; border: 0; border-radius: 6px; }
+${pop} .ace_completion-highlight { color: ${p.popMatch}; font-weight: 600; text-shadow: none; }
+${pop} .ace_completion-meta { color: ${p.popMeta}; }
+${pop} .ace_scroller { border-radius: 10px; }
+`;
+}
+function defineAceThemes(ace) {
+  for (const [name, p] of Object.entries(ACE_PALETTES)) {
+    ace.define(`ace/theme/${name}`, ['require', 'exports', 'module', 'ace/lib/dom'], (require, exports) => {
+      exports.isDark = p.dark;
+      exports.cssClass = `ace-${name}`;
+      exports.cssText = aceThemeCss(exports.cssClass, p);
+      require('ace/lib/dom').importCssString(exports.cssText, exports.cssClass, false);
+    });
+  }
 }
 
 // Editor backends share one tiny interface: open(file), value(), dispose(), layout(), setTheme()
-function monacoBackend(monaco, host, ide) {
-  const models = new Map();
-  const viewStates = new Map();
+const EXT_TO_ACE = {
+  js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'jsx', ts: 'typescript', tsx: 'tsx',
+  py: 'python', sh: 'sh', bash: 'sh', json: 'json', jsonc: 'json', html: 'html', htm: 'html', css: 'css',
+  scss: 'scss', less: 'less', md: 'markdown', yaml: 'yaml', yml: 'yaml', xml: 'xml', svg: 'svg', sql: 'sql',
+  txt: 'text', go: 'golang', rs: 'rust', rb: 'ruby', php: 'php', lua: 'lua', c: 'c_cpp', cpp: 'c_cpp', h: 'c_cpp',
+  toml: 'toml', ini: 'ini', dockerfile: 'dockerfile', csv: 'text'
+};
+function aceBackend(ace, host, ide) {
+  const sessions = new Map();
   let current = null;
-  const editor = monaco.editor.create(host, {
-    theme: S.theme === 'light' ? 'ax-light' : 'ax-dark',
+  const el = document.createElement('div');
+  el.className = 'ace-host';
+  host.appendChild(el);
+  const editor = ace.edit(el, {
+    theme: `ace/theme/${S.theme === 'light' ? 'ax-light' : 'ax-dark'}`,
     fontFamily: "'Geist Mono', ui-monospace, monospace",
-    fontSize: 13,
-    lineHeight: 21,
-    minimap: { enabled: false },
-    scrollBeyondLastLine: false,
-    smoothScrolling: true,
-    automaticLayout: true,
+    fontSize: '13px',
+    showPrintMargin: false,
+    highlightActiveLine: true,
+    highlightGutterLine: true,
+    displayIndentGuides: true,
+    highlightIndentGuides: true,
+    showFoldWidgets: true,
+    fadeFoldWidgets: true,
+    enableBasicAutocompletion: true,
+    enableLiveAutocompletion: true,
+    enableSnippets: true,
+    animatedScroll: true,
+    scrollPastEnd: 0.3,
+    cursorStyle: 'smooth',
     tabSize: 2,
-    padding: { top: 12 },
-    renderLineHighlight: 'all',
-    fixedOverflowWidgets: true
+    useSoftTabs: true
   });
-  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => ide.save());
-  editor.onDidChangeModelContent(() => {
-    if (current) ide.onEdit(current, editor.getValue());
-  });
-  const uri = (f) => monaco.Uri.parse(`file:///${enc(ide.name)}/${enc(f)}`);
+  editor.renderer.setPadding(14);
+  editor.renderer.setScrollMargin(12, 12, 0, 0);
+  editor.setOption('vScrollBarAlwaysVisible', false);
+  editor.commands.addCommand({ name: 'save', bindKey: { win: 'Ctrl-S', mac: 'Command-S' }, exec: () => ide.save() });
   return {
-    kind: 'monaco',
+    kind: 'ace',
     open(f) {
-      if (current) viewStates.set(current, editor.saveViewState());
-      let m = models.get(f);
-      if (!m) {
-        m = monaco.editor.createModel(ide.files.get(f).current, EXT_TO_MONACO[extOf(f)] || 'plaintext', uri(f));
-        models.set(f, m);
+      let sess = sessions.get(f);
+      if (!sess) {
+        sess = ace.createEditSession(ide.files.get(f).current, `ace/mode/${EXT_TO_ACE[extOf(f)] || 'text'}`);
+        sess.setUndoManager(new ace.UndoManager());
+        sess.setOptions({ tabSize: 2, useSoftTabs: true });
+        sess.on('change', () => ide.onEdit(f, sess.getValue()));
+        sessions.set(f, sess);
       }
       current = f;
-      editor.setModel(m);
-      if (viewStates.get(f)) editor.restoreViewState(viewStates.get(f));
+      editor.setSession(sess);
       editor.focus();
     },
     drop(f) {
-      const m = models.get(f);
-      if (m) m.dispose();
-      models.delete(f);
-      viewStates.delete(f);
+      const sess = sessions.get(f);
+      if (sess) sess.destroy();
+      sessions.delete(f);
       if (current === f) current = null;
     },
     value: () => editor.getValue(),
-    layout: () => editor.layout(),
-    setTheme: (t) => monaco.editor.setTheme(t === 'light' ? 'ax-light' : 'ax-dark'),
+    layout: () => editor.resize(),
+    setTheme: (t) => editor.setTheme(`ace/theme/${t === 'light' ? 'ax-light' : 'ax-dark'}`),
     dispose() {
-      editor.dispose();
-      models.forEach((m) => m.dispose());
+      editor.destroy();
+      sessions.forEach((sess) => sess.destroy());
+      editor.container.remove();
     }
   };
 }
@@ -1748,12 +1756,12 @@ class Ide {
     slideInd($('.side-panel .tabs', this.root));
 
     try {
-      const monaco = await loadMonaco();
+      const ace = await loadAce();
       $('#ideHost').innerHTML = '';
-      this.ed = monacoBackend(monaco, $('#ideHost'), this);
+      this.ed = aceBackend(ace, $('#ideHost'), this);
     } catch (err) {
       this.ed = basicBackend($('#ideHost'), this);
-      if (store.get('ax-editor', 'monaco') !== 'basic') toast(`Using the basic editor: ${err.message}`, 'err');
+      if (store.get('ax-editor', 'ace') !== 'basic') toast(`Using the basic editor: ${err.message}`, 'err');
     }
     if (!this.root.isConnected) return this.ed.dispose(); // navigated away while loading
     this.open(this.entry && this.files.has(this.entry) ? this.entry : [...this.files.keys()].find((f) => !this.files.get(f).binary));
@@ -2599,11 +2607,11 @@ function openPalette() {
     { label: 'Sign out', sec: 'Action', ico: icon('logout'), go: signOut },
     { label: `Switch to ${S.theme === 'dark' ? 'light' : 'dark'} theme`, sec: 'Action', ico: icon(S.theme === 'dark' ? 'sun' : 'moon'), go: toggleTheme },
     {
-      label: `Use the ${store.get('ax-editor', 'monaco') === 'basic' ? 'full (Monaco)' : 'basic, offline'} editor`,
+      label: `Use the ${store.get('ax-editor', 'ace') === 'basic' ? 'full (Ace)' : 'basic, offline'} editor`,
       sec: 'Action',
       ico: icon('code'),
       go: () => {
-        store.set('ax-editor', store.get('ax-editor', 'monaco') === 'basic' ? 'monaco' : 'basic');
+        store.set('ax-editor', store.get('ax-editor', 'ace') === 'basic' ? 'ace' : 'basic');
         toast('Editor changed. Reopen a worker’s code to use it');
       }
     },

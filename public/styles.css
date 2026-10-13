@@ -396,6 +396,11 @@ h1.page-title { margin: 0; font: 600 30px/1.15 var(--display); letter-spacing: -
 .etab.active { background: var(--well-2); color: var(--text); }
 .etab .dirty { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); }
 .editor-host { position: relative; flex: 1; min-height: 0; margin: 6px; border-radius: 10px; overflow: hidden; background: var(--card); }
+.ace-host { position: absolute; inset: 0; }
+.ace-host.ace_editor { font-variant-ligatures: none; line-height: 21px; }
+/* Ace's autocomplete and tooltips live on <body>, outside the editor */
+.ace_editor.ace_autocomplete { width: 320px; font-family: 'Geist Mono', ui-monospace, monospace; font-size: 12.5px; line-height: 24px; padding: 4px; }
+.ace_tooltip { background: var(--well-2); color: var(--text); border: 1px solid var(--line-2); border-radius: 8px; padding: 6px 9px; font: 12px/1.45 'Geist Mono', ui-monospace, monospace; box-shadow: 0 12px 30px -14px rgba(0, 0, 0, 0.6); }
 .fallback-editor { position: absolute; inset: 0; display: flex; overflow: auto; }
 .fallback-editor .gutter { padding: 14px 10px 14px 16px; text-align: right; color: var(--faint); font: 12.5px/1.6 var(--mono); user-select: none; background: var(--card); position: sticky; left: 0; z-index: 1; }
 .fallback-editor .stage { position: relative; flex: 1; min-width: max-content; }
