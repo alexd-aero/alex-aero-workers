@@ -249,6 +249,12 @@ http {
         default \$http_cf_connecting_ip;
     }
 
+    # only ask for an upgrade when the client did (was: "upgrade" on every request)
+    map \$http_upgrade \$connection_upgrade {
+        default upgrade;
+        ""      "";
+    }
+
     server {
         listen 0.0.0.0:${PUBLIC_PORT} default_server;
         listen [::]:${PUBLIC_PORT} default_server;
@@ -276,7 +282,7 @@ http {
             proxy_set_header Accept \$http_accept;
             proxy_set_header Origin \$http_origin;
             proxy_set_header Upgrade \$http_upgrade;
-            proxy_set_header Connection "upgrade";
+            proxy_set_header Connection \$connection_upgrade;
         }
     }
 }

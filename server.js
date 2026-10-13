@@ -35,6 +35,71 @@ const PUBLIC_PORT = parseInt(process.env.PUBLIC_PORT || '27715', 10);
   }
 });
 
+// Write JSON through a temp file + rename so a crash or power cut mid-write
+// can never leave a half-written (unparseable) config/state/meta file behind.
+function writeJsonAtomic(filePath, data, mode) {
+  const tmp = `${filePath}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), mode ? { encoding: 'utf8', mode } : 'utf8');
+  fs.renameSync(tmp, filePath);
+}
+
+// Request-driven bookkeeping (logs, invocations, counters) changes on every hit.
+// Writing meta.json + state.json synchronously per request hammered the SD card
+// and blocked the event loop, so those writes are coalesced and flushed shortly after.
+const pendingMetaWrites = new Set();
+let pendingStateWrite = false;
+let flushTimer = null;
+function scheduleFlush() {
+  if (flushTimer) return;
+  flushTimer = setTimeout(flushPendingWrites, 750);
+}
+function persistWorkerSoon(name) {
+  pendingMetaWrites.add(name);
+  scheduleFlush();
+}
+function persistStateSoon() {
+  pendingStateWrite = true;
+  scheduleFlush();
+}
+function flushPendingWrites() {
+  if (flushTimer) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+  for (const name of pendingMetaWrites) {
+    const meta = state.workers[name];
+    const dir = path.join(WORKERS_DIR, name);
+    if (meta && fs.existsSync(dir)) {
+      try {
+        writeJsonAtomic(path.join(dir, 'meta.json'), meta);
+      } catch (err) {
+        console.error(`Failed writing meta for ${name}:`, err.message);
+      }
+    }
+  }
+  pendingMetaWrites.clear();
+  if (pendingStateWrite) {
+    pendingStateWrite = false;
+    try {
+      saveState();
+    } catch (err) {
+      console.error('Failed writing state.json:', err.message);
+    }
+  }
+}
+
+function escapeHtmlText(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+const dayKey = (d = new Date()) => d.toISOString().slice(0, 10);
+const hourKey = (d = new Date()) => d.toISOString().slice(0, 13);
+
 function detectLocalIp() {
   const interfaces = os.networkInterfaces();
   for (const name of Object.keys(interfaces)) {
@@ -86,84 +151,32 @@ try {
   if (fs.existsSync(NETWORK_IP_CACHE_FILE)) fs.unlinkSync(NETWORK_IP_CACHE_FILE);
 } catch (_) {}
 
-function loadInitialPublicNetworkInfo() {
-  let info = {
-    ip: '',
-    cf: {}
-  };
+// Filled in asynchronously right after boot. It used to be three blocking `curl`
+// calls (up to 9 s) before the server could even listen.
+let PUBLIC_NETWORK_INFO = { ip: '', cf: {} };
+let publicNetworkInfoAt = 0;
+let publicNetworkRefresh = null;
 
-  try {
-    const rawWho = execSync('curl -fsSL --max-time 3 "https://ipwho.is/"', {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore']
-    }).trim();
-    const who = JSON.parse(rawWho);
-    if (who && who.ip && !isPrivateOrLocalIp(who.ip)) {
-      info.ip = who.ip;
-      info.cf = {
-        country: who.country_code || null,
-        region: who.region || null,
-        regionCode: who.region_code || null,
-        city: who.city || null,
-        postalCode: who.postal || null,
-        continent: who.continent_code || null,
-        latitude: typeof who.latitude === 'number' ? who.latitude : null,
-        longitude: typeof who.longitude === 'number' ? who.longitude : null,
-        timezone: (who.timezone && who.timezone.id) || null,
-        isEUCountry: Boolean(who.is_eu),
-        asn: (who.connection && who.connection.asn) || null,
-        asOrganization: (who.connection && (who.connection.org || who.connection.isp)) || null
-      };
-    }
-  } catch (_) {}
-
-  try {
-    const traceRaw = execSync('curl -fsSL --max-time 3 "https://1.1.1.1/cdn-cgi/trace"', {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore']
-    }).trim();
-    const traceMap = {};
-    for (const line of traceRaw.split('\n')) {
-      const idx = line.indexOf('=');
-      if (idx !== -1) {
-        traceMap[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
-      }
-    }
-    if (!info.ip && traceMap.ip && !isPrivateOrLocalIp(traceMap.ip)) {
-      info.ip = traceMap.ip;
-    }
-    if (traceMap.colo) info.cf.colo = traceMap.colo;
-    if (!info.cf.country && traceMap.loc) info.cf.country = traceMap.loc;
-    if (traceMap.http) info.cf.httpProtocol = traceMap.http.toUpperCase().replace('HTTP/2', 'HTTP/2');
-    if (traceMap.tls) info.cf.tlsVersion = traceMap.tls;
-  } catch (_) {}
-
-  if (!info.ip) {
-    try {
-      const ipifyRaw = execSync('curl -fsSL --max-time 3 "https://api.ipify.org?format=json"', {
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'ignore']
-      }).trim();
-      const parsed = JSON.parse(ipifyRaw);
-      if (parsed && parsed.ip && !isPrivateOrLocalIp(parsed.ip)) {
-        info.ip = parsed.ip;
-      }
-    } catch (_) {}
+function refreshPublicNetworkInfoAsync(maxAgeMs = 0) {
+  if (maxAgeMs && Date.now() - publicNetworkInfoAt < maxAgeMs) return Promise.resolve();
+  if (!publicNetworkRefresh) {
+    publicNetworkRefresh = doRefreshPublicNetworkInfo().finally(() => {
+      publicNetworkInfoAt = Date.now();
+      publicNetworkRefresh = null;
+    });
   }
-
-  return info;
+  return publicNetworkRefresh;
 }
 
-let PUBLIC_NETWORK_INFO = loadInitialPublicNetworkInfo();
-
-async function refreshPublicNetworkInfoAsync() {
+async function doRefreshPublicNetworkInfo() {
+  const fetchT = (url) => fetch(url, { signal: AbortSignal.timeout(4000) });
   try {
     const nextInfo = {
       ip: PUBLIC_NETWORK_INFO.ip || '',
       cf: { ...(PUBLIC_NETWORK_INFO.cf || {}) }
     };
     try {
-      const r1 = await fetch('https://ipwho.is/');
+      const r1 = await fetchT('https://ipwho.is/');
       if (r1.ok) {
         const who = await r1.json();
         if (who && who.ip && !isPrivateOrLocalIp(who.ip)) {
@@ -191,7 +204,7 @@ async function refreshPublicNetworkInfoAsync() {
     } catch (_) {}
 
     try {
-      const r2 = await fetch('https://1.1.1.1/cdn-cgi/trace');
+      const r2 = await fetchT('https://1.1.1.1/cdn-cgi/trace');
       if (r2.ok) {
         const traceRaw = await r2.text();
         for (const line of traceRaw.split('\n')) {
@@ -215,7 +228,8 @@ async function refreshPublicNetworkInfoAsync() {
   } catch (_) {}
 }
 
-setInterval(refreshPublicNetworkInfoAsync, 10 * 60 * 1000).unref();
+setInterval(() => refreshPublicNetworkInfoAsync(), 10 * 60 * 1000).unref();
+setImmediate(() => refreshPublicNetworkInfoAsync());
 
 function getRuntimeVersions() {
   const safeExec = (cmd) => {
@@ -246,7 +260,8 @@ function buildJsWorkerTemplate(name) {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const files = (env && env.FILES) || {};
-    const reqFile = decodeURIComponent(url.pathname.replace(/^\\/+/, ""));
+    let reqFile = url.pathname.replace(/^\\/+/, "");
+    try { reqFile = decodeURIComponent(reqFile); } catch (_) {}
 
     if (reqFile && files[reqFile] !== undefined) {
       return new Response(files[reqFile]);
@@ -294,7 +309,8 @@ const LANGUAGES = {
   async fetch(request: Request, env: any, ctx: any): Promise<Response> {
     const url = new URL(request.url);
     const files = (env && env.FILES) || {};
-    const reqFile = decodeURIComponent(url.pathname.replace(/^\\/+/, ""));
+    let reqFile = url.pathname.replace(/^\\/+/, "");
+    try { reqFile = decodeURIComponent(reqFile); } catch (_) {}
 
     if (reqFile && files[reqFile] !== undefined) {
       return new Response(files[reqFile]);
@@ -378,7 +394,7 @@ const LANGUAGES = {
 </head>
 <body>
   <h1>${name}</h1>
-  <p>Edit this HTML file in Robo Workers.</p>
+  <p>Edit this page in Alex-Aero.</p>
 </body>
 </html>
 `
@@ -592,13 +608,13 @@ function loadConfig() {
     }
   }
   const diskConfig = { ...defaultConfig, localIp: '' };
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(diskConfig, null, 2), 'utf8');
+  writeJsonAtomic(CONFIG_FILE, diskConfig);
   return defaultConfig;
 }
 
 function saveConfig(cfg) {
   cfg.updatedAt = new Date().toISOString();
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf8');
+  writeJsonAtomic(CONFIG_FILE, cfg);
   syncCloudflareRecordsFile(cfg);
 }
 
@@ -607,6 +623,10 @@ let config = loadConfig();
 function loadState() {
   const defaultState = {
     activeWorker: '',
+    // The worker that answers paths no other worker claims. It used to be
+    // `activeWorker`, which changes whenever you click a worker in the
+    // dashboard, so browsing silently re-pointed the public site.
+    defaultWorker: null,
     lastDashboardClient: null,
     editorPreferences: {
       spaces: 2,
@@ -646,13 +666,23 @@ function loadState() {
 
 let state = loadState();
 
+let lastRecordsSignature = '';
 function saveState() {
+  // Each worker's meta.json is the source of truth; state.json only keeps the
+  // UI/editor state. (It used to duplicate every worker's logs, invocations and
+  // 25 code snapshots, rewritten on every single request.)
   const diskState = {
-    ...state,
-    lastDashboardClient: null
+    activeWorker: state.activeWorker,
+    defaultWorker: state.defaultWorker,
+    editorPreferences: state.editorPreferences,
+    workers: Object.fromEntries(Object.keys(state.workers).map((n) => [n, { name: n }]))
   };
-  fs.writeFileSync(STATE_FILE, JSON.stringify(diskState, null, 2), 'utf8');
-  syncCloudflareRecordsFile(config);
+  writeJsonAtomic(STATE_FILE, diskState);
+  const signature = JSON.stringify([Object.keys(state.workers).sort(), config.subdomain, config.rootDomain, config.tunnelId, config.localIp]);
+  if (signature !== lastRecordsSignature) {
+    lastRecordsSignature = signature;
+    syncCloudflareRecordsFile(config);
+  }
 }
 
 function syncCloudflareRecordsFile(cfg) {
@@ -693,7 +723,7 @@ function syncCloudflareRecordsFile(cfg) {
       }))
     };
 
-    fs.writeFileSync(CF_RECORDS_FILE, JSON.stringify(recordsPayload, null, 2), 'utf8');
+    writeJsonAtomic(CF_RECORDS_FILE, recordsPayload);
   } catch (err) {
     console.error('Failed syncing cloudflare-records.json:', err.message);
   }
@@ -812,8 +842,8 @@ function discoverWorkersOnDisk() {
         errors: 0,
         subrequests: 0,
         lastRunAt: null,
-        lastDurationMs: 1.4,
-        lastCpuUs: 967,
+        lastDurationMs: null,
+        lastCpuUs: null,
         spaces: 2,
         encoding: 'UTF-8',
         eol: 'LF',
@@ -887,7 +917,6 @@ function discoverWorkersOnDisk() {
       }));
       if (!Array.isArray(meta.issues)) meta.issues = [];
       if (!Array.isArray(meta.invocations)) meta.invocations = [];
-      if (!meta.lastCpuUs) meta.lastCpuUs = Math.round((meta.lastDurationMs || 1.2) * 800);
       if (!Array.isArray(meta.deployments) || meta.deployments.length === 0) {
         meta.deployments = [
           {
@@ -903,7 +932,7 @@ function discoverWorkersOnDisk() {
     }
 
     state.workers[name] = meta;
-    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf8');
+    writeJsonAtomic(metaPath, meta);
   }
 
   for (const existingName of Object.keys(state.workers)) {
@@ -915,15 +944,36 @@ function discoverWorkersOnDisk() {
   if (!state.activeWorker || !state.workers[state.activeWorker]) {
     state.activeWorker = Object.keys(state.workers)[0] || '';
   }
+  // Older installs used the selected worker as the catch-all; keep serving the
+  // same one, but from now on it only changes when you pick it on purpose.
+  if (state.defaultWorker === null || state.defaultWorker === undefined) {
+    state.defaultWorker = state.activeWorker || '';
+  }
+  if (state.defaultWorker && !state.workers[state.defaultWorker]) {
+    state.defaultWorker = '';
+  }
   saveState();
 }
 
 function sanitizeWorkerName(rawName) {
+  // No leading dots: "." and ".." used to resolve to storage/ itself, letting a
+  // worker overwrite auth.json / config.json.
   return String(rawName || '')
     .trim()
     .replace(/[^a-zA-Z0-9._-]/g, '-')
-    .replace(/^-+|-+$/g, '')
+    .replace(/^[-.]+|-+$/g, '')
     .slice(0, 64);
+}
+
+const RESERVED_WORKER_NAMES = new Set([
+  'api', 'public', 'assets', 'dashboard', 'editor', 'records', 'vendor',
+  'index.html', 'app.js', 'styles.css', 'lang-icons.js', 'favicon.ico', 'favicon.svg', 'robots.txt'
+]);
+
+function validateWorkerName(name) {
+  if (!name) return 'Worker name is required';
+  if (RESERVED_WORKER_NAMES.has(name.toLowerCase())) return `"${name}" is a reserved system path`;
+  return null;
 }
 
 function getWorkerCodePath(name, targetFile) {
@@ -958,7 +1008,12 @@ function readWorkerCodeFromStorage(name, targetFile) {
   return '';
 }
 
-function invalidateWorkerRuntime(workerName) {
+function invalidateWorkerRuntime(workerName, removeRunDir = false) {
+  if (removeRunDir && workerName) {
+    try {
+      fs.rmSync(path.join(RUNTIME_DIR, workerName), { recursive: true, force: true });
+    } catch (_) {}
+  }
   if (!workerName || !workerdPool.has(workerName)) return;
   const running = workerdPool.get(workerName);
   if (running) {
@@ -978,10 +1033,8 @@ function invalidateWorkerRuntime(workerName) {
 
 function createOrUpdateWorker(rawName, options = {}) {
   const name = sanitizeWorkerName(rawName);
-  if (!name) throw new Error('Invalid worker name');
-  if (['api', 'public', 'assets', 'dashboard', 'editor', 'records'].includes(name.toLowerCase())) {
-    throw new Error(`"${name}" is a reserved system path`);
-  }
+  const invalid = validateWorkerName(name);
+  if (invalid) throw Object.assign(new Error(invalid), { statusCode: 400 });
 
   const existing = state.workers[name] || {};
   const languageId = options.language || existing.language || 'javascript';
@@ -1074,7 +1127,8 @@ function createOrUpdateWorker(rawName, options = {}) {
       sizeBytes: Buffer.byteLength(codeToWrite),
       author: config.username || 'admin',
       source: options.deploySource || 'Manually deployed',
-      codeSnapshot: codeToWrite
+      codeSnapshot: codeToWrite,
+      filesSnapshot: snapshotWorkerFiles(name)
     });
   }
 
@@ -1090,8 +1144,12 @@ function createOrUpdateWorker(rawName, options = {}) {
     errors: existing.errors || 0,
     subrequests: existing.subrequests || 0,
     lastRunAt: existing.lastRunAt || null,
-    lastDurationMs: existing.lastDurationMs || 1.4,
-    lastCpuUs: existing.lastCpuUs || 967,
+    lastDurationMs: existing.lastDurationMs ?? null,
+    lastCpuUs: existing.lastCpuUs ?? null,
+    lastResponseBytes: existing.lastResponseBytes ?? null,
+    totalBytesServed: existing.totalBytesServed || 0,
+    daily: existing.daily || {},
+    hourly: existing.hourly || {},
     spaces: options.spaces !== undefined ? options.spaces : existing.spaces || 2,
     indentUsingTabs:
       options.indentUsingTabs !== undefined ? options.indentUsingTabs : existing.indentUsingTabs || false,
@@ -1138,11 +1196,22 @@ function createOrUpdateWorker(rawName, options = {}) {
     logs: Array.isArray(existing.logs) ? existing.logs.slice(-150) : []
   };
 
-  fs.writeFileSync(path.join(workerDir, 'meta.json'), JSON.stringify(meta, null, 2), 'utf8');
+  writeJsonAtomic(path.join(workerDir, 'meta.json'), meta);
   state.workers[name] = meta;
   saveState();
 
   return { meta, code: codeToWrite, files: listWorkerFiles(name) };
+}
+
+// Every text file of a worker, for deployment history. Capped so a worker
+// with big assets doesn't balloon meta.json; past the cap only the entry
+// file is kept (the old behaviour).
+const SNAPSHOT_LIMIT_BYTES = 512 * 1024;
+function snapshotWorkerFiles(name) {
+  const files = listWorkerFiles(name);
+  const total = files.reduce((n, f) => n + Buffer.byteLength(f.content || ''), 0);
+  if (total > SNAPSHOT_LIMIT_BYTES) return null;
+  return Object.fromEntries(files.map((f) => [f.name, f.content]));
 }
 
 function appendWorkerLog(name, level, message) {
@@ -1154,15 +1223,12 @@ function appendWorkerLog(name, level, message) {
     worker: name,
     timestamp: new Date().toISOString(),
     level: level || 'log',
-    message: String(message)
+    message: String(message).slice(0, 8000)
   });
-  if (meta.logs.length > 100) {
-    meta.logs = meta.logs.slice(-100);
+  if (meta.logs.length > 200) {
+    meta.logs = meta.logs.slice(-200);
   }
-  const workerDir = path.join(WORKERS_DIR, name);
-  if (fs.existsSync(workerDir)) {
-    fs.writeFileSync(path.join(workerDir, 'meta.json'), JSON.stringify(meta, null, 2), 'utf8');
-  }
+  persistWorkerSoon(name);
 }
 
 /**
@@ -1262,9 +1328,43 @@ function parseClientAndDevice(req, isDashboardHttp = false) {
 // Cloudflare `workerd` Process Pool & On-Run Code Loader
 // ============================================================================
 const workerdPool = new Map();
-let nextWorkerdPort = 19100;
+
+// Ask the kernel for a free port. The old counter started at 19100 and only
+// ever went up, so a second instance (or anything else on 191xx) collided.
+function getFreePort() {
+  return new Promise((resolve, reject) => {
+    const srv = require('net').createServer();
+    srv.unref();
+    srv.on('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+let nodeStripTypes = null;
+try {
+  const mod = require('module');
+  if (typeof mod.stripTypeScriptTypes === 'function') nodeStripTypes = mod.stripTypeScriptTypes;
+} catch (_) {}
 
 function stripBasicTypeScriptTypes(code) {
+  // Node 22.13+/23.2+ ships a proper type stripper; the regexes below mangled
+  // anything beyond the simplest annotations (object types, generics, `as`).
+  if (nodeStripTypes) {
+    try {
+      const prevEmit = process.emitWarning;
+      process.emitWarning = () => {};
+      try {
+        return nodeStripTypes(code, { mode: 'strip' });
+      } finally {
+        process.emitWarning = prevEmit;
+      }
+    } catch (_) {
+      // not valid erasable TS (e.g. enums): fall through to the old best-effort pass
+    }
+  }
   return code
     .replace(/:\s*Promise<[^>]+>/g, '')
     .replace(/:\s*(Request|Response|any|string|number|boolean|unknown|void|Record<[^>]+>)\b/g, '')
@@ -1374,6 +1474,17 @@ function __normalizeToResponse(val) {
     });
   }
   return new Response(val !== undefined ? String(val) : '');
+}
+
+function __packLogs(logs) {
+  let list = logs.slice(-40).map((l) => ({ level: l.level, message: String(l.message).slice(0, 1500) }));
+  let packed = encodeURIComponent(JSON.stringify(list));
+  while (packed.length > 9000 && list.length > 1) {
+    list = list.slice(Math.ceil(list.length / 2));
+    packed = encodeURIComponent(JSON.stringify(list));
+  }
+  if (packed.length > 9000) packed = encodeURIComponent(JSON.stringify([{ level: 'warn', message: '(log output too large to show)' }]));
+  return packed;
 }
 
 async function __invokeUserExport(req, env, ctx) {
@@ -1497,7 +1608,7 @@ export default {
 
       const headers = new Headers(resp.headers);
       if (__logs.length > 0) {
-        headers.set('x-internal-logs', encodeURIComponent(JSON.stringify(__logs)));
+        headers.set('x-internal-logs', __packLogs(__logs));
       }
       return new Response(resp.body, {
         status: resp.status,
@@ -1510,7 +1621,7 @@ export default {
         status: 500,
         headers: {
           'content-type': 'text/plain; charset=utf-8',
-          'x-internal-logs': encodeURIComponent(JSON.stringify(__logs))
+          'x-internal-logs': __packLogs(__logs)
         }
       });
     } finally {
@@ -1744,14 +1855,6 @@ function startNodeWorkerFallbackServer(port, compiledWorkerPath, workerName) {
     const moduleVersion = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     let cachedWorkerModPromise = null;
 
-    const srv = http.createServer(async (req, res) => {
-      try {
-        const chunks = [];
-        for await (const chunk of req) chunks.push(c => c, chunk);
-      } catch (_) {}
-    });
-    srv.close();
-
     const isolateSrv = http.createServer(async (req, res) => {
       try {
         const chunks = [];
@@ -1805,7 +1908,7 @@ function startNodeWorkerFallbackServer(port, compiledWorkerPath, workerName) {
         res.writeHead(webRes.status || 200, outHeaders);
         res.end(Buffer.from(arrayBuf));
       } catch (err) {
-        appendWorkerLog(workerName, 'error', `[Robo Workers] ${err.message}`);
+        appendWorkerLog(workerName, 'error', `[node fallback] ${err.message}`);
         res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ error: err.message }));
       }
@@ -1863,7 +1966,7 @@ async function ensureWorkerdInstance(workerName, rawCode, language, bindings) {
     workerdPool.delete(workerName);
   }
 
-  const port = nextWorkerdPort++;
+  const port = await getFreePort();
   const runDir = path.join(RUNTIME_DIR, workerName);
   if (!fs.existsSync(runDir)) {
     fs.mkdirSync(runDir, { recursive: true });
@@ -1937,6 +2040,11 @@ ${extraModuleLines.join('\n')}
         cwd: runDir,
         stdio: ['ignore', 'pipe', 'pipe']
       });
+      // Must be read: a full, unread stdout pipe blocks workerd mid-request.
+      proc.stdout.on('data', (chunk) => {
+        const msg = chunk.toString().trim();
+        if (msg) appendWorkerLog(workerName, 'log', msg);
+      });
 
       proc.on('error', () => {
         spawnFailed = true;
@@ -1950,7 +2058,7 @@ ${extraModuleLines.join('\n')}
           spawnFailed = true;
           return;
         }
-        appendWorkerLog(workerName, 'error', `[Robo Workers] ${msg}`);
+        appendWorkerLog(workerName, /warning/i.test(msg) ? 'warn' : 'error', `[workerd] ${msg}`);
       });
 
       proc.on('exit', (code) => {
@@ -1978,8 +2086,9 @@ ${extraModuleLines.join('\n')}
         });
         sock.on('error', () => {
           sock.destroy();
-          if (attempts > 25) return resolve(false);
-          setTimeout(check, 25);
+          // ~6 s: a cold workerd on a Raspberry Pi can need well over the old 0.7 s
+          if (attempts > 120) return resolve(false);
+          setTimeout(check, 50);
         });
       };
       setTimeout(check, 20);
@@ -2005,6 +2114,9 @@ ${extraModuleLines.join('\n')}
 function forwardToWorkerd(port, req, bodyBuffer, deviceInfo, targetPathWithQuery) {
   return new Promise((resolve, reject) => {
     const forwardHeaders = { ...req.headers };
+    for (const h of ['connection', 'upgrade', 'keep-alive', 'proxy-connection', 'te', 'trailer', 'transfer-encoding']) {
+      delete forwardHeaders[h];
+    }
     forwardHeaders['x-client-ip'] = deviceInfo.ip;
     forwardHeaders['x-real-ip'] = deviceInfo.ip;
     forwardHeaders['true-client-ip'] = deviceInfo.ip;
@@ -2059,7 +2171,7 @@ function forwardToWorkerd(port, req, bodyBuffer, deviceInfo, targetPathWithQuery
         path: targetPathWithQuery,
         method: req.method,
         headers: forwardHeaders,
-        timeout: 8000
+        timeout: 30000
       },
       (proxyRes) => {
         const chunks = [];
@@ -2086,7 +2198,7 @@ function forwardToWorkerd(port, req, bodyBuffer, deviceInfo, targetPathWithQuery
   });
 }
 
-function interpolateTemplate(templateStr, workerName, req, deviceInfo, queryObj) {
+function interpolateTemplate(templateStr, workerName, req, deviceInfo, queryObj, markup = false) {
   const vars = {
     worker: workerName,
     ip: deviceInfo.ip,
@@ -2103,9 +2215,12 @@ function interpolateTemplate(templateStr, workerName, req, deviceInfo, queryObj)
     timestamp: new Date().toISOString(),
     query: JSON.stringify(queryObj || {})
   };
-  return String(templateStr).replace(/\{\{\s*(\w+)\s*\}\}/g, (_, key) =>
-    vars[key] !== undefined ? vars[key] : ''
-  );
+  // In HTML/XML/SVG the values (URL, query, User-Agent) are attacker-controlled,
+  // so they're escaped there; otherwise ?q=<script> was reflected verbatim.
+  return String(templateStr).replace(/\{\{\s*(\w+)\s*\}\}/g, (_, key) => {
+    if (vars[key] === undefined) return '';
+    return markup ? escapeHtmlText(vars[key]) : String(vars[key]);
+  });
 }
 
 function executeProcessCommand(cmd, args, codeFilePath, envVars, stdinBuffer) {
@@ -2118,24 +2233,37 @@ function executeProcessCommand(cmd, args, codeFilePath, envVars, stdinBuffer) {
 
     const stdoutChunks = [];
     const stderrChunks = [];
+    const LIMIT = 8 * 1024 * 1024;
+    let outBytes = 0;
+    let timedOut = false;
     const timer = setTimeout(() => {
+      timedOut = true;
       try {
         child.kill('SIGKILL');
       } catch (_) {}
-    }, 8000);
+    }, 15000);
 
-    child.stdout.on('data', (c) => stdoutChunks.push(c));
-    child.stderr.on('data', (c) => stderrChunks.push(c));
+    child.stdout.on('data', (c) => {
+      outBytes += c.length;
+      if (outBytes <= LIMIT) stdoutChunks.push(c);
+    });
+    child.stderr.on('data', (c) => {
+      if (stderrChunks.reduce((n, x) => n + x.length, 0) < 256 * 1024) stderrChunks.push(c);
+    });
 
-    child.on('close', (exitCode) => {
+    child.on('close', (exitCode, signal) => {
       clearTimeout(timer);
+      let stderr = Buffer.concat(stderrChunks).toString('utf8');
+      if (timedOut) stderr += `${stderr ? '\n' : ''}Timed out after 15 s and was stopped.`;
+      else if (signal) stderr += `${stderr ? '\n' : ''}Killed by ${signal}.`;
       resolve({
-        exitCode: exitCode || 0,
+        exitCode: timedOut ? 124 : exitCode === null ? 1 : exitCode,
         stdout: Buffer.concat(stdoutChunks).toString('utf8'),
-        stderr: Buffer.concat(stderrChunks).toString('utf8')
+        stderr
       });
     });
 
+    child.stdin.on('error', () => {});
     child.on('error', (err) => {
       clearTimeout(timer);
       resolve({
@@ -2216,6 +2344,86 @@ function detectDataFormatContentType(bodyStr, filename, languageId, currentConte
   return existing || 'text/plain; charset=utf-8';
 }
 
+// Counters, per-day/per-hour buckets (for real charts), the invocation list and
+// issue tracking. Persisted in the background (see persistWorkerSoon).
+function recordInvocation(workerName, meta, req, parsedUrl, deviceInfo, status, hrStart, responseBytes, errorMessage) {
+  const totalUs = Math.max(1, Number((process.hrtime.bigint() - hrStart) / 1000n));
+  const durationMs = Number((totalUs / 1000).toFixed(2));
+  // time spent inside the runtime itself, when the branch measured it
+  const cpuUs = meta._execUs || totalUs;
+  delete meta._execUs;
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const isError = status >= 500;
+
+  meta.requests = (meta.requests || 0) + 1;
+  meta.totalBytesServed = (meta.totalBytesServed || 0) + responseBytes;
+  if (isError) meta.errors = (meta.errors || 0) + 1;
+  meta.lastRunAt = nowIso;
+  meta.lastDurationMs = durationMs;
+  meta.lastCpuUs = cpuUs;
+  meta.lastResponseBytes = responseBytes;
+
+  const bump = (bucket, key, keep) => {
+    if (!meta[bucket] || typeof meta[bucket] !== 'object') meta[bucket] = {};
+    const b = meta[bucket][key] || (meta[bucket][key] = { requests: 0, errors: 0, totalMs: 0, bytes: 0 });
+    b.requests += 1;
+    if (isError) b.errors += 1;
+    b.totalMs = Number((b.totalMs + durationMs).toFixed(2));
+    b.bytes += responseBytes;
+    const keys = Object.keys(meta[bucket]).sort();
+    for (const old of keys.slice(0, Math.max(0, keys.length - keep))) delete meta[bucket][old];
+  };
+  bump('daily', dayKey(now), 30);
+  bump('hourly', hourKey(now), 48);
+
+  if (!Array.isArray(meta.invocations)) meta.invocations = [];
+  meta.invocations.push({
+    id: crypto.randomBytes(4).toString('hex'),
+    timestamp: nowIso,
+    method: req.method || 'GET',
+    path: parsedUrl.pathname,
+    url: `${deviceInfo.protocol || 'http'}://${deviceInfo.host}${req.url || '/' + workerName}`,
+    status,
+    outcome: isError ? 'exception' : 'ok',
+    durationMs,
+    wallMs: durationMs,
+    cpuUs,
+    memoryMb: Number((process.memoryUsage().rss / (1024 * 1024)).toFixed(1)),
+    responseBytes,
+    clientIp: deviceInfo.ip,
+    os: deviceInfo.os,
+    browser: deviceInfo.browser,
+    deviceType: deviceInfo.deviceType,
+    versionId: meta.deployId || '00000000'
+  });
+  if (meta.invocations.length > 200) meta.invocations = meta.invocations.slice(-200);
+
+  if (isError && meta.issueDetectionEnabled !== false) {
+    if (!Array.isArray(meta.issues)) meta.issues = [];
+    const issueMsg = errorMessage || `HTTP ${status} from ${meta.filename}`;
+    const existingIssue = meta.issues.find((iss) => iss.message === issueMsg && iss.status === 'active');
+    if (existingIssue) {
+      existingIssue.occurrences = (existingIssue.occurrences || 1) + 1;
+      existingIssue.lastSeen = nowIso;
+    } else {
+      meta.issues.unshift({
+        id: crypto.randomBytes(4).toString('hex'),
+        title: issueMsg.split('\n')[0].slice(0, 160),
+        message: issueMsg.slice(0, 8000),
+        filename: meta.filename,
+        status: 'active',
+        occurrences: 1,
+        firstSeen: nowIso,
+        lastSeen: nowIso
+      });
+      meta.issues = meta.issues.slice(0, 100);
+    }
+  }
+  persistWorkerSoon(workerName);
+  return { durationMs, cpuUs };
+}
+
 async function executeWorkerAction(workerName, req, bodyBuffer, subPathAndQuery) {
   const hrStart = process.hrtime.bigint();
   const meta = state.workers[workerName];
@@ -2294,7 +2502,7 @@ async function executeWorkerAction(workerName, req, bodyBuffer, subPathAndQuery)
 
   if (fallbackStaticAsset && !hasExecutableJsWorker) {
     const renderedContent = /\.(html|htm|css|svg|xml|csv|md|yaml|yml|txt|json)$/i.test(fallbackStaticAsset.name)
-      ? interpolateTemplate(fallbackStaticAsset.content, workerName, req, deviceInfo, queryObj)
+      ? interpolateTemplate(fallbackStaticAsset.content, workerName, req, deviceInfo, queryObj, /\.(html?|svg|xml|xsl)$/i.test(fallbackStaticAsset.name))
       : fallbackStaticAsset.content;
     const fileCt = detectDataFormatContentType(
       renderedContent,
@@ -2303,6 +2511,8 @@ async function executeWorkerAction(workerName, req, bodyBuffer, subPathAndQuery)
       '',
       true
     );
+    const body = Buffer.from(renderedContent, 'utf8');
+    recordInvocation(workerName, meta, req, parsedUrl, deviceInfo, 200, hrStart, body.length, null);
     return {
       status: 200,
       headers: {
@@ -2311,15 +2521,13 @@ async function executeWorkerAction(workerName, req, bodyBuffer, subPathAndQuery)
         'cache-control': 'no-store',
         'access-control-allow-origin': '*'
       },
-      body: Buffer.from(renderedContent, 'utf8'),
-      durationMs: 1,
-      cpuUs: 120,
+      body,
       deviceInfo
     };
   }
 
   if (htmlEntryFile && !fallbackStaticAsset) {
-    let bundledHtml = interpolateTemplate(htmlEntryFile.content, workerName, req, deviceInfo, queryObj);
+    let bundledHtml = interpolateTemplate(htmlEntryFile.content, workerName, req, deviceInfo, queryObj, true);
     const cssBlocks = workerFiles
       .filter((f) => /\.(css|scss|less)$/i.test(f.name))
       .map((f) => `<style data-file="${f.name}">\n${f.content}\n</style>`)
@@ -2338,6 +2546,8 @@ async function executeWorkerAction(workerName, req, bodyBuffer, subPathAndQuery)
         ? bundledHtml.replace(/<\/body>/i, `${jsBlocks}\n</body>`)
         : `${bundledHtml}\n${jsBlocks}`;
     }
+    const body = Buffer.from(bundledHtml, 'utf8');
+    recordInvocation(workerName, meta, req, parsedUrl, deviceInfo, 200, hrStart, body.length, null);
     return {
       status: 200,
       headers: {
@@ -2346,23 +2556,9 @@ async function executeWorkerAction(workerName, req, bodyBuffer, subPathAndQuery)
         'cache-control': 'no-store',
         'access-control-allow-origin': '*'
       },
-      body: Buffer.from(bundledHtml, 'utf8'),
-      durationMs: 1,
-      cpuUs: 150,
+      body,
       deviceInfo
     };
-  }
-
-  if (!meta.observabilityConfig || meta.observabilityConfig.logsEnabled !== false) {
-    const filesLabel =
-      workerFiles.length > 1
-        ? workerFiles.map((f) => f.name).join(' + ')
-        : meta.filename;
-    appendWorkerLog(
-      workerName,
-      'info',
-      `${req.method || 'GET'} http://${deviceInfo.host}${req.url || '/' + workerName} · Pulled ${filesLabel} (${totalWorkerBytes} B, ${workerFiles.length} file${workerFiles.length === 1 ? '' : 's'}) · Client IP ${deviceInfo.ip} (${deviceInfo.os} / ${deviceInfo.browser})`
-    );
   }
 
   let status = 200;
@@ -2382,7 +2578,7 @@ async function executeWorkerAction(workerName, req, bodyBuffer, subPathAndQuery)
         subPathAndQuery || req.url || `/${workerName}`
       );
       const execUs = Math.max(120, Number((process.hrtime.bigint() - execHrStart) / 1000n));
-      meta.lastCpuUs = execUs;
+      meta._execUs = execUs;
       status = workerdResp.status;
       resHeaders = { ...workerdResp.headers };
 
@@ -2405,7 +2601,7 @@ async function executeWorkerAction(workerName, req, bodyBuffer, subPathAndQuery)
       // If the worker returned 404 and the request matched a static asset file in the worker folder, serve it
       if (status === 404 && fallbackStaticAsset) {
         const renderedContent = /\.(html|htm|css|svg|xml|csv|md|yaml|yml|txt|json)$/i.test(fallbackStaticAsset.name)
-          ? interpolateTemplate(fallbackStaticAsset.content, workerName, req, deviceInfo, queryObj)
+          ? interpolateTemplate(fallbackStaticAsset.content, workerName, req, deviceInfo, queryObj, /\.(html?|svg|xml|xsl)$/i.test(fallbackStaticAsset.name))
           : fallbackStaticAsset.content;
         const fileCt = detectDataFormatContentType(
           renderedContent,
@@ -2439,9 +2635,7 @@ async function executeWorkerAction(workerName, req, bodyBuffer, subPathAndQuery)
       };
 
       const cmd = langSpec.runtime === 'python3' ? 'python3' : langSpec.runtime === 'bash' ? 'bash' : 'node';
-      const extRegex = langSpec.runtime === 'python3' ? /\.py$/i : langSpec.runtime === 'bash' ? /\.(sh|bash)$/i : /\.(js|mjs|cjs)$/i;
-      const runnableScripts = workerFiles.filter((f) => f && f.name && extRegex.test(f.name) && f.path && fs.existsSync(f.path));
-      const scriptsToRun = runnableScripts.length > 0 ? runnableScripts.map((f) => f.path) : [codeFilePath];
+      const scriptsToRun = [codeFilePath];
 
       const execHrStart = process.hrtime.bigint();
       let combinedStdout = '';
@@ -2455,7 +2649,7 @@ async function executeWorkerAction(workerName, req, bodyBuffer, subPathAndQuery)
         if (r.exitCode !== 0) lastExitCode = r.exitCode;
       }
       const procResult = { stdout: combinedStdout, stderr: combinedStderr, exitCode: lastExitCode };
-      meta.lastCpuUs = Math.max(200, Number((process.hrtime.bigint() - execHrStart) / 1000n));
+      meta._execUs = Math.max(200, Number((process.hrtime.bigint() - execHrStart) / 1000n));
 
       if (procResult.stderr.trim()) {
         appendWorkerLog(workerName, procResult.exitCode === 0 ? 'warn' : 'error', procResult.stderr.trim());
@@ -2472,8 +2666,9 @@ async function executeWorkerAction(workerName, req, bodyBuffer, subPathAndQuery)
         resBodyBuffer = Buffer.from(procResult.stdout, 'utf8');
       }
     } else {
-      const rendered = interpolateTemplate(rawCode, workerName, req, deviceInfo, queryObj);
-      meta.lastCpuUs = Math.max(85, Number((process.hrtime.bigint() - hrStart) / 1000n));
+      const isMarkup = ['html', 'xml', 'svg', 'handlebars', 'razor'].includes(languageId) || /\.(html?|svg|xml|xsl)$/i.test(meta.filename || '');
+      const rendered = interpolateTemplate(rawCode, workerName, req, deviceInfo, queryObj, isMarkup);
+      meta._execUs = Math.max(85, Number((process.hrtime.bigint() - hrStart) / 1000n));
       resBodyBuffer = Buffer.from(rendered, 'utf8');
     }
   } catch (err) {
@@ -2545,73 +2740,8 @@ async function executeWorkerAction(workerName, req, bodyBuffer, subPathAndQuery)
     }
   }
 
-  const totalUs = Math.max(100, Number((process.hrtime.bigint() - hrStart) / 1000n));
-  const durationMs = Number((totalUs / 1000).toFixed(2));
-  const cpuUs = meta.lastCpuUs || Math.max(120, Math.round(totalUs * 0.65));
-  const nowIso = new Date().toISOString();
-  const sysMemMb = Number((process.memoryUsage().rss / (1024 * 1024)).toFixed(1));
   const responseBytes = resBodyBuffer ? resBodyBuffer.length : 0;
-
-  meta.requests = (meta.requests || 0) + 1;
-  meta.totalBytesServed = (meta.totalBytesServed || 0) + responseBytes;
-  if (status >= 500) {
-    meta.errors = (meta.errors || 0) + 1;
-  }
-  meta.lastRunAt = nowIso;
-  meta.lastDurationMs = durationMs;
-  meta.lastCpuUs = cpuUs;
-  meta.lastResponseBytes = responseBytes;
-
-  if (!Array.isArray(meta.invocations)) meta.invocations = [];
-  meta.invocations.push({
-    id: crypto.randomBytes(4).toString('hex'),
-    timestamp: nowIso,
-    method: req.method || 'GET',
-    path: parsedUrl.pathname,
-    url: `http://${deviceInfo.host}${req.url || '/' + workerName}`,
-    status,
-    outcome: status >= 500 ? 'exception' : 'ok',
-    durationMs,
-    wallMs: durationMs,
-    cpuUs,
-    memoryMb: sysMemMb,
-    responseBytes,
-    clientIp: deviceInfo.ip,
-    os: deviceInfo.os,
-    browser: deviceInfo.browser,
-    deviceType: deviceInfo.deviceType,
-    versionId: meta.deployId || '00000000'
-  });
-  if (meta.invocations.length > 200) {
-    meta.invocations = meta.invocations.slice(-200);
-  }
-
-  if (status >= 500 && meta.issueDetectionEnabled !== false) {
-    if (!Array.isArray(meta.issues)) meta.issues = [];
-    const issueMsg = capturedErrorMessage || `HTTP ${status} runtime exception in ${meta.filename}`;
-    const existingIssue = meta.issues.find((iss) => iss.message === issueMsg && iss.status === 'active');
-    if (existingIssue) {
-      existingIssue.occurrences = (existingIssue.occurrences || 1) + 1;
-      existingIssue.lastSeen = nowIso;
-    } else {
-      meta.issues.unshift({
-        id: crypto.randomBytes(4).toString('hex'),
-        title: issueMsg.split('\n')[0].slice(0, 120),
-        message: issueMsg,
-        filename: meta.filename,
-        status: 'active',
-        occurrences: 1,
-        firstSeen: nowIso,
-        lastSeen: nowIso
-      });
-    }
-  }
-
-  const workerDir = path.join(WORKERS_DIR, workerName);
-  if (fs.existsSync(workerDir)) {
-    fs.writeFileSync(path.join(workerDir, 'meta.json'), JSON.stringify(meta, null, 2), 'utf8');
-  }
-  saveState();
+  const { durationMs, cpuUs } = recordInvocation(workerName, meta, req, parsedUrl, deviceInfo, status, hrStart, responseBytes, capturedErrorMessage);
 
   return {
     status,
@@ -2628,39 +2758,69 @@ async function executeWorkerAction(workerName, req, bodyBuffer, subPathAndQuery)
 // ============================================================================
 let cloudflaredProc = null;
 
+let connectorInstalledCache = { at: 0, value: false };
 function isConnectorInstalled() {
+  if (Date.now() - connectorInstalledCache.at < 60000) return connectorInstalledCache.value;
+  let value = false;
   try {
     execSync('command -v cloudflared', { stdio: 'ignore' });
-    return true;
-  } catch (_) {
-    return false;
-  }
+    value = true;
+  } catch (_) {}
+  connectorInstalledCache = { at: Date.now(), value };
+  return value;
+}
+
+// Only connectors started for *this* token count. The old check was "is any
+// cloudflared running", so with any other tunnel on the box (Termix, mail…)
+// Alex-Aero's own tunnel never started.
+const OWN_TUNNEL_PATTERN = '[c]loudflared tunnel --no-autoupdate run --token';
+function ownConnectorPids(token) {
+  let out = '';
+  try {
+    out = execSync(`pgrep -af "${OWN_TUNNEL_PATTERN}" || true`, { encoding: 'utf8' });
+  } catch (_) {}
+  return out
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => ({ pid: Number(line.split(' ')[0]), token: line.split('--token ')[1] || '' }))
+    .filter((p) => p.pid && (token === undefined || p.token.trim() === token));
 }
 
 function isConnectorRunning() {
-  if (cloudflaredProc && !cloudflaredProc.killed) return true;
-  try {
-    const out = execSync('pgrep -f "[c]loudflared tunnel --no-autoupdate run --token" || true', { encoding: 'utf8' }).trim();
-    return Boolean(out);
-  } catch (_) {
-    return false;
-  }
+  const token = String(config.tunnelToken || '').trim();
+  if (!token) return false;
+  return ownConnectorPids(token).length > 0;
 }
 
+let tunnelRestartTimer = null;
 function manageTunnelConnector() {
-  if (config.tunnelToken && config.tunnelToken.trim()) {
-    if (!isConnectorRunning() && isConnectorInstalled()) {
+  const token = String(config.tunnelToken || '').trim();
+  // stop connectors still running an old/cleared token
+  for (const p of ownConnectorPids()) {
+    if (p.token.trim() !== token) {
       try {
-        cloudflaredProc = spawn(
-          'cloudflared',
-          ['tunnel', '--no-autoupdate', 'run', '--token', config.tunnelToken.trim()],
-          { stdio: 'ignore', detached: true }
-        );
-        cloudflaredProc.unref();
-      } catch (err) {
-        console.error('Failed starting cloudflared tunnel:', err.message);
-      }
+        process.kill(p.pid, 'SIGTERM');
+      } catch (_) {}
     }
+  }
+  if (!token || !isConnectorInstalled() || isConnectorRunning()) return;
+  try {
+    cloudflaredProc = spawn('cloudflared', ['tunnel', '--no-autoupdate', 'run', '--token', token], {
+      stdio: 'ignore',
+      detached: true
+    });
+    cloudflaredProc.on('error', (err) => console.error('cloudflared failed to start:', err.message));
+    cloudflaredProc.on('exit', (code) => {
+      // crashed or was killed: bring it back if it's still wanted
+      if (tunnelRestartTimer) clearTimeout(tunnelRestartTimer);
+      tunnelRestartTimer = setTimeout(manageTunnelConnector, 5000);
+      tunnelRestartTimer.unref();
+      if (code) console.error(`cloudflared exited with code ${code}; restarting in 5 s`);
+    });
+    cloudflaredProc.unref();
+  } catch (err) {
+    console.error('Failed starting cloudflared tunnel:', err.message);
   }
 }
 
@@ -2775,7 +2935,16 @@ function listLocalStorageFiles() {
 function readRequestBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data', (c) => chunks.push(c));
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(new HttpError(413, 'Request body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
@@ -2785,8 +2954,8 @@ function sendJson(res, statusCode, data) {
   const payload = JSON.stringify(data, null, 2);
   res.writeHead(statusCode, {
     'content-type': 'application/json; charset=utf-8',
-    'access-control-allow-origin': '*',
-    'cache-control': 'no-store'
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff'
   });
   res.end(payload);
 }
@@ -2805,18 +2974,40 @@ function serveStaticFile(res, filePath, contentType) {
   res.end(content);
 }
 
+let authCfgCache = { mtimeMs: -1, data: null };
+const authOkCache = new Map(); // Authorization header -> expiry
+const authFailures = new Map(); // client ip -> { count, first, lockedUntil }
+
 function loadAuthConfig() {
-  if (!fs.existsSync(AUTH_FILE)) return null;
+  let mtimeMs = 0;
   try {
-    const data = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8'));
-    if (data && data.authEnabled && data.username && data.passwordHash && data.salt) {
-      return data;
-    }
-  } catch (_) {}
-  return null;
+    mtimeMs = fs.statSync(AUTH_FILE).mtimeMs;
+  } catch (_) {
+    authCfgCache = { mtimeMs: 0, data: null };
+    authOkCache.clear();
+    return null;
+  }
+  if (mtimeMs !== authCfgCache.mtimeMs) {
+    let data = null;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8'));
+      if (parsed && parsed.authEnabled && parsed.username && parsed.passwordHash && parsed.salt) data = parsed;
+    } catch (_) {}
+    authCfgCache = { mtimeMs, data };
+    authOkCache.clear(); // a new password signs everyone out
+  }
+  return authCfgCache.data;
 }
 
-function checkBasicAuth(req) {
+function scryptAsync(pass, salt) {
+  return new Promise((resolve, reject) =>
+    crypto.scrypt(pass, salt, 64, (err, key) => (err ? reject(err) : resolve(key)))
+  );
+}
+
+// Was: a synchronous scrypt (tens of ms on a Pi) on *every* dashboard request,
+// re-reading auth.json each time, with no limit on guesses.
+async function checkBasicAuth(req, clientIp) {
   const authCfg = loadAuthConfig();
   if (!authCfg) {
     return { authenticated: true, username: config.username || 'admin', authRequired: false };
@@ -2825,59 +3016,244 @@ function checkBasicAuth(req) {
   if (!header.toLowerCase().startsWith('basic ')) {
     return { authenticated: false, authRequired: true };
   }
+  const cachedUntil = authOkCache.get(header);
+  if (cachedUntil && cachedUntil > Date.now()) {
+    return { authenticated: true, username: authCfg.username, authRequired: true };
+  }
+
+  const fail = authFailures.get(clientIp);
+  if (fail && fail.lockedUntil > Date.now()) {
+    return { authenticated: false, authRequired: true, locked: true };
+  }
+
+  let ok = false;
   try {
-    const b64 = header.slice(6).trim();
-    const decoded = Buffer.from(b64, 'base64').toString('utf8');
+    const decoded = Buffer.from(header.slice(6).trim(), 'base64').toString('utf8');
     const colonIdx = decoded.indexOf(':');
-    if (colonIdx === -1) return { authenticated: false, authRequired: true };
-    const user = decoded.slice(0, colonIdx);
-    const pass = decoded.slice(colonIdx + 1);
-    if (user !== authCfg.username) {
-      return { authenticated: false, authRequired: true };
-    }
-    const computedHash = crypto.scryptSync(pass, authCfg.salt, 64).toString('hex');
-    const a = Buffer.from(computedHash, 'hex');
-    const b = Buffer.from(authCfg.passwordHash, 'hex');
-    if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
-      return { authenticated: true, username: user, authRequired: true };
+    if (colonIdx !== -1) {
+      const user = decoded.slice(0, colonIdx);
+      const pass = decoded.slice(colonIdx + 1);
+      const a = await scryptAsync(pass, authCfg.salt);
+      const b = Buffer.from(authCfg.passwordHash, 'hex');
+      const userOk = crypto.timingSafeEqual(
+        crypto.createHash('sha256').update(user).digest(),
+        crypto.createHash('sha256').update(authCfg.username).digest()
+      );
+      ok = userOk && a.length === b.length && crypto.timingSafeEqual(a, b);
     }
   } catch (_) {}
+
+  if (ok) {
+    authFailures.delete(clientIp);
+    if (authOkCache.size > 500) authOkCache.clear();
+    authOkCache.set(header, Date.now() + 10 * 60 * 1000);
+    return { authenticated: true, username: authCfg.username, authRequired: true };
+  }
+
+  const now = Date.now();
+  const entry = fail && now - fail.first < 15 * 60 * 1000 ? fail : { count: 0, first: now, lockedUntil: 0 };
+  entry.count += 1;
+  if (entry.count >= 10) entry.lockedUntil = now + 15 * 60 * 1000;
+  authFailures.set(clientIp, entry);
+  if (authFailures.size > 5000) authFailures.clear();
+  await new Promise((r) => setTimeout(r, 400)); // slow down guessing
   return { authenticated: false, authRequired: true };
 }
 
-function sendBasicAuthChallenge(res) {
+function sendBasicAuthChallenge(res, locked = false) {
+  if (locked) {
+    res.writeHead(429, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'Retry-After': '900' });
+    res.end('Too many wrong passwords. Try again in 15 minutes.');
+    return;
+  }
   res.writeHead(401, {
-    'WWW-Authenticate': 'Basic realm="Alex-Aero (ax.) - Robo Workers", charset="UTF-8"',
+    'WWW-Authenticate': 'Basic realm="Alex-Aero", charset="UTF-8"',
     'Content-Type': 'text/plain; charset=utf-8',
     'Cache-Control': 'no-store'
   });
   res.end('Sign-in required to access Alex-Aero (ax.).');
 }
 
+const DASHBOARD_FILES = {
+  '/': ['index.html', 'text/html; charset=utf-8'],
+  '/index.html': ['index.html', 'text/html; charset=utf-8'],
+  '/editor': ['index.html', 'text/html; charset=utf-8'],
+  '/styles.css': ['styles.css', 'text/css; charset=utf-8'],
+  '/app.js': ['app.js', 'application/javascript; charset=utf-8'],
+  '/lang-icons.js': ['lang-icons.js', 'application/javascript; charset=utf-8']
+};
+
 function isProtectedManagementPath(pathname) {
-  if (
-    pathname === '/' ||
-    pathname === '/index.html' ||
-    pathname === '/editor' ||
-    pathname === '/styles.css' ||
-    pathname === '/lang-icons.js' ||
-    pathname === '/app.js'
-  ) {
-    return true;
+  // Every /api/* route except the health probe. (The old allow-list missed
+  // routes as they were added.)
+  if (DASHBOARD_FILES[pathname]) return true;
+  return pathname.startsWith('/api/') && pathname !== '/api/health';
+}
+
+// The dashboard uses HTTP Basic auth, which the browser attaches to *any*
+// request to this host, including ones a malicious page fires cross-site.
+// Without this check a random website could create a Python worker = run
+// code on the Pi. Browsers send Sec-Fetch-Site and/or Origin; curl sends neither.
+function isCrossSiteRequest(req) {
+  const site = String(req.headers['sec-fetch-site'] || '');
+  if (site && site !== 'same-origin' && site !== 'none') return true;
+  const origin = req.headers.origin;
+  if (origin && origin !== 'null') {
+    try {
+      const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+      return new URL(origin).host !== host;
+    } catch (_) {
+      return true;
+    }
   }
-  if (
-    pathname === '/api/state' ||
-    pathname === '/api/client-ip' ||
-    pathname === '/api/workers' ||
-    pathname.startsWith('/api/workers/') ||
-    pathname === '/api/active-worker' ||
-    pathname.startsWith('/api/logs/') ||
-    pathname === '/api/config' ||
-    pathname === '/api/dns/check'
-  ) {
-    return true;
+  return origin === 'null';
+}
+
+class HttpError extends Error {
+  constructor(statusCode, message) {
+    super(message);
+    this.statusCode = statusCode;
   }
-  return false;
+}
+
+const MAX_BODY_BYTES = 64 * 1024 * 1024;
+
+async function readJsonBody(req) {
+  const buf = await readRequestBody(req);
+  const text = buf.toString('utf8').trim();
+  if (!text) return {};
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === 'object') return parsed;
+  } catch (_) {}
+  throw new HttpError(400, 'Request body must be JSON');
+}
+
+function clientIpOf(req) {
+  return String(req.headers['x-real-ip'] || req.socket?.remoteAddress || '').replace(/^::ffff:/, '');
+}
+
+// What the dashboard needs about a worker, without file contents, logs or the
+// 25 code snapshots (/api/state used to ship all of that every few seconds).
+function workerSummary(w) {
+  const today = w.daily && w.daily[dayKey()];
+  const files = listWorkerFiles(w.name);
+  return {
+    name: w.name,
+    language: w.language,
+    filename: w.filename,
+    createdAt: w.createdAt,
+    updatedAt: w.updatedAt,
+    deployId: w.deployId,
+    status: w.status,
+    requests: w.requests || 0,
+    errors: w.errors || 0,
+    requestsToday: today ? today.requests : 0,
+    errorsToday: today ? today.errors : 0,
+    lastRunAt: w.lastRunAt,
+    lastDurationMs: w.lastDurationMs,
+    lastResponseBytes: w.lastResponseBytes,
+    totalBytesServed: w.totalBytesServed || 0,
+    hourly: w.hourly || {},
+    daily: w.daily || {},
+    publishingLink: w.publishingLink || `/${w.name}`,
+    publishingPath: extractPublishingPath(w.publishingLink || w.publishingPath, w.name),
+    customRoutes: w.customRoutes || [],
+    productionUrlEnabled: w.productionUrlEnabled !== false,
+    issueDetectionEnabled: w.issueDetectionEnabled !== false,
+    activeIssues: (w.issues || []).filter((i) => i.status === 'active').length,
+    fileCount: files.length,
+    sizeBytes: files.reduce((n, f) => n + (f.sizeBytes || 0), 0),
+    deploymentCount: (w.deployments || []).length
+  };
+}
+
+function workerDetail(w) {
+  return {
+    ...w,
+    files: listWorkerFiles(w.name),
+    deployments: (w.deployments || []).map(({ codeSnapshot, filesSnapshot, ...d }) => ({
+      ...d,
+      hasSnapshot: Boolean(filesSnapshot || typeof codeSnapshot === 'string'),
+      fileNames: filesSnapshot ? Object.keys(filesSnapshot) : [d.filename]
+    })),
+    summary: workerSummary(w),
+    isDefault: state.defaultWorker === w.name
+  };
+}
+
+function publicConfig() {
+  const { tunnelToken, ...rest } = config;
+  return {
+    ...rest,
+    tunnelTokenSet: Boolean(String(tunnelToken || '').trim()),
+    publicHostname: getConfiguredHostname(config),
+    connectorInstalled: isConnectorInstalled(),
+    connectorRunning: isConnectorRunning(),
+    publicPort: PUBLIC_PORT,
+    backendPort: BACKEND_PORT
+  };
+}
+
+function readCpuTempC() {
+  try {
+    const raw = fs.readFileSync('/sys/class/thermal/thermal_zone0/temp', 'utf8').trim();
+    const v = Number(raw) / 1000;
+    return Number.isFinite(v) ? Number(v.toFixed(1)) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function readDiskUsage() {
+  try {
+    const st = fs.statfsSync(STORAGE_DIR);
+    const total = st.blocks * st.bsize;
+    const free = st.bavail * st.bsize;
+    return { totalGb: Number((total / 1e9).toFixed(1)), freeGb: Number((free / 1e9).toFixed(1)) };
+  } catch (_) {
+    return null;
+  }
+}
+
+function systemSnapshot() {
+  return {
+    ...RUNTIME_VERSIONS,
+    ...getLiveSystemTelemetry(),
+    loadAvg: os.loadavg().map((n) => Number(n.toFixed(2))),
+    cpuTempC: readCpuTempC(),
+    disk: readDiskUsage(),
+    storageDir: STORAGE_DIR,
+    backendUptimeSeconds: Math.floor(process.uptime()),
+    runningWorkers: [...workerdPool.entries()].map(([name, e]) => ({
+      name,
+      port: e.port,
+      engine: e.proc ? 'workerd' : e.fallbackServer ? 'node-fallback' : 'stopped'
+    }))
+  };
+}
+
+function restoreDeployment(name, meta, dep) {
+  const dir = path.join(WORKERS_DIR, name);
+  if (dep.filesSnapshot && typeof dep.filesSnapshot === 'object') {
+    const keep = new Set();
+    for (const [fname, content] of Object.entries(dep.filesSnapshot)) {
+      const safe = sanitizeFileName(fname);
+      if (!safe) continue;
+      keep.add(safe);
+      fs.writeFileSync(path.join(dir, safe), String(content), 'utf8');
+    }
+    for (const f of listWorkerFiles(name)) {
+      if (!keep.has(f.name)) fs.rmSync(path.join(dir, f.name), { force: true });
+    }
+  } else if (typeof dep.codeSnapshot === 'string') {
+    fs.writeFileSync(path.join(dir, sanitizeFileName(dep.filename) || meta.filename || 'worker.js'), dep.codeSnapshot, 'utf8');
+  } else {
+    return false;
+  }
+  if (dep.filename && fs.existsSync(path.join(dir, dep.filename))) meta.filename = dep.filename;
+  invalidateWorkerRuntime(name);
+  return true;
 }
 
 discoverWorkersOnDisk();
@@ -2885,8 +3261,13 @@ syncCloudflareRecordsFile(config);
 
 const server = http.createServer(async (req, res) => {
   try {
+    const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    const pathname = parsedUrl.pathname;
+    const isManagement = isProtectedManagementPath(pathname);
+
     if (req.method === 'OPTIONS') {
-      res.writeHead(204, {
+      // CORS preflight only for workers; the management API stays same-origin.
+      res.writeHead(204, isManagement ? {} : {
         'access-control-allow-origin': '*',
         'access-control-allow-methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD',
         'access-control-allow-headers': '*',
@@ -2896,91 +3277,161 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-    const pathname = parsedUrl.pathname;
-
     if (pathname === '/api/health' && req.method === 'GET') {
       sendJson(res, 200, { ok: true });
       return;
     }
 
-    // Require native browser Basic Auth sign-in on homepage, editor, and dashboard API routes,
-    // while keeping all worker viewer/executor routes (/example, etc.) unauthenticated.
-    if (isProtectedManagementPath(pathname)) {
-      const auth = checkBasicAuth(req);
+    // Sign-in (browser Basic auth) on the dashboard and every management API
+    // route; worker routes (/example, …) stay public.
+    if (isManagement) {
+      const auth = await checkBasicAuth(req, clientIpOf(req));
       if (!auth.authenticated) {
-        sendBasicAuthChallenge(res);
+        sendBasicAuthChallenge(res, auth.locked);
         return;
       }
       if (auth.username && config.username !== auth.username) {
         config.username = auth.username;
       }
+      if (req.method !== 'GET' && req.method !== 'HEAD' && isCrossSiteRequest(req)) {
+        sendJson(res, 403, { error: 'Cross-site request blocked' });
+        return;
+      }
+    }
+
+    if (DASHBOARD_FILES[pathname] && req.method === 'GET') {
+      const [file, type] = DASHBOARD_FILES[pathname];
+      if (file === 'index.html') parseClientAndDevice(req, true);
+      serveStaticFile(res, path.join(PUBLIC_DIR, file), type);
+      return;
     }
 
     // Dashboard-only client IP endpoint: determines client IP directly from incoming HTTP request
     if (pathname === '/api/client-ip' && req.method === 'GET') {
-      await refreshPublicNetworkInfoAsync();
-      const clientDevice = parseClientAndDevice(req, true);
+      await refreshPublicNetworkInfoAsync(10 * 60 * 1000);
+      sendJson(res, 200, { ok: true, clientDevice: parseClientAndDevice(req, true) });
+      return;
+    }
+
+    // ---- lightweight dashboard endpoints
+    if (pathname === '/api/overview' && req.method === 'GET') {
+      const workers = Object.values(state.workers).map(workerSummary);
+      sendJson(res, 200, {
+        config: publicConfig(),
+        system: systemSnapshot(),
+        activeWorker: state.activeWorker,
+        defaultWorker: state.defaultWorker || '',
+        editorPreferences: state.editorPreferences,
+        workers,
+        totals: {
+          workers: workers.length,
+          requestsToday: workers.reduce((n, w) => n + w.requestsToday, 0),
+          errorsToday: workers.reduce((n, w) => n + w.errorsToday, 0),
+          requests: workers.reduce((n, w) => n + w.requests, 0)
+        },
+        languages: Object.values(LANGUAGES).map(({ id, label, badge, ext, runtime, defaultFile }) => ({
+          id, label, badge, ext, runtime, defaultFile
+        })),
+        clientDevice: parseClientAndDevice(req, true),
+        authEnabled: Boolean(loadAuthConfig())
+      });
+      return;
+    }
+
+    if (pathname === '/api/system' && req.method === 'GET') {
+      sendJson(res, 200, { system: systemSnapshot(), storageFiles: listLocalStorageFiles().filter((f) => !f.path.startsWith('storage/workers/')) });
+      return;
+    }
+
+    if (pathname === '/api/default-worker' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      const name = String(body.name || '');
+      if (name && !state.workers[name]) throw new HttpError(404, 'Worker not found');
+      state.defaultWorker = name;
+      saveState();
+      sendJson(res, 200, { ok: true, defaultWorker: state.defaultWorker });
+      return;
+    }
+
+    const detailMatch = pathname.match(/^\/api\/workers\/([^/]+)$/);
+    if (detailMatch && req.method === 'GET') {
+      const w = state.workers[decodeURIComponent(detailMatch[1])];
+      if (!w) throw new HttpError(404, 'Worker not found');
+      sendJson(res, 200, { ok: true, worker: workerDetail(w) });
+      return;
+    }
+
+    // live tail: logs + invocations newer than ?since=
+    const activityMatch = pathname.match(/^\/api\/workers\/([^/]+)\/activity$/);
+    if (activityMatch && req.method === 'GET') {
+      const w = state.workers[decodeURIComponent(activityMatch[1])];
+      if (!w) throw new HttpError(404, 'Worker not found');
+      const since = parsedUrl.searchParams.get('since') || '';
+      const newer = (list) => (Array.isArray(list) ? list.filter((x) => !since || String(x.timestamp) > since) : []);
       sendJson(res, 200, {
         ok: true,
-        clientDevice
+        logs: newer(w.logs),
+        invocations: newer(w.invocations),
+        summary: workerSummary(w),
+        issues: w.issues || [],
+        now: new Date().toISOString()
+      });
+      return;
+    }
+
+    const logsMatch = pathname.match(/^\/api\/workers\/([^/]+)\/logs$/);
+    if (logsMatch && req.method === 'DELETE') {
+      const name = decodeURIComponent(logsMatch[1]);
+      const w = state.workers[name];
+      if (!w) throw new HttpError(404, 'Worker not found');
+      w.logs = [];
+      if (parsedUrl.searchParams.get('invocations') === '1') w.invocations = [];
+      persistWorkerSoon(name);
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+
+    const snapMatch = pathname.match(/^\/api\/workers\/([^/]+)\/deployments\/([0-9a-f]+)$/);
+    if (snapMatch && req.method === 'GET') {
+      const w = state.workers[decodeURIComponent(snapMatch[1])];
+      const dep = w && (w.deployments || []).find((d) => d.id === snapMatch[2]);
+      if (!dep) throw new HttpError(404, 'Deployment not found');
+      sendJson(res, 200, {
+        ok: true,
+        id: dep.id,
+        files: dep.filesSnapshot || (typeof dep.codeSnapshot === 'string' ? { [dep.filename]: dep.codeSnapshot } : {})
       });
       return;
     }
 
     if (pathname === '/api/state' && req.method === 'GET') {
-      // Determine client IP directly from the dashboard HTTP request
+      // Kept for older dashboards / scripts.
       const clientDevice = parseClientAndDevice(req, true);
       const sysTelemetry = getLiveSystemTelemetry();
-      const todayPrefix = new Date().toISOString().slice(0, 10);
       let totalRequestsToday = 0;
       const workersList = Object.values(state.workers).map((w) => {
-        const files = listWorkerFiles(w.name);
-        const code = readWorkerCodeFromStorage(w.name) || '';
-        const totalBytes = files.reduce((acc, f) => acc + (f.sizeBytes || 0), 0) || Buffer.byteLength(code);
-        const invToday = Array.isArray(w.invocations)
-          ? w.invocations.filter((i) => String(i.timestamp || '').startsWith(todayPrefix)).length
-          : 0;
-        const requestsToday = Math.max(invToday, w.requests || 0);
-        totalRequestsToday += requestsToday;
-        const publishingLink = w.publishingLink || `/${w.name}`;
-        const publishingPath = extractPublishingPath(publishingLink, w.name);
+        const summary = workerSummary(w);
+        totalRequestsToday += summary.requestsToday;
         return {
-          ...w,
-          publishingLink,
-          publishingPath,
-          requestsToday,
-          code,
-          files,
-          sizeBytes: totalBytes
+          ...workerDetail(w),
+          code: readWorkerCodeFromStorage(w.name) || '',
+          requestsToday: summary.requestsToday,
+          sizeBytes: summary.sizeBytes
         };
       });
       sendJson(res, 200, {
-        config: {
-          ...config,
-          publicHostname: getConfiguredHostname(config),
-          connectorInstalled: isConnectorInstalled(),
-          connectorRunning: isConnectorRunning(),
-          publicPort: PUBLIC_PORT
-        },
-        runtimeInfo: {
-          ...RUNTIME_VERSIONS,
-          ...sysTelemetry
-        },
+        config: publicConfig(),
+        runtimeInfo: { ...RUNTIME_VERSIONS, ...sysTelemetry },
         systemTelemetry: sysTelemetry,
         activeWorker: state.activeWorker,
+        defaultWorker: state.defaultWorker || '',
         editorPreferences: state.editorPreferences,
         workerCount: workersList.length,
         totalRequestsToday,
         workers: workersList,
         storageFiles: listLocalStorageFiles(),
         languages: Object.values(LANGUAGES).map(({ id, label, badge, ext, runtime, defaultFile }) => ({
-          id,
-          label,
-          badge,
-          ext,
-          runtime,
-          defaultFile
+          id, label, badge, ext, runtime, defaultFile
         })),
         clientDevice
       });
@@ -3011,8 +3462,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const bodyBuf = await readRequestBody(req);
-      const body = JSON.parse(bodyBuf.toString('utf8') || '{}');
+      const body = await readJsonBody(req);
 
       if (req.method === 'POST') {
         const rawFilename = body.filename || 'new-file.js';
@@ -3067,7 +3517,7 @@ const server = http.createServer(async (req, res) => {
           meta.language = langId;
         }
         invalidateWorkerRuntime(targetName);
-        fs.writeFileSync(path.join(workerDir, 'meta.json'), JSON.stringify(meta, null, 2), 'utf8');
+        writeJsonAtomic(path.join(workerDir, 'meta.json'), meta);
         saveState();
         appendWorkerLog(targetName, 'info', `Created file "${safeName}" (${Buffer.byteLength(initialContent)} B) in ${targetName}`);
 
@@ -3133,14 +3583,16 @@ const server = http.createServer(async (req, res) => {
             filename: finalFileName,
             sizeBytes: Buffer.byteLength(currentContent),
             author: config.username || 'admin',
-            source: body.deploySource || 'Manually deployed'
+            source: body.deploySource || 'Manually deployed',
+            codeSnapshot: currentContent,
+            filesSnapshot: snapshotWorkerFiles(targetName)
           });
           meta.deployments = meta.deployments.slice(0, 25);
-          appendWorkerLog(targetName, 'info', `Deployed ${finalFileName} (rev ${newDeployId}) to Robo Workers storage.`);
+          appendWorkerLog(targetName, 'info', `Deployed ${finalFileName} (rev ${newDeployId}) to local storage.`);
         }
 
         invalidateWorkerRuntime(targetName);
-        fs.writeFileSync(path.join(workerDir, 'meta.json'), JSON.stringify(meta, null, 2), 'utf8');
+        writeJsonAtomic(path.join(workerDir, 'meta.json'), meta);
         saveState();
 
         const files = listWorkerFiles(targetName);
@@ -3180,7 +3632,7 @@ const server = http.createServer(async (req, res) => {
 
         invalidateWorkerRuntime(targetName);
         meta.updatedAt = new Date().toISOString();
-        fs.writeFileSync(path.join(workerDir, 'meta.json'), JSON.stringify(meta, null, 2), 'utf8');
+        writeJsonAtomic(path.join(workerDir, 'meta.json'), meta);
         saveState();
         appendWorkerLog(targetName, 'warn', `Deleted file "${safeName}" from ${targetName}`);
 
@@ -3204,8 +3656,7 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 404, { error: 'Worker not found' });
         return;
       }
-      const bodyBuf = await readRequestBody(req);
-      const body = JSON.parse(bodyBuf.toString('utf8') || '{}');
+      const body = await readJsonBody(req);
 
       if (actionType === 'routes') {
         if (body.productionUrlEnabled !== undefined) meta.productionUrlEnabled = Boolean(body.productionUrlEnabled);
@@ -3259,10 +3710,10 @@ const server = http.createServer(async (req, res) => {
         const workerDir = path.join(WORKERS_DIR, targetName);
         if (body.action === 'rollback' && body.versionId) {
           const targetDep = (meta.deployments || []).find((d) => d.id === body.versionId);
+          if (!targetDep) throw new HttpError(404, 'Deployment not found');
           if (targetDep) {
-            if (typeof targetDep.codeSnapshot === 'string') {
-              const entryFile = path.join(workerDir, targetDep.filename || meta.filename || 'worker.js');
-              fs.writeFileSync(entryFile, targetDep.codeSnapshot, 'utf8');
+            if (!restoreDeployment(targetName, meta, targetDep)) {
+              throw new HttpError(409, `Version ${targetDep.id} has no stored code to roll back to`);
             }
             meta.deployId = targetDep.id;
             meta.updatedAt = now;
@@ -3283,7 +3734,8 @@ const server = http.createServer(async (req, res) => {
             sizeBytes: Buffer.byteLength(currentCode),
             author: config.username || 'admin',
             source: body.source || 'Deployed from Dashboard',
-            codeSnapshot: currentCode
+            codeSnapshot: currentCode,
+            filesSnapshot: snapshotWorkerFiles(targetName)
           });
           meta.deployments = meta.deployments.slice(0, 25);
           appendWorkerLog(targetName, 'info', `Created new deployment version ${newDeployId} for ${targetName}`);
@@ -3292,7 +3744,7 @@ const server = http.createServer(async (req, res) => {
 
       const workerDir = path.join(WORKERS_DIR, targetName);
       if (fs.existsSync(workerDir)) {
-        fs.writeFileSync(path.join(workerDir, 'meta.json'), JSON.stringify(meta, null, 2), 'utf8');
+        writeJsonAtomic(path.join(workerDir, 'meta.json'), meta);
       }
       saveState();
       const files = listWorkerFiles(targetName);
@@ -3304,13 +3756,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === '/api/workers' && req.method === 'POST') {
-      const bodyBuf = await readRequestBody(req);
-      const body = JSON.parse(bodyBuf.toString('utf8') || '{}');
+      const body = await readJsonBody(req);
       const name = sanitizeWorkerName(body.name || `worker-${Object.keys(state.workers).length + 1}`);
-      if (!name) {
-        sendJson(res, 400, { error: 'Worker name is required' });
-        return;
-      }
+      const invalid = validateWorkerName(name);
+      if (invalid) throw new HttpError(400, invalid);
+      if (state.workers[name] && !body.overwrite) throw new HttpError(409, `Worker "${name}" already exists`);
       const language = body.language || state.editorPreferences.language || 'javascript';
       const langSpec = getLangSpec(language);
       const created = createOrUpdateWorker(name, {
@@ -3321,8 +3771,9 @@ const server = http.createServer(async (req, res) => {
         deploySource: 'Created Worker'
       });
       state.activeWorker = name;
+      if (!state.defaultWorker) state.defaultWorker = name;
       saveState();
-      appendWorkerLog(name, 'info', `Created worker "${name}" (${langSpec.label}) and saved to local storage.`);
+      appendWorkerLog(name, 'info', `Created worker "${name}" (${langSpec.label}).`);
       sendJson(res, 200, {
         ok: true,
         worker: { ...created.meta, code: created.code, files: created.files },
@@ -3337,16 +3788,16 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 404, { error: 'Worker not found' });
         return;
       }
-      const bodyBuf = await readRequestBody(req);
-      const body = JSON.parse(bodyBuf.toString('utf8') || '{}');
+      const body = await readJsonBody(req);
 
       let finalName = targetName;
       if (body.newName && sanitizeWorkerName(body.newName) && sanitizeWorkerName(body.newName) !== targetName) {
         const candidate = sanitizeWorkerName(body.newName);
-        if (state.workers[candidate]) {
-          sendJson(res, 400, { error: `Worker "${candidate}" already exists` });
-          return;
-        }
+        const invalid = validateWorkerName(candidate);
+        if (invalid) throw new HttpError(400, invalid);
+        if (state.workers[candidate]) throw new HttpError(409, `Worker "${candidate}" already exists`);
+        invalidateWorkerRuntime(targetName, true);
+        if (state.defaultWorker === targetName) state.defaultWorker = candidate;
         const oldDir = path.join(WORKERS_DIR, targetName);
         const newDir = path.join(WORKERS_DIR, candidate);
         if (fs.existsSync(oldDir)) {
@@ -3391,7 +3842,7 @@ const server = http.createServer(async (req, res) => {
         appendWorkerLog(
           finalName,
           'info',
-          `Deployed ${updated.meta.filename} (rev ${updated.meta.deployId}) to Robo Workers storage.`
+          `Deployed ${updated.meta.filename} (rev ${updated.meta.deployId}) to local storage.`
         );
       }
 
@@ -3408,21 +3859,17 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 404, { error: 'Worker not found' });
         return;
       }
-      const running = workerdPool.get(targetName);
-      if (running && running.proc) {
-        try {
-          running.proc.kill('SIGTERM');
-        } catch (_) {}
-        workerdPool.delete(targetName);
-      }
+      invalidateWorkerRuntime(targetName, true);
       const workerDir = path.join(WORKERS_DIR, targetName);
       if (fs.existsSync(workerDir)) {
         fs.rmSync(workerDir, { recursive: true, force: true });
       }
       delete state.workers[targetName];
+      pendingMetaWrites.delete(targetName);
       if (!state.workers[state.activeWorker]) {
         state.activeWorker = Object.keys(state.workers)[0] || '';
       }
+      if (state.defaultWorker === targetName) state.defaultWorker = '';
       saveState();
       sendJson(res, 200, {
         ok: true,
@@ -3433,8 +3880,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === '/api/active-worker' && req.method === 'POST') {
-      const bodyBuf = await readRequestBody(req);
-      const body = JSON.parse(bodyBuf.toString('utf8') || '{}');
+      const body = await readJsonBody(req);
       if (body.name && state.workers[body.name]) {
         state.activeWorker = body.name;
       }
@@ -3451,19 +3897,26 @@ const server = http.createServer(async (req, res) => {
       if (targetName === '_all') {
         for (const w of Object.values(state.workers)) {
           w.logs = [];
+          persistWorkerSoon(w.name);
         }
-        saveState();
       } else if (state.workers[targetName]) {
         state.workers[targetName].logs = [];
-        saveState();
+        persistWorkerSoon(targetName);
       }
       sendJson(res, 200, { ok: true });
       return;
     }
 
     if (pathname === '/api/config' && req.method === 'PUT') {
-      const bodyBuf = await readRequestBody(req);
-      const body = JSON.parse(bodyBuf.toString('utf8') || '{}');
+      const body = await readJsonBody(req);
+      // A blank token field means "keep the saved one"; clearing is explicit.
+      let nextToken = config.tunnelToken || '';
+      if (body.clearTunnelToken) nextToken = '';
+      else if (typeof body.tunnelToken === 'string' && body.tunnelToken.trim()) {
+        const m = body.tunnelToken.match(/[A-Za-z0-9_=-]{80,}/);
+        if (!m) throw new HttpError(400, "That doesn't look like a Cloudflare tunnel token");
+        nextToken = m[0];
+      }
       config = {
         ...config,
         subdomain: String(body.subdomain ?? config.subdomain ?? '').trim(),
@@ -3471,58 +3924,18 @@ const server = http.createServer(async (req, res) => {
         localIp: String(body.localIp ?? config.localIp ?? '').trim() || detectLocalIp(),
         networkCidrs: String(body.networkCidrs ?? config.networkCidrs ?? '').trim(),
         tunnelId: String(body.tunnelId ?? config.tunnelId ?? '').trim(),
-        tunnelToken: String(body.tunnelToken ?? config.tunnelToken ?? '').trim()
+        tunnelToken: nextToken
       };
       saveConfig(config);
       manageTunnelConnector();
       const dnsCheck = await checkCloudflareDnsRecord();
-      sendJson(res, 200, {
-        ok: true,
-        config: {
-          ...config,
-          publicHostname: getConfiguredHostname(config),
-          connectorInstalled: isConnectorInstalled(),
-          connectorRunning: isConnectorRunning()
-        },
-        dnsCheck
-      });
+      sendJson(res, 200, { ok: true, config: publicConfig(), dnsCheck });
       return;
     }
 
     if (pathname === '/api/dns/check' && req.method === 'POST') {
       const dnsCheck = await checkCloudflareDnsRecord();
-      sendJson(res, 200, {
-        ok: true,
-        dnsCheck,
-        config: {
-          ...config,
-          publicHostname: getConfiguredHostname(config),
-          connectorInstalled: isConnectorInstalled(),
-          connectorRunning: isConnectorRunning()
-        }
-      });
-      return;
-    }
-
-    if (
-      pathname === '/' ||
-      pathname === '/index.html' ||
-      pathname === '/editor'
-    ) {
-      parseClientAndDevice(req, true);
-      serveStaticFile(res, path.join(PUBLIC_DIR, 'index.html'), 'text/html; charset=utf-8');
-      return;
-    }
-    if (pathname === '/styles.css') {
-      serveStaticFile(res, path.join(PUBLIC_DIR, 'styles.css'), 'text/css; charset=utf-8');
-      return;
-    }
-    if (pathname === '/lang-icons.js') {
-      serveStaticFile(res, path.join(PUBLIC_DIR, 'lang-icons.js'), 'application/javascript; charset=utf-8');
-      return;
-    }
-    if (pathname === '/app.js') {
-      serveStaticFile(res, path.join(PUBLIC_DIR, 'app.js'), 'application/javascript; charset=utf-8');
+      sendJson(res, 200, { ok: true, dnsCheck, config: publicConfig() });
       return;
     }
 
@@ -3556,16 +3969,19 @@ const server = http.createServer(async (req, res) => {
     if (!matchedWorker) {
       const pathSegments = pathname.split('/').filter(Boolean);
       if (pathSegments.length >= 1) {
-        const candidateWorker = decodeURIComponent(pathSegments[0]);
+        let candidateWorker = pathSegments[0];
+        try {
+          candidateWorker = decodeURIComponent(candidateWorker);
+        } catch (_) {}
         if (state.workers[candidateWorker]) {
           matchedWorker = candidateWorker;
         }
       }
     }
 
-    // 3. Fallback to active worker for top-level subpaths (e.g. /ipdata, /health)
-    if (!matchedWorker && state.activeWorker && state.workers[state.activeWorker]) {
-      matchedWorker = state.activeWorker;
+    // 3. Fallback to the default worker for unclaimed paths (e.g. /ipdata, /health)
+    if (!matchedWorker && pathname !== '/favicon.ico' && state.defaultWorker && state.workers[state.defaultWorker]) {
+      matchedWorker = state.defaultWorker;
     }
 
     if (matchedWorker) {
@@ -3579,8 +3995,13 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
     res.end('Not found');
   } catch (err) {
-    console.error('Server error:', err);
-    sendJson(res, 500, { error: 'Internal server error', message: err.message });
+    const status = err.statusCode || 500;
+    if (status >= 500) console.error('Server error:', err);
+    if (res.headersSent) {
+      res.end();
+      return;
+    }
+    sendJson(res, status, { error: status >= 500 ? 'Internal server error' : err.message, message: err.message });
   }
 });
 
@@ -3598,14 +4019,15 @@ function cleanupPool() {
     }
   }
 }
-process.on('SIGINT', () => {
+function shutdown() {
+  try {
+    flushPendingWrites();
+  } catch (_) {}
   cleanupPool();
   process.exit(0);
-});
-process.on('SIGTERM', () => {
-  cleanupPool();
-  process.exit(0);
-});
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
 process.on('uncaughtException', (err) => {
   console.error('[workerd-runtime] Uncaught exception:', err);
 });
@@ -3613,6 +4035,12 @@ process.on('unhandledRejection', (err) => {
   console.error('[workerd-runtime] Unhandled rejection:', err);
 });
 
+server.on('error', (err) => {
+  console.error(`[alex-aero] cannot listen on 127.0.0.1:${BACKEND_PORT}: ${err.message}`);
+  process.exit(1);
+});
 server.listen(BACKEND_PORT, '127.0.0.1', () => {
-  console.log(`[workerd-runtime] Backend controller listening on http://127.0.0.1:${BACKEND_PORT}`);
+  console.log(`[alex-aero] backend listening on http://127.0.0.1:${BACKEND_PORT}`);
+  manageTunnelConnector(); // used to start only after saving settings, never at boot
+  setInterval(manageTunnelConnector, 60 * 1000).unref();
 });

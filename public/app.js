@@ -1,4245 +1,2119 @@
-/**
- * Alex-Aero (ax.) · Robo Workers Frontend Application
- * Typography: Helvetica Medium
- * Design: Google Material Design 3 + Rounded Black Buttons + VS Code Icons & Syntax Highlighting
- * Client IP determined from HTTP requests (Dashboard only) · Zero Horizontal Scrolling
- */
+/* Alex-Aero dashboard.
+ * Vanilla JS, no build step. Hash routes:
+ *   #/                    workers
+ *   #/w/<name>[/<tab>]    worker: overview | code | logs | deployments | settings
+ *   #/logs  #/tunnel  #/system
+ * Every number shown comes from the backend (per-hour/per-day buckets, the
+ * invocation log, live host telemetry); nothing is made up. */
+'use strict';
 
-const appState = {
-  config: {},
-  runtimeInfo: {},
-  activeWorker: '',
-  editorPreferences: {
-    spaces: 2,
-    indentUsingTabs: false,
-    encoding: 'UTF-8',
-    eol: 'LF',
-    layout: 'Layout: US',
-    language: 'javascript'
-  },
-  workers: {},
-  storageFiles: [],
-  languages: [],
-  clientDevice: {},
-  systemTelemetry: {},
-  currentView: 'applications',
-  currentDetailSubtab: 'overview',
-  activeFileByWorker: {},
-  explorerInlineMode: null,
-  bottomPanelTab: 'output',
-  lastHttpRawResponse: '',
-  lastHttpContentType: 'application/json',
-  lastHttpStatus: 200,
-  lastHttpDurationMs: 0,
-  lastHttpHeaders: {},
-  issuesFilterStatus: 'active',
-  customHeaders: [],
-  notifications: [
-    { time: new Date().toLocaleTimeString(), text: 'Robo Workers runtime initialized and synced with local storage' }
-  ],
-  diagnostics: []
-};
-
-let autoSaveTimer = null;
-let hasUnsavedEditorChanges = false;
-let workerModalMode = 'create';
-
-const el = (id) => document.getElementById(id);
-
-function addNotification(text, type = 'ok') {
-  appState.notifications.unshift({
-    time: new Date().toLocaleTimeString(),
-    text
-  });
-  if (appState.notifications.length > 30) {
-    appState.notifications.pop();
-  }
-
-  const stack = el('notifStack');
-  if (stack) {
-    const toast = document.createElement('div');
-    toast.className = 'vscode-toast';
-    const iconSvg =
-      (window.VSCODE_ICONS && (type === 'info' ? window.VSCODE_ICONS.ICON_INFO : window.VSCODE_ICONS.ICON_OK)) ||
-      '';
-    toast.innerHTML = `
-      ${iconSvg}
-      <span>${escapeHtml(text)}</span>
-      <button type="button" class="vscode-toast-close" aria-label="Dismiss">×</button>
-    `;
-    toast.querySelector('.vscode-toast-close').addEventListener('click', () => toast.remove());
-    stack.appendChild(toast);
-    setTimeout(() => {
-      if (toast.parentNode) toast.remove();
-    }, 3200);
-  }
-}
-
-function escapeHtml(str) {
-  return String(str || '')
+/* ================================================================ utilities */
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+const esc = (v) =>
+  String(v ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+const enc = encodeURIComponent;
+const nf = new Intl.NumberFormat();
+const num = (n) => nf.format(Number(n) || 0);
+const plural = (n, word) => `${num(n)} ${word}${Number(n) === 1 ? '' : 's'}`;
 
-function getLangLogoHtml(langId) {
-  if (typeof window.langIconHTML === 'function') {
-    return window.langIconHTML(langId || 'javascript');
-  }
-  return '';
+function bytes(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MB`;
+  return `${(n / 1024 ** 3).toFixed(2)} GB`;
 }
-
-function getLangDisplayName(langId) {
-  if (typeof window.langLabel === 'function') {
-    return window.langLabel(langId || 'javascript');
-  }
-  const spec = appState.languages.find((l) => l.id === langId);
-  return spec ? spec.label : 'JavaScript';
+function ms(v) {
+  if (v === null || v === undefined || Number.isNaN(Number(v))) return '—';
+  v = Number(v);
+  if (v < 1) return `${Math.round(v * 1000)} µs`;
+  if (v < 1000) return `${v < 10 ? v.toFixed(1) : Math.round(v)} ms`;
+  return `${(v / 1000).toFixed(2)} s`;
 }
-
-function getConfiguredCustomDomain() {
-  const cfg = appState.config || {};
-  const sub = String(cfg.subdomain || '').trim();
-  const root = String(cfg.rootDomain || '').trim();
-  if (sub && root) return `${sub}.${root}`;
-  if (root) return root;
-  return '';
+function ago(iso) {
+  if (!iso) return 'never';
+  const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+  if (s < 5) return 'just now';
+  if (s < 60) return `${s}s ago`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 48) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
 }
-
-function getDisplayHost() {
-  const custom = getConfiguredCustomDomain();
-  if (custom) return custom;
-  const cfg = appState.config || {};
-  const ip = cfg.localIp || 'localhost';
-  const port = cfg.publicPort || 27715;
-  return `${ip}:${port}`;
+function clock(iso) {
+  return iso ? new Date(iso).toLocaleTimeString([], { hour12: false }) : '';
 }
-
-function getWorkerPrimaryPublishingLink(w) {
-  if (!w) return '/worker';
-  return String(w.publishingLink || `/${w.name}`).trim() || `/${w.name}`;
+function duration(sec) {
+  sec = Math.floor(Number(sec) || 0);
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (d) return `${d}d ${h}h`;
+  if (h) return `${h}h ${m}m`;
+  return `${m}m`;
 }
-
-function getWorkerPrimaryPublishingPath(w) {
-  if (!w) return '/worker';
-  if (w.publishingPath) return w.publishingPath;
-  const raw = getWorkerPrimaryPublishingLink(w);
-  if (/^https?:\/\//i.test(raw)) {
+const debounce = (fn, wait) => {
+  let t;
+  return (...a) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...a), wait);
+  };
+};
+const store = {
+  get(k, d) {
     try {
-      return new URL(raw).pathname.replace(/\*+$/, '').replace(/\/+$/, '') || '/';
+      const v = localStorage.getItem(k);
+      return v === null ? d : JSON.parse(v);
+    } catch (_) {
+      return d;
+    }
+  },
+  set(k, v) {
+    try {
+      localStorage.setItem(k, JSON.stringify(v));
     } catch (_) {}
   }
-  if (!raw.startsWith('/')) {
-    const idx = raw.indexOf('/');
-    if (idx !== -1 && (raw.slice(0, idx).includes('.') || raw.slice(0, idx).includes(':'))) {
-      return raw.slice(idx).replace(/\*+$/, '').replace(/\/+$/, '') || '/';
-    }
-    return `/${raw.replace(/^\/+/, '').replace(/\*+$/, '').replace(/\/+$/, '')}`;
-  }
-  return raw.replace(/\*+$/, '').replace(/\/+$/, '') || '/';
-}
-
-function getAllWorkerPublishingLinks(w) {
-  if (!w) return [];
-  const primary = getWorkerPrimaryPublishingLink(w);
-  const primaryPath = getWorkerPrimaryPublishingPath(w);
-  const extra = Array.isArray(w.customRoutes)
-    ? w.customRoutes.map((r) => ({
-        id: r.id,
-        label: r.pattern || r.path,
-        href: r.path || (String(r.pattern || '').startsWith('/') ? r.pattern : `/${w.name}`),
-        isPrimary: false
-      }))
-    : [];
-  return [
-    { id: 'primary', label: primary, href: primaryPath, isPrimary: true },
-    ...extra
-  ];
-}
-
-// ============================================================================
-// State Synchronization & Dashboard HTTP Request Client IP Detection
-// ============================================================================
-function formatRuntimeName(rt) {
-  if (!rt || String(rt).toLowerCase() === 'workerd') return 'Robo Workers';
-  return String(rt);
-}
-
-async function fetchAppState() {
+};
+async function copy(text) {
   try {
-    const res = await fetch('/api/state');
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    appState.config = data.config || {};
-    appState.runtimeInfo = data.runtimeInfo || {};
-    appState.systemTelemetry = data.systemTelemetry || data.runtimeInfo || {};
-    appState.languages = data.languages || [];
-    appState.clientDevice = data.clientDevice || {};
-    appState.storageFiles = data.storageFiles || [];
-    appState.editorPreferences = data.editorPreferences || appState.editorPreferences;
-
-    appState.workers = {};
-    for (const w of data.workers || []) {
-      appState.workers[w.name] = w;
-      if (!appState.activeFileByWorker[w.name]) {
-        appState.activeFileByWorker[w.name] = w.filename || (w.files && w.files[0]?.name) || 'worker.js';
-      } else if (Array.isArray(w.files) && w.files.length > 0) {
-        const exists = w.files.some((f) => f.name === appState.activeFileByWorker[w.name]);
-        if (!exists) {
-          appState.activeFileByWorker[w.name] = w.filename || w.files[0].name;
-        }
-      }
-    }
-
-    if (data.activeWorker && appState.workers[data.activeWorker]) {
-      appState.activeWorker = data.activeWorker;
-    } else {
-      appState.activeWorker = Object.keys(appState.workers)[0] || '';
-    }
-
-    // Preserve any live unsaved buffer in #codeEditor so a background state poll never clobbers edits
-    if (hasUnsavedEditorChanges || autoSaveTimer) {
-      syncEditorBufferToMemory();
-    }
-  } catch (err) {
-    console.warn('State sync warning:', err);
+    await navigator.clipboard.writeText(text);
+    toast('Copied to clipboard');
+  } catch (_) {
+    toast('Copy failed (needs HTTPS or localhost)', 'err');
   }
-
-  renderAll();
 }
 
-async function refreshDashboardClientIpFromHttp() {
+/* ==================================================================== icons */
+const P = {
+  grid: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
+  logs: '<path d="M4 6h16M4 12h16M4 18h10"/>',
+  globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
+  cpu: '<rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
+  code: '<path d="m16 18 6-6-6-6M8 6l-6 6 6 6"/>',
+  external: '<path d="M14 4h6v6M20 4 10 14M19 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5"/>',
+  copy: '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/>',
+  trash: '<path d="M4 7h16M10 11v6M14 11v6M5 7l1 13h12l1-13M9 7V4h6v3"/>',
+  edit: '<path d="M4 20h4L19 9l-4-4L4 16z"/>',
+  x: '<path d="M18 6 6 18M6 6l12 12"/>',
+  check: '<path d="m5 12 5 5L20 7"/>',
+  alert: '<path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>',
+  bolt: '<path d="M13 2 4 14h7l-1 8 9-12h-7z"/>',
+  activity: '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  thermo: '<path d="M14 14.8V4a2 2 0 0 0-4 0v10.8a4 4 0 1 0 4 0z"/>',
+  save: '<path d="M5 3h11l5 5v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M7 3v6h8M7 21v-7h10v7"/>',
+  tag: '<path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8z"/><circle cx="7.5" cy="7.5" r="1.5"/>',
+  undo: '<path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-15-6.7L3 13"/>',
+  eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+  send: '<path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/>',
+  refresh: '<path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/>',
+  pause: '<rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/>',
+  play: '<path d="m7 4 13 8-13 8z"/>',
+  file: '<path d="M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8z"/><path d="M14 3v5h5"/>',
+  star: '<path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1 6.2L12 17.3 6.5 20.2l1-6.2L3 9.6l6.2-.9z"/>',
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+  moon: '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>',
+  menu: '<path d="M4 6h16M4 12h16M4 18h16"/>',
+  chevDown: '<path d="m6 9 6 6 6-6"/>',
+  chevUp: '<path d="m18 15-6-6-6 6"/>',
+  link: '<path d="M10 14a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 10a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/>',
+  key: '<circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.7 12.3 9.3-9.3M17 6l3 3M14 9l2 2"/>',
+  layers: '<path d="m12 2 10 5-10 5L2 7z"/><path d="m2 17 10 5 10-5M2 12l10 5 10-5"/>',
+  shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
+  disk: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/>',
+  dots: '<circle cx="5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="19" cy="12" r="1.2"/>'
+};
+const icon = (name, cls = '') =>
+  `<svg class="${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name] || ''}</svg>`;
+
+/* ================================================================ languages */
+const EXT_TO_MONACO = {
+  js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'javascript',
+  ts: 'typescript', tsx: 'typescript', py: 'python', sh: 'shell', bash: 'shell',
+  json: 'json', jsonc: 'json', html: 'html', htm: 'html', css: 'css', scss: 'scss', less: 'less',
+  md: 'markdown', yaml: 'yaml', yml: 'yaml', xml: 'xml', svg: 'xml', sql: 'sql', txt: 'plaintext',
+  go: 'go', rs: 'rust', rb: 'ruby', php: 'php', lua: 'lua', c: 'c', cpp: 'cpp'
+};
+const EXT_TO_LANGID = {
+  js: 'javascript', mjs: 'javascript', jsx: 'javascriptreact', ts: 'typescript', tsx: 'typescriptreact',
+  py: 'python', sh: 'shellscript', json: 'json', html: 'html', htm: 'html', css: 'css', md: 'markdown',
+  yaml: 'yaml', yml: 'yaml', xml: 'xml', svg: 'xml', sql: 'sql', txt: 'plaintext'
+};
+const extOf = (f) => (String(f).split('.').pop() || '').toLowerCase();
+const langOfFile = (f) => EXT_TO_LANGID[extOf(f)] || 'plaintext';
+function langIcon(lang, cls = '') {
+  const inner = typeof window.langIconHTML === 'function' ? window.langIconHTML(lang || 'javascript') : '';
+  return `<span class="lang-ico ${cls}">${inner || icon('code')}</span>`;
+}
+function langName(lang) {
+  return typeof window.langLabel === 'function' ? window.langLabel(lang) : lang;
+}
+const RUNTIME_OF = (lang) =>
+  ({ python: 'Python', shellscript: 'Shell', shell: 'Shell', html: 'Static page', json: 'Template', yaml: 'Template', markdown: 'Template', css: 'Template', plaintext: 'Template' }[lang] ||
+  'workerd');
+
+const TEMPLATES = [
+  { id: 'javascript', name: 'JavaScript', desc: 'A Workers-style fetch() handler on workerd' },
+  { id: 'typescript', name: 'TypeScript', desc: 'Same, typed — types are stripped on run' },
+  { id: 'python', name: 'Python', desc: 'A script; whatever it prints is the response' },
+  { id: 'shellscript', name: 'Shell', desc: 'A bash script; stdout is the response' },
+  { id: 'html', name: 'HTML page', desc: 'Static page with {{ip}}, {{url}} placeholders' },
+  { id: 'json', name: 'JSON', desc: 'A static JSON document' }
+];
+
+/* ====================================================================== api */
+class ApiError extends Error {}
+async function api(method, url, body) {
+  const opts = { method, headers: {} };
+  if (body !== undefined) {
+    opts.headers['content-type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  let res;
   try {
-    const res = await fetch('/api/client-ip');
-    const data = await res.json();
-    if (data.ok && data.clientDevice) {
-      appState.clientDevice = data.clientDevice;
-      addNotification(`Determined client IP from HTTP request: ${data.clientDevice.ip}`);
-      renderAll();
-    }
+    res = await fetch(url, opts);
+  } catch (_) {
+    throw new ApiError("Can't reach the Pi. Is Alex-Aero running?");
+  }
+  let data = null;
+  try {
+    data = await res.json();
   } catch (_) {}
+  if (!res.ok) throw new ApiError((data && (data.message || data.error)) || `HTTP ${res.status}`);
+  return data || {};
 }
 
-function getActiveWorkerObj() {
-  return appState.workers[appState.activeWorker] || Object.values(appState.workers)[0];
+/* =================================================================== toasts */
+function toast(text, kind = 'ok') {
+  const t = document.createElement('div');
+  t.className = `toast ${kind}`;
+  t.innerHTML = `${icon(kind === 'err' ? 'alert' : 'check')}<div>${esc(text)}</div>`;
+  $('#toasts').appendChild(t);
+  setTimeout(() => {
+    t.classList.add('out');
+    setTimeout(() => t.remove(), 320);
+  }, kind === 'err' ? 6000 : 3000);
 }
-
-function getLanguageSpec(langId) {
-  const normalized = window.normalizeLangId ? window.normalizeLangId(langId) : (langId || 'javascript');
-  const found = appState.languages.find((l) => l.id === normalized || l.id === langId);
-  if (found) {
-    return {
-      ...found,
-      displayRuntime: formatRuntimeName(found.runtime)
-    };
+async function attempt(fn, okMsg) {
+  try {
+    const r = await fn();
+    if (okMsg) toast(okMsg);
+    return r;
+  } catch (err) {
+    toast(err.message || String(err), 'err');
+    return undefined;
   }
-  const label = getLangDisplayName(normalized);
-  const ext = (window.VSCODE_EXT_MAP && Object.keys(window.VSCODE_EXT_MAP).find((k) => window.VSCODE_EXT_MAP[k] === normalized)) || 'js';
-  return {
-    id: normalized,
-    label,
-    badge: ext.toUpperCase().slice(0, 4),
-    ext,
-    runtime: 'workerd',
-    displayRuntime: 'Robo Workers',
-    defaultFile: `worker.${ext}`
+}
+
+/* =================================================================== modals */
+function modal({ title, body, foot = '', wide = false, onMount }) {
+  const ov = document.createElement('div');
+  ov.className = 'overlay';
+  ov.innerHTML = `<div class="modal ${wide ? 'wide' : ''}" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+    <div class="modal-head"><h3>${esc(title)}</h3><button class="icon-btn" data-close aria-label="Close">${icon('x')}</button></div>
+    <div class="modal-body">${body}</div>
+    ${foot ? `<div class="modal-foot">${foot}</div>` : ''}
+  </div>`;
+  const prevFocus = document.activeElement;
+  const close = () => {
+    ov.remove();
+    document.removeEventListener('keydown', onKey, true);
+    if (prevFocus && prevFocus.focus) prevFocus.focus();
   };
-}
-
-// ============================================================================
-// View & Sub-Tab Navigation
-// ============================================================================
-function switchView(viewName) {
-  if (appState.currentView === 'editor' && viewName !== 'editor') {
-    syncEditorBufferToMemory();
-    if (autoSaveTimer) {
-      clearTimeout(autoSaveTimer);
-      autoSaveTimer = null;
+  const onKey = (e) => {
+    if (e.key === 'Escape') {
+      e.stopPropagation();
+      close();
     }
-    saveActiveWorkerToStorage({ deploy: false });
-  }
-  appState.currentView = viewName;
-
-  const isEditor = viewName === 'editor';
-  // Hide top global header (including HTTP Client IP badge) when in Editor so Client IP is Dashboard-only
-  // and Quick Edit has a single clean topbar without stacked duplicate headers.
-  const globalHeader = el('cfGlobalHeader');
-  if (globalHeader) {
-    globalHeader.classList.toggle('hidden', isEditor);
-  }
-
-  el('dashboardShell').classList.toggle('hidden', isEditor);
-  el('viewEditor').classList.toggle('hidden', !isEditor);
-
-  const viewsMap = {
-    applications: 'viewApplications',
-    detail: 'viewDetail',
-    records: 'viewRecords',
-    websites: 'viewWebsites',
-    analytics: 'viewAnalytics',
-    storage: 'viewStorage',
-    plans: 'viewPlans'
   };
-
-  if (!isEditor) {
-    for (const [k, domId] of Object.entries(viewsMap)) {
-      const node = el(domId);
-      if (node) node.classList.toggle('hidden', k !== viewName);
-    }
-  }
-
-  document.querySelectorAll('.cf-side-item').forEach((btn) => {
-    const isWorkersSection = ['applications', 'detail', 'storage', 'plans'].includes(viewName);
-    if (btn.id === 'sideWorkersPagesBtn') {
-      btn.classList.toggle('active', isWorkersSection);
-    } else {
-      btn.classList.toggle('active', btn.dataset.view === viewName);
-    }
+  ov.addEventListener('mousedown', (e) => {
+    if (e.target === ov) close();
   });
-
-  document.querySelectorAll('.cf-side-subitem').forEach((btn) => {
-    btn.classList.toggle('active', btn.dataset.view === viewName);
+  ov.addEventListener('click', (e) => {
+    if (e.target.closest('[data-close]')) close();
   });
-
-  const w = getActiveWorkerObj();
-  if (viewName === 'applications') {
-    document.title = 'Workers & Pages · Overview';
-    renderApplicationsView();
-  } else if (viewName === 'detail') {
-    document.title = `${w ? w.name : 'Worker'} · Details`;
-    renderDetailView();
-  } else if (viewName === 'records') {
-    document.title = 'Public links · Tunnel & DNS';
-    renderRecordsView();
-  } else if (viewName === 'websites') {
-    document.title = 'Websites & Proxy';
-    renderWebsitesView();
-  } else if (viewName === 'analytics') {
-    document.title = 'Analytics & Logs';
-    renderAnalyticsView();
-  } else if (viewName === 'storage') {
-    document.title = 'Local Storage & KV';
-    renderStorageView();
-  } else if (viewName === 'plans') {
-    document.title = 'Plans & Runtimes';
-    renderPlansView();
-  } else if (viewName === 'editor') {
-    document.title = `${w ? w.name : 'worker'} · Quick Edit`;
-    renderEditorView();
-  }
+  document.addEventListener('keydown', onKey, true);
+  document.body.appendChild(ov);
+  const first = ov.querySelector('[autofocus]') || ov.querySelector('input, select, textarea, button.primary');
+  if (first) setTimeout(() => first.focus(), 30);
+  if (onMount) onMount(ov, close);
+  return { el: ov, close };
 }
-
-function switchDetailSubtab(subtabName) {
-  appState.currentDetailSubtab = subtabName;
-  const subtabMap = {
-    overview: 'subpaneOverview',
-    metrics: 'subpaneMetrics',
-    deployments: 'subpaneDeployments',
-    observability: 'subpaneObservability',
-    issues: 'subpaneIssues',
-    domains: 'subpaneDomains',
-    access: 'subpaneAccess',
-    bindings: 'subpaneBindings',
-    settings: 'subpaneSettings'
-  };
-
-  for (const [k, domId] of Object.entries(subtabMap)) {
-    const pane = el(domId);
-    if (pane) pane.classList.toggle('hidden', k !== subtabName);
-  }
-
-  document.querySelectorAll('#detailSubtabsBar .cf-subtab').forEach((btn) => {
-    btn.classList.toggle('active', btn.dataset.subtab === subtabName);
-  });
-
-  renderDetailView();
-}
-
-function formatRelativeTime(isoStr) {
-  if (!isoStr) return 'just now';
-  const diffSec = Math.max(0, Math.floor((Date.now() - new Date(isoStr).getTime()) / 1000));
-  if (diffSec < 10) return 'just now';
-  if (diffSec < 60) return `${diffSec}s ago`;
-  const mins = Math.floor(diffSec / 60);
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  const days = Math.floor(hrs / 24);
-  return `${days}d ago`;
-}
-
-function computePercentile(values, p) {
-  if (!values || values.length === 0) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor((p / 100) * sorted.length)));
-  return sorted[idx];
-}
-
-function buildMiniSparklineSvg(points, color = '#111111') {
-  const nums = Array.isArray(points) && points.length > 0 ? points : [0];
-  if (nums.every((v) => v === 0)) {
-    return `<svg class="cf-sparkline" viewBox="0 0 120 34" preserveAspectRatio="none">
-      <line x1="0" y1="30" x2="120" y2="30" stroke="#cbd5e1" stroke-width="2"></line>
-    </svg>`;
-  }
-  const vals = nums.length === 1 ? [nums[0] * 0.7, nums[0], nums[0] * 0.9, nums[0]] : nums.slice(-12);
-  const maxVal = Math.max(...vals, 1);
-  const minVal = Math.min(...vals, 0);
-  const span = Math.max(1, maxVal - minVal);
-  const coords = vals.map((v, i) => {
-    const x = Math.round((i / Math.max(1, vals.length - 1)) * 120);
-    const y = Math.round(28 - ((v - minVal) / span) * 22);
-    return `${x},${y}`;
-  });
-  const polyPoints = coords.join(' ');
-  const areaPath = `M0,32 L${coords.join(' L')} L120,32 Z`;
-  return `<svg class="cf-sparkline" viewBox="0 0 120 34" preserveAspectRatio="none">
-    <path d="${areaPath}" fill="rgba(17,17,17,0.08)"></path>
-    <polyline fill="none" stroke="${color}" stroke-width="2" points="${polyPoints}"></polyline>
-  </svg>`;
-}
-
-// ============================================================================
-// Render Functions for All 8 Pages
-// ============================================================================
-function renderAll() {
-  const displayHost = getDisplayHost();
-  if (el('detectedIpText')) {
-    el('detectedIpText').textContent = appState.clientDevice.ip || '127.0.0.1';
-  }
-  if (el('sidebarDomainLabel')) {
-    el('sidebarDomainLabel').textContent = displayHost;
-  }
-
-  const dnsDot = el('navDnsDot');
-  if (dnsDot) {
-    dnsDot.className = 'nav-status-dot';
-    if (appState.config.dnsRecordStatus === 'verified') dnsDot.classList.add('verified');
-    else if (appState.config.dnsRecordStatus === 'pending') dnsDot.classList.add('pending');
-  }
-
-  const steps = [
-    renderWorkerDropdown,
-    renderApplicationsView,
-    renderDetailView,
-    renderEditorView,
-    renderRecordsView,
-    renderWebsitesView,
-    renderAnalyticsView,
-    renderStorageView,
-    renderPlansView
-  ];
-  for (const step of steps) {
-    try {
-      step();
-    } catch (err) {
-      console.error(`Error in ${step.name}:`, err);
-    }
-  }
-}
-
-function renderWorkerDropdown() {
-  const select = el('workerSelect');
-  if (!select) return;
-  select.innerHTML = '';
-  const names = Object.keys(appState.workers).sort();
-  for (const name of names) {
-    const opt = document.createElement('option');
-    opt.value = name;
-    opt.textContent = `${name} (/${name})`;
-    if (name === appState.activeWorker) opt.selected = true;
-    select.appendChild(opt);
-  }
-}
-
-// 1. Workers & Pages -> Overview (Dashboard with HTTP Request Client IP)
-function renderApplicationsView() {
-  const allWorkers = Object.values(appState.workers);
-  const customDomain = getConfiguredCustomDomain();
-  const displayHost = getDisplayHost();
-  const totalReqs = allWorkers.reduce((sum, w) => sum + (w.requestsToday ?? w.requests ?? 0), 0);
-  const reqsTodayLabel = `${totalReqs} Request${totalReqs === 1 ? '' : 's'} made today`;
-
-  el('statWorkerCount').textContent = String(allWorkers.length);
-  el('statTotalRequests').textContent = String(totalReqs);
-  if (el('statRequestsTodayFoot')) {
-    el('statRequestsTodayFoot').textContent = reqsTodayLabel;
-  }
-  el('statClientIp').textContent = appState.clientDevice.ip || '127.0.0.1';
-  el('statClientDevice').textContent = `HTTP Request · ${appState.clientDevice.os || 'Linux'} · ${appState.clientDevice.browser || 'Browser'}`;
-
-  el('asideRequestsToday').textContent = reqsTodayLabel;
-  el('asideWorkerTotal').textContent = `${allWorkers.length} worker${allWorkers.length === 1 ? '' : 's'}`;
-  el('statPublicHostname').textContent = customDomain || displayHost;
-  el('asideClientIpCode').textContent = appState.clientDevice.ip || '127.0.0.1';
-  const hintEl = el('asideClientIpHint');
-  if (hintEl) {
-    hintEl.textContent = `Determined from HTTP request (${appState.clientDevice.os || 'Linux'} / ${appState.clientDevice.browser || 'Browser'})`;
-  }
-
-  const searchQuery = (el('workerSearchInput')?.value || '').trim().toLowerCase();
-  const filterBy = el('workerFilterSelect')?.value || 'all';
-  const sortBy = el('workerSortSelect')?.value || 'updated';
-
-  const filtered = allWorkers.filter((w) => {
-    const langSpec = getLanguageSpec(w.language);
-    if (searchQuery) {
-      const hay = `${w.name} ${langSpec.label} ${langSpec.runtime} ${w.filename} ${w.publishingLink || ''}`.toLowerCase();
-      if (!hay.includes(searchQuery)) return false;
-    }
-    if (filterBy === 'workerd' && langSpec.runtime !== 'workerd') return false;
-    if (filterBy === 'python' && w.language !== 'python') return false;
-    if (filterBy === 'shell' && w.language !== 'shellscript' && w.language !== 'shell') return false;
-    return true;
-  });
-
-  filtered.sort((a, b) => {
-    if (sortBy === 'name') return a.name.localeCompare(b.name);
-    if (sortBy === 'requests') return (b.requests || 0) - (a.requests || 0);
-    return new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0);
-  });
-
-  el('appsListCountBadge').textContent = `Showing ${filtered.length} of ${allWorkers.length} application${allWorkers.length === 1 ? '' : 's'}`;
-
-  const container = el('workersListContainer');
-  if (filtered.length === 0) {
-    container.innerHTML = `<div class="card"><p class="card-desc">No matching workers found. Click "Create application" to create a new worker action.</p></div>`;
-    return;
-  }
-
-  container.innerHTML = filtered
-    .map((w) => {
-      const langSpec = getLanguageSpec(w.language);
-      const langLogo = getLangLogoHtml(w.language);
-      const pubLink = getWorkerPrimaryPublishingLink(w);
-      const pubPath = getWorkerPrimaryPublishingPath(w);
-      const allLinks = getAllWorkerPublishingLinks(w);
-      const wReqsToday = w.requestsToday ?? w.requests ?? 0;
-      const lastDeployed = w.updatedAt ? new Date(w.updatedAt).toLocaleTimeString() : 'just now';
-      const dur = w.lastDurationMs ? `${w.lastDurationMs} ms` : '1.8 ms';
-      return `
-      <div class="cf-worker-card">
-        <div class="cf-worker-card-body">
-          <div class="cf-worker-card-left">
-            <div class="cf-worker-title-line">
-              ${langLogo}
-              <button type="button" class="cf-worker-name-btn" onclick="openWorkerDetail('${w.name}')">
-                ${escapeHtml(w.name)}
-              </button>
-              <span class="cf-plan-pill">${escapeHtml(langSpec.label)}</span>
-              <span style="font-size:12px;color:var(--text-secondary);">${wReqsToday} Request${wReqsToday === 1 ? '' : 's'} made today</span>
-            </div>
-            <div class="cf-worker-submeta">
-              <span><i class="fa-solid fa-circle-check" style="color:#15803d;"></i> production</span>
-              <span>·</span>
-              <span>${escapeHtml(formatRuntimeName(langSpec.runtime))}</span>
-              <span>·</span>
-              <code>storage/workers/${escapeHtml(w.name)}/${escapeHtml(w.filename)}</code>
-            </div>
-            <div class="cf-worker-route-url">
-              Publishing Link${allLinks.length > 1 ? 's' : ''}:
-              ${allLinks
-                .map(
-                  (lnk) =>
-                    `<a href="${escapeHtml(lnk.href)}" target="_blank" rel="noopener" style="color:#111111;font-weight:600;margin-right:8px;">${escapeHtml(lnk.label)}</a>`
-                )
-                .join('')}
-              <button type="button" class="btn-outline btn-xs" style="height:22px;padding:0 8px;font-size:11px;" onclick="openWorkerPublishLinksEditor('${escapeHtml(w.name)}')">
-                <i class="fa-solid fa-link"></i> Choose link
-              </button>
-            </div>
-          </div>
-
-          <div class="cf-worker-card-right">
-            <a href="${escapeHtml(pubPath)}" target="_blank" rel="noopener" class="btn-outline btn-xs">
-              <span>Visit Link</span>
-              <i class="fa-solid fa-arrow-up-right-from-square"></i>
-            </a>
-            <div class="cf-card-stats-cluster">
-              <div class="cf-stat-col">
-                <span class="cf-stat-col-head">Requests today</span>
-                <span class="cf-stat-col-val">${wReqsToday}</span>
-              </div>
-              <div class="cf-stat-col">
-                <span class="cf-stat-col-head">Errors</span>
-                <span class="cf-stat-col-val">${w.errors || 0}</span>
-              </div>
-              <div class="cf-stat-col">
-                <span class="cf-stat-col-head">Execution</span>
-                <span class="cf-stat-col-val">${dur}</span>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div class="cf-worker-card-footer">
-          <div class="cf-footer-left">
-            <span class="cf-prod-badge">Production</span>
-            <span class="cf-rev-code"><i class="fa-solid fa-code-branch"></i> rev ${escapeHtml(w.deployId || '00000000')}</span>
-            <span style="color:#15803d;"><i class="fa-solid fa-floppy-disk"></i> Auto-saved ${lastDeployed}</span>
-          </div>
-          <div class="cf-footer-right">
-            <button type="button" class="btn-black btn-xs" onclick="openWorkerInEditor('${w.name}')">
-              <i class="fa-solid fa-code"></i> Edit code
-            </button>
-            <button type="button" class="btn-outline btn-xs" onclick="openWorkerDetail('${w.name}')">
-              <i class="fa-solid fa-sliders"></i> Details
-            </button>
-            <button type="button" class="btn-outline btn-xs" onclick="promptRenameWorker('${w.name}')">
-              <i class="fa-solid fa-pen"></i> Edit / Link
-            </button>
-            <button type="button" class="btn-outline btn-xs" style="color:#b91c1c;" onclick="deleteWorkerByName('${w.name}')">
-              <i class="fa-solid fa-trash"></i> Delete
-            </button>
-          </div>
-        </div>
-      </div>
-    `;
-    })
-    .join('');
-}
-
-// 2. Worker Detail View (Real Telemetry & Chosen Publishing Links)
-function renderDetailView() {
-  const w = getActiveWorkerObj();
-  if (!w) return;
-  const langSpec = getLanguageSpec(w.language);
-  const customDomain = getConfiguredCustomDomain();
-  const displayHost = getDisplayHost();
-  const primaryLink = getWorkerPrimaryPublishingLink(w);
-  const primaryPath = getWorkerPrimaryPublishingPath(w);
-  const allLinks = getAllWorkerPublishingLinks(w);
-  const wReqsToday = w.requestsToday ?? w.requests ?? 0;
-  const reqsTodayLabel = `${wReqsToday} Request${wReqsToday === 1 ? '' : 's'} made today`;
-  const invocations = Array.isArray(w.invocations) ? w.invocations : [];
-  const files = Array.isArray(w.files) && w.files.length > 0 ? w.files : [{ name: w.filename || 'worker.js', sizeBytes: w.sizeBytes || 0, language: w.language }];
-  const deployments = Array.isArray(w.deployments) ? w.deployments : [];
-  const latestDeploy = deployments[0] || { id: w.deployId || '00000000', timestamp: w.updatedAt, author: appState.config.username || 'admin', source: 'Manually deployed' };
-  const bindingEntries = Object.entries(w.bindings || {});
-
-  const cpuUsList = invocations.map((i) => i.cpuUs || 900);
-  const wallMsList = invocations.map((i) => i.wallMs || i.durationMs || 1.4);
-  const lastCpuUs = w.lastCpuUs || (cpuUsList.length ? cpuUsList[cpuUsList.length - 1] : 967);
-  const cpuDisplay = lastCpuUs < 1000 ? `${lastCpuUs} µs` : `${(lastCpuUs / 1000).toFixed(2)} ms`;
-  const durDisplay = w.lastDurationMs ? `${w.lastDurationMs} ms` : '1.4 ms';
-
-  el('detailWorkerNameTitle').textContent = w.name;
-  el('detailVisitBtn').href = primaryPath;
-  el('bindingNodeWorkerName').textContent = w.name;
-  el('bindingRuntimeText').textContent = `${langSpec.label} (${formatRuntimeName(langSpec.runtime)})`;
-  if (el('archRequestsTodayText')) {
-    el('archRequestsTodayText').textContent = reqsTodayLabel;
-  }
-
-  // Overview Subtab
-  const liveLink = el('overviewLiveUrlLink');
-  if (liveLink) {
-    liveLink.href = primaryPath;
-    liveLink.textContent = primaryLink;
-  }
-  if (el('overviewRequestsTodayBadge')) {
-    el('overviewRequestsTodayBadge').textContent = reqsTodayLabel;
-  }
-  if (el('overviewPrimaryPublishInput') && document.activeElement !== el('overviewPrimaryPublishInput')) {
-    el('overviewPrimaryPublishInput').value = primaryLink;
-  }
-  if (el('overviewPublishLinksChips')) {
-    el('overviewPublishLinksChips').innerHTML = allLinks
-      .map(
-        (lnk) => `
-        <span style="display:inline-flex;align-items:center;gap:6px;padding:4px 10px;background:var(--bg-subtle);border:1px solid var(--border-color);border-radius:999px;font-family:var(--font-mono);font-size:12px;">
-          <a href="${escapeHtml(lnk.href)}" target="_blank" rel="noopener" style="color:#111111;text-decoration:none;font-weight:600;">${escapeHtml(lnk.label)}</a>
-          ${
-            lnk.isPrimary
-              ? `<span style="font-size:10px;color:#15803d;font-family:var(--font-sans);">primary</span>`
-              : `<button type="button" class="explorer-icon-btn" style="width:18px;height:18px;" onclick="removeWorkerCustomRoute('${escapeHtml(lnk.id)}')" title="Remove link"><i class="fa-solid fa-xmark"></i></button>`
-          }
-        </span>`
-      )
-      .join('');
-  }
-
-  const authorTime = el('overviewDeployAuthorTime');
-  if (authorTime) {
-    authorTime.textContent = `by ${latestDeploy.author || 'admin'} · ${formatRelativeTime(latestDeploy.timestamp || w.updatedAt)}`;
-  }
-
-  if (el('archDomainsCount')) el('archDomainsCount').textContent = String(allLinks.length);
-  if (el('archDomainsSub')) el('archDomainsSub').textContent = allLinks.map((l) => l.label).join(', ');
-  if (el('archFilesCount')) el('archFilesCount').textContent = String(files.length);
-  if (el('archFilesSub')) el('archFilesSub').textContent = files.map((f) => f.name).join(', ');
-  if (el('archBindingsCount')) el('archBindingsCount').textContent = String(bindingEntries.length);
-  if (el('overviewStoragePathCode')) el('overviewStoragePathCode').textContent = `/home/user/storage/workers/${w.name}/`;
-  if (el('overviewCurlWorkerSlug')) el('overviewCurlWorkerSlug').textContent = primaryPath.replace(/^\/+/, '') || w.name;
-
-  const archBindingsList = el('archBindingsItemsList');
-  if (archBindingsList) {
-    if (bindingEntries.length === 0) {
-      archBindingsList.innerHTML = `<div style="color:var(--text-muted);">No bindings added</div>`;
-    } else {
-      archBindingsList.innerHTML = bindingEntries
-        .slice(0, 5)
-        .map(([k]) => `<div><i class="fa-solid fa-key"></i> env.${escapeHtml(k)}</div>`)
-        .join('');
-    }
-  }
-
-  el('detailMetricRequests').textContent = String(wReqsToday);
-  if (el('detailMetricReqTrend')) el('detailMetricReqTrend').textContent = reqsTodayLabel;
-  el('detailMetricErrors').textContent = String(w.errors || 0);
-  el('detailMetricCpu').textContent = cpuDisplay;
-  if (el('overviewSparkInvocations')) {
-    el('overviewSparkInvocations').innerHTML = buildMiniSparklineSvg(
-      invocations.length ? invocations.map((_, idx) => idx + 1) : [wReqsToday]
-    );
-  }
-  if (el('overviewSparkCpu')) {
-    el('overviewSparkCpu').innerHTML = buildMiniSparklineSvg(cpuUsList.length ? cpuUsList : [lastCpuUs]);
-  }
-  if (el('overviewSparkErrors')) {
-    el('overviewSparkErrors').innerHTML = buildMiniSparklineSvg(
-      invocations.map((i) => (i.status >= 500 ? 1 : 0)),
-      '#dc2626'
-    );
-  }
-
-  const renderDeployRowsHtml = (list) =>
-    list
-      .map((d) => {
-        const isCurrent = d.id === w.deployId;
-        return `
-      <div class="cf-deploy-item-row">
-        <div style="display:flex;align-items:center;gap:10px;min-width:0;flex-wrap:wrap;">
-          <span style="color:${isCurrent ? '#16a34a' : '#94a3b8'};font-size:11px;" title="${isCurrent ? 'Active Version' : 'Historical Version'}">
-            <i class="fa-solid ${isCurrent ? 'fa-circle-dot' : 'fa-circle'}"></i>
-          </span>
-          <code class="cf-deploy-hash-pill">${escapeHtml(d.id)}</code>
-          <button type="button" class="explorer-icon-btn" onclick="copyTextToClipboard('${escapeHtml(d.id)}')" title="Copy Version ID">
-            <i class="fa-regular fa-copy"></i>
-          </button>
-          <span>${escapeHtml(d.source || 'Manually deployed')}</span>
-          <span style="color:var(--text-muted);font-family:var(--font-mono);font-size:11.5px;">(${escapeHtml(d.filename || w.filename)} · ${d.sizeBytes || w.sizeBytes || 0} B)</span>
-        </div>
-        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-          <span class="cf-ready-dot"><i class="fa-solid fa-circle" style="font-size:7px;"></i> ${isCurrent ? 'Active (100%)' : 'Stored'}</span>
-          <span class="cf-plan-pill">Dashboard</span>
-          <span style="color:var(--text-secondary);">by ${escapeHtml(d.author || 'admin')}</span>
-          <span style="color:var(--text-muted);min-width:65px;text-align:right;">${formatRelativeTime(d.timestamp)}</span>
-          ${
-            !isCurrent
-              ? `<button type="button" class="btn-black btn-xs" onclick="rollbackWorkerVersion('${escapeHtml(d.id)}')" title="Rollback to version ${escapeHtml(d.id)}">
-                  <i class="fa-solid fa-rotate-left"></i> Rollback
-                </button>`
-              : ''
-          }
-          <button type="button" class="btn-outline btn-xs" onclick="openWorkerInEditor('${escapeHtml(w.name)}')">
-            <i class="fa-solid fa-code"></i> Edit
-          </button>
-        </div>
-      </div>
-    `;
-      })
-      .join('');
-
-  if (el('overviewDeploymentsList')) {
-    el('overviewDeploymentsList').innerHTML = renderDeployRowsHtml(deployments.slice(0, 5));
-  }
-
-  if (el('overviewDomainsSummary')) {
-    el('overviewDomainsSummary').innerHTML = `
-      <div class="cf-domains-mini-row">
-        <span style="color:var(--text-secondary);">Primary Publishing Link</span>
-        <a href="${escapeHtml(primaryPath)}" target="_blank" rel="noopener" style="font-family:var(--font-mono);font-weight:600;color:#111111;">${escapeHtml(primaryLink)}</a>
-      </div>
-      ${allLinks
-        .filter((l) => !l.isPrimary)
-        .map(
-          (l) => `
-      <div class="cf-domains-mini-row">
-        <span style="color:var(--text-secondary);">Additional Link</span>
-        <a href="${escapeHtml(l.href)}" target="_blank" rel="noopener" style="font-family:var(--font-mono);font-weight:600;color:#111111;">${escapeHtml(l.label)}</a>
-      </div>`
-        )
-        .join('')}
-      <div class="cf-domains-mini-row">
-        <span style="color:var(--text-secondary);">Local Host</span>
-        <code>http://${escapeHtml(displayHost)}${escapeHtml(primaryPath)}</code>
-      </div>
-    `;
-  }
-
-  if (el('stepPublicUrlText')) {
-    el('stepPublicUrlText').textContent = primaryLink;
-  }
-
-  // Subtab 2: Metrics (Matches Screenshot 2 with Real Hardware & Invocation Data)
-  const sixStrip = el('metricsSixSummaryStrip');
-  if (sixStrip) {
-    sixStrip.innerHTML = `
-      <div class="cf-metric-mini-card">
-        <span class="cf-metric-mini-label">Requests</span>
-        <strong class="cf-metric-mini-val">${w.requests || 0}</strong>
-        ${buildMiniSparklineSvg(invocations.map((_, i) => i + 1))}
-      </div>
-      <div class="cf-metric-mini-card">
-        <span class="cf-metric-mini-label">Subrequests</span>
-        <strong class="cf-metric-mini-val">${w.subrequests || 0}</strong>
-        ${buildMiniSparklineSvg([0])}
-      </div>
-      <div class="cf-metric-mini-card">
-        <span class="cf-metric-mini-label">Errors</span>
-        <strong class="cf-metric-mini-val">${w.errors || 0}</strong>
-        ${buildMiniSparklineSvg(invocations.map((i) => (i.status >= 500 ? 1 : 0)), '#dc2626')}
-      </div>
-      <div class="cf-metric-mini-card">
-        <span class="cf-metric-mini-label">CPU Time</span>
-        <strong class="cf-metric-mini-val">${cpuDisplay}</strong>
-        ${buildMiniSparklineSvg(cpuUsList.length ? cpuUsList : [lastCpuUs])}
-      </div>
-      <div class="cf-metric-mini-card">
-        <span class="cf-metric-mini-label">Wall Time</span>
-        <strong class="cf-metric-mini-val">${durDisplay}</strong>
-        ${buildMiniSparklineSvg(wallMsList.length ? wallMsList : [w.lastDurationMs || 1.4])}
-      </div>
-      <div class="cf-metric-mini-card">
-        <span class="cf-metric-mini-label">Request Duration</span>
-        <strong class="cf-metric-mini-val">${durDisplay}</strong>
-        ${buildMiniSparklineSvg(wallMsList.length ? wallMsList : [w.lastDurationMs || 1.4])}
-      </div>
-    `;
-  }
-
-  const activeDeployCardHtml = `
-    <div style="padding:16px 20px;">
-      <div style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:10px;">Active deployment</div>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:14px;align-items:center;">
-        <div>
-          <div style="font-size:11px;color:var(--text-muted);">Version ID</div>
-          <code class="cf-deploy-hash-pill">* ${escapeHtml(w.deployId || '00000000')}</code>
-        </div>
-        <div>
-          <div style="font-size:11px;color:var(--text-muted);">Deployed</div>
-          <strong style="font-size:13px;">${formatRelativeTime(w.updatedAt)}</strong>
-        </div>
-        <div>
-          <div style="font-size:11px;color:var(--text-muted);">Traffic %</div>
-          <div style="display:flex;align-items:center;gap:8px;">
-            <div class="cf-progress-track" style="flex:1;margin:0;"><div class="cf-progress-fill" style="width:100%;"></div></div>
-            <strong style="font-size:12.5px;">100%</strong>
-          </div>
-        </div>
-        <div>
-          <div style="font-size:11px;color:var(--text-muted);">Files in Worker</div>
-          <strong style="font-size:13px;">${files.length} (${w.sizeBytes || 0} B)</strong>
-        </div>
-        <div>
-          <div style="font-size:11px;color:var(--text-muted);">Error rate</div>
-          <strong style="font-size:13px;">${w.requests ? (((w.errors || 0) / w.requests) * 100).toFixed(1) : 0}%</strong>
-        </div>
-        <div>
-          <div style="font-size:11px;color:var(--text-muted);">Median CPU time</div>
-          <strong style="font-size:13px;">${cpuDisplay}</strong>
-        </div>
-      </div>
-    </div>
-  `;
-
-  if (el('metricsActiveDeploymentBar')) el('metricsActiveDeploymentBar').innerHTML = activeDeployCardHtml;
-  if (el('deploymentsActiveCard')) el('deploymentsActiveCard').innerHTML = activeDeployCardHtml;
-
-  const p50Cpu = computePercentile(cpuUsList.length ? cpuUsList : [lastCpuUs], 50);
-  const p75Cpu = computePercentile(cpuUsList.length ? cpuUsList : [lastCpuUs], 75);
-  const p99Cpu = computePercentile(cpuUsList.length ? cpuUsList : [lastCpuUs], 99);
-  const p50Wall = computePercentile(wallMsList.length ? wallMsList : [w.lastDurationMs || 1.4], 50);
-  const p75Wall = computePercentile(wallMsList.length ? wallMsList : [w.lastDurationMs || 1.4], 75);
-  const p99Wall = computePercentile(wallMsList.length ? wallMsList : [w.lastDurationMs || 1.4], 99);
-  const sys = appState.systemTelemetry || {};
-
-  const verFilterEl = el('metricsVersionFilterSelect');
-  if (verFilterEl) {
-    const prevVal = verFilterEl.value || 'all';
-    verFilterEl.innerHTML =
-      `<option value="all">All deployed versions (${deployments.length})</option>` +
-      deployments
-        .map(
-          (d) =>
-            `<option value="${escapeHtml(d.id)}" ${d.id === prevVal ? 'selected' : ''}>Version ${escapeHtml(d.id)}${d.id === w.deployId ? ' (Active)' : ''}</option>`
-        )
-        .join('');
-  }
-
-  const selectedVer = verFilterEl ? verFilterEl.value : 'all';
-  const filteredInvocations =
-    selectedVer && selectedVer !== 'all'
-      ? invocations.filter((inv) => inv.versionId === selectedVer)
-      : invocations;
-
-  // Build real client IP breakdown from invocations
-  const ipCounts = {};
-  for (const inv of filteredInvocations) {
-    const key = `${inv.clientIp || appState.clientDevice.ip || '127.0.0.1'} (${inv.os || 'Linux'} / ${inv.browser || 'Browser'})`;
-    ipCounts[key] = (ipCounts[key] || 0) + 1;
-  }
-  if (Object.keys(ipCounts).length === 0) {
-    const d = appState.clientDevice || {};
-    ipCounts[`${d.ip || '127.0.0.1'} (${d.os || 'Linux'} / ${d.browser || 'Browser'})`] = w.requests || 1;
-  }
-
-  const totalDiskBytes = files.reduce((sum, f) => sum + (f.sizeBytes || 0), 0);
-  const totalServedBytes =
-    w.totalBytesServed ||
-    filteredInvocations.reduce((sum, inv) => sum + (inv.responseBytes || 540), 0) ||
-    (w.requests || 1) * 540;
-
-  const metricsBoxes = el('detailMetricsBoxes');
-  if (metricsBoxes) {
-    metricsBoxes.innerHTML = `
-      <div class="cf-chart-card">
-        <div class="cf-chart-head">
-          <span>Requests</span>
-          <div class="cf-chart-legend"><span>${escapeHtml(reqsTodayLabel)}</span><span>Errors: ${w.errors || 0}</span></div>
-        </div>
-        ${buildMiniSparklineSvg(filteredInvocations.length ? filteredInvocations.map((_, i) => i + 1) : [wReqsToday || 1])}
-        <div style="font-size:12px;color:var(--text-secondary);">Last run: ${w.lastRunAt ? new Date(w.lastRunAt).toLocaleTimeString() : 'Ready'} · 100% served from local storage</div>
-      </div>
-
-      <div class="cf-chart-card">
-        <div class="cf-chart-head">
-          <span>Invocations by Outcome</span>
-          <div class="cf-chart-legend"><span>OK: ${Math.max(0, (w.requests || 0) - (w.errors || 0))}</span><span>Error: ${w.errors || 0}</span></div>
-        </div>
-        ${buildMiniSparklineSvg(filteredInvocations.length ? filteredInvocations.map((inv) => (inv.status < 500 ? 1 : 0)) : [1], '#16a34a')}
-        <div style="font-size:12px;color:var(--text-secondary);">Outcome distribution across all invocations</div>
-      </div>
-
-      <div class="cf-chart-card">
-        <div class="cf-chart-head">
-          <span>Errors by Type</span>
-          <div class="cf-chart-legend"><span>${w.errors || 0} total</span></div>
-        </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;">
-          <div style="padding:8px 10px;background:var(--bg-subtle);border-radius:8px;">Exceeded Memory: <strong>0</strong></div>
-          <div style="padding:8px 10px;background:var(--bg-subtle);border-radius:8px;">Exceeded CPU Limit: <strong>0</strong></div>
-          <div style="padding:8px 10px;background:var(--bg-subtle);border-radius:8px;">Client Disconnected: <strong>0</strong></div>
-          <div style="padding:8px 10px;background:var(--bg-subtle);border-radius:8px;">Script Exceptions: <strong>${w.errors || 0}</strong></div>
-        </div>
-      </div>
-
-      <div class="cf-chart-card">
-        <div class="cf-chart-head">
-          <span>Errors by Invocation Status</span>
-          <div class="cf-chart-legend"><span>2xx: ${filteredInvocations.filter((i) => i.status < 400).length || w.requests || 0}</span><span>5xx: ${w.errors || 0}</span></div>
-        </div>
-        ${buildMiniSparklineSvg(filteredInvocations.map((i) => (i.status >= 500 ? 1 : 0)), '#dc2626')}
-        <div style="font-size:12px;color:var(--text-secondary);">HTTP status distribution from Robo Workers</div>
-      </div>
-
-      <div class="cf-chart-card">
-        <div class="cf-chart-head">
-          <span>CPU Time per Execution</span>
-          <div class="cf-chart-legend"><span>P50: ${p50Cpu} µs</span><span>P75: ${p75Cpu} µs</span><span>P99: ${p99Cpu} µs</span></div>
-        </div>
-        ${buildMiniSparklineSvg(cpuUsList.length ? cpuUsList : [lastCpuUs])}
-        <div style="font-size:12px;color:var(--text-secondary);">Measured high-resolution execution time in <code>${escapeHtml(formatRuntimeName(langSpec.runtime))}</code></div>
-      </div>
-
-      <div class="cf-chart-card">
-        <div class="cf-chart-head">
-          <span>Wall Time per Execution</span>
-          <div class="cf-chart-legend"><span>P50: ${p50Wall} ms</span><span>P75: ${p75Wall} ms</span><span>P99: ${p99Wall} ms</span></div>
-        </div>
-        ${buildMiniSparklineSvg(wallMsList.length ? wallMsList : [w.lastDurationMs || 1.4])}
-        <div style="font-size:12px;color:var(--text-secondary);">Total wall-clock time per worker invocation</div>
-      </div>
-
-      <div class="cf-chart-card">
-        <div class="cf-chart-head">
-          <span>Request Duration</span>
-          <div class="cf-chart-legend"><span>P50: ${p50Wall} ms</span><span>P75: ${p75Wall} ms</span><span>P99: ${p99Wall} ms</span></div>
-        </div>
-        ${buildMiniSparklineSvg(wallMsList.length ? wallMsList : [w.lastDurationMs || 1.4])}
-        <div style="font-size:12px;color:var(--text-secondary);">End-to-end HTTP request duration through Nginx port ${(appState.config && appState.config.publicPort) || 27715}</div>
-      </div>
-
-      <div class="cf-chart-card">
-        <div class="cf-chart-head">
-          <span>Memory Usage &amp; Host Hardware</span>
-          <div class="cf-chart-legend"><span>Worker RSS: ${sys.workerMemoryMb || 42} MB</span></div>
-        </div>
-        ${buildMiniSparklineSvg(filteredInvocations.map((i) => i.memoryMb || sys.workerMemoryMb || 42))}
-        <div style="font-size:12px;color:var(--text-secondary);">Host RAM: ${sys.memoryUsedMb || 0} MB / ${sys.memoryTotalMb || 0} MB (${escapeHtml(sys.arch || 'linux')} · ${sys.cpus || 1} CPU cores)</div>
-      </div>
-
-      <div class="cf-chart-card">
-        <div class="cf-chart-head">
-          <span>Subrequests &amp; Storage Module Reads</span>
-          <div class="cf-chart-legend"><span>Files in env.FILES: ${files.length}</span></div>
-        </div>
-        ${buildMiniSparklineSvg(filteredInvocations.length ? filteredInvocations.map(() => files.length) : [files.length])}
-        <div style="font-size:12px;color:var(--text-secondary);">Every run pulls ${files.length} file${files.length === 1 ? '' : 's'} (${totalDiskBytes} B) fresh from <code>/home/user/storage/workers/${escapeHtml(w.name)}/</code></div>
-      </div>
-
-      <div class="cf-chart-card">
-        <div class="cf-chart-head">
-          <span>Subrequests by Storage Mode</span>
-          <div class="cf-chart-legend"><span>Fresh Disk Pull: 100%</span><span>Stale Cache: 0%</span></div>
-        </div>
-        ${buildMiniSparklineSvg([100, 100, 100, 100], '#0284c7')}
-        <div style="font-size:12px;color:var(--text-secondary);">Zero stale caching — code is read directly from local disk on every execution</div>
-      </div>
-
-      <div class="cf-chart-card">
-        <div class="cf-chart-head">
-          <span>Request Distribution (Real HTTP Client IPs)</span>
-          <span class="cf-chart-legend">Live Nginx Proxy</span>
-        </div>
-        <div style="display:flex;flex-direction:column;gap:6px;font-size:12px;">
-          ${Object.entries(ipCounts)
-            .slice(0, 4)
-            .map(
-              ([label, cnt]) =>
-                `<div style="display:flex;justify-content:space-between;padding:6px 10px;background:var(--bg-subtle);border-radius:8px;">
-                  <code>${escapeHtml(label)}</code>
-                  <strong>${cnt} req</strong>
-                </div>`
-            )
-            .join('')}
-        </div>
-      </div>
-
-      <div class="cf-chart-card">
-        <div class="cf-chart-head">
-          <span>Response Bandwidth &amp; Disk Footprint</span>
-          <div class="cf-chart-legend"><span>Served: ${(totalServedBytes / 1024).toFixed(2)} KB</span><span>Disk: ${totalDiskBytes} B</span></div>
-        </div>
-        ${buildMiniSparklineSvg(filteredInvocations.length ? filteredInvocations.map((inv) => inv.responseBytes || 540) : [totalServedBytes])}
-        <div style="font-size:12px;color:var(--text-secondary);">Last response payload: ${w.lastResponseBytes || 540} bytes · Stored files: ${files.map((f) => escapeHtml(f.name)).join(', ')}</div>
-      </div>
-    `;
-  }
-
-  // Subtab 3: Deployments (Screenshot 3)
-  const deploymentsList = el('detailDeploymentsList');
-  if (deploymentsList) {
-    deploymentsList.innerHTML = renderDeployRowsHtml(deployments);
-  }
-
-  // Subtab 4: Observability (Screenshot 4)
-  const obsType = el('obsTypeFilterSelect')?.value || 'all';
-  const obsQuery = (el('obsQuerySearchInput')?.value || '').trim().toLowerCase();
-  const obsLegend = el('obsEventsLegend');
-  if (obsLegend) {
-    obsLegend.innerHTML = `
-      <span style="color:#16a34a;font-weight:600;"><i class="fa-solid fa-circle" style="font-size:7px;"></i> ${w.requests || 0} Success</span>
-      <span style="color:#dc2626;font-weight:600;"><i class="fa-solid fa-circle" style="font-size:7px;"></i> ${w.errors || 0} Errors</span>
-    `;
-  }
-  const obsTimeline = el('obsEventsTimelineChart');
-  if (obsTimeline) {
-    obsTimeline.innerHTML = buildMiniSparklineSvg(
-      invocations.length ? invocations.map((inv) => inv.cpuUs || 500) : [w.requests || 1]
-    );
-  }
-
-  const obsContainer = el('detailObservabilityLogs');
-  if (obsContainer) {
-    let combinedEvents = [];
-    if (obsType === 'all' || obsType === 'invocations') {
-      for (const inv of invocations) {
-        combinedEvents.push({
-          timestamp: inv.timestamp,
-          level: inv.status >= 500 ? 'error' : 'info',
-          message: `[${inv.status}] ${inv.method} ${inv.path} · Client IP ${inv.clientIp} (${inv.os || 'Linux'} / ${inv.browser || 'Browser'}) · CPU ${inv.cpuUs} µs · Wall ${inv.durationMs} ms · rev ${inv.versionId}`,
-          rawJson: inv
+function confirmDialog({ title, text, ok = 'Confirm', danger = false, typeToConfirm = '' }) {
+  return new Promise((resolve) => {
+    const m = modal({
+      title,
+      body: `<p style="margin:0;color:var(--text-2)">${text}</p>${
+        typeToConfirm
+          ? `<div class="field"><label for="cfmIn">Type <b class="mono">${esc(typeToConfirm)}</b> to confirm</label><input id="cfmIn" class="input mono" autocomplete="off" autofocus></div>`
+          : ''
+      }`,
+      foot: `<button class="btn ghost" data-close>Cancel</button><button class="btn ${danger ? 'danger' : 'primary'}" id="cfmOk" ${typeToConfirm ? 'disabled' : ''}>${esc(ok)}</button>`,
+      onMount(ov, close) {
+        const okBtn = $('#cfmOk', ov);
+        const inp = $('#cfmIn', ov);
+        if (inp) inp.addEventListener('input', () => (okBtn.disabled = inp.value.trim() !== typeToConfirm));
+        okBtn.addEventListener('click', () => {
+          resolved = true;
+          close();
+          resolve(true);
         });
-      }
-    }
-    if (obsType === 'all' || obsType === 'logs') {
-      for (const l of w.logs || []) {
-        combinedEvents.push({
-          ...l,
-          rawJson: l
-        });
-      }
-    }
-    combinedEvents.sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0));
-    if (obsQuery) {
-      combinedEvents = combinedEvents.filter((ev) =>
-        `${ev.level} ${ev.message} ${JSON.stringify(ev.rawJson || {})}`.toLowerCase().includes(obsQuery)
-      );
-    }
-    obsContainer.innerHTML = combinedEvents.length
-      ? combinedEvents
-          .map((ev, i) => {
-            const time = ev.timestamp ? new Date(ev.timestamp).toLocaleTimeString() : '';
-            const lvl = (ev.level || 'info').toLowerCase();
-            const detailId = `obs-ev-detail-${i}`;
-            const jsonPretty = JSON.stringify(ev.rawJson || ev, null, 2);
-            return `<div class="obs-expandable-row" style="border-bottom:1px solid #f1f5f9;">
-              <div class="log-row" style="cursor:pointer;" onclick="const d=document.getElementById('${detailId}'); if(d) d.classList.toggle('hidden');">
-                <span class="log-time"><i class="fa-solid fa-caret-right" style="margin-right:5px;color:#64748b;"></i>${escapeHtml(time)}</span>
-                <span class="log-level ${escapeHtml(lvl)}">${escapeHtml(lvl)}</span>
-                <span>${escapeHtml(ev.message)}</span>
-              </div>
-              <pre id="${detailId}" class="hidden" style="margin:4px 0 10px 24px;padding:10px 12px;background:#f8fafc;border:1px solid var(--border-color);border-radius:8px;font-family:var(--font-mono);font-size:11.5px;white-space:pre-wrap;overflow-wrap:anywhere;">${escapeHtml(jsonPretty)}</pre>
-            </div>`;
-          })
-          .join('')
-      : buildLogsHtml([], w.name);
-  }
-
-  // Subtab 5: Issues (Screenshots 5 & 6)
-  renderDetailIssuesSubtab(w);
-
-  // Subtab 6: Domains (Screenshot 7)
-  renderDetailDomainsSubtab(w, displayHost, primaryLink);
-
-  // Subtab 7: Bindings
-  const bindingsList = el('detailBindingsList');
-  if (bindingsList) {
-    const fileItemsHtml = files
-      .map(
-        (f) => `
-      <div class="action-path-item">
-        <div class="action-path-urls">
-          <span class="action-path-slug">${getLangLogoHtml(f.language)} env.FILES["${escapeHtml(f.name)}"]</span>
-          <span class="action-path-sub">Local Storage File · ${f.sizeBytes || 0} bytes · Auto-synced into Robo Workers</span>
-        </div>
-        <button type="button" class="btn-outline btn-xs" onclick="openWorkerFileInEditor('${escapeHtml(w.name)}', '${escapeHtml(f.name)}')">
-          <i class="fa-solid fa-code"></i> Edit File
-        </button>
-      </div>
-    `
-      )
-      .join('');
-
-    const envItemsHtml = bindingEntries
-      .map(
-        ([k, v]) => `
-      <div class="action-path-item">
-        <div class="action-path-urls">
-          <span class="action-path-slug"><i class="fa-solid fa-key"></i> env.${escapeHtml(k)}</span>
-          <span class="action-path-sub">Environment Variable · Value: <code>${escapeHtml(String(v))}</code></span>
-        </div>
-        <button type="button" class="btn-outline btn-xs" onclick="removeWorkerBinding('${escapeHtml(k)}')">
-          <i class="fa-solid fa-trash"></i> Remove
-        </button>
-      </div>
-    `
-      )
-      .join('');
-
-    bindingsList.innerHTML = fileItemsHtml + envItemsHtml;
-  }
-
-  // Subtab 8: Settings (Screenshot 8)
-  const settingsVarsWrap = el('settingsVarsTableWrap');
-  if (settingsVarsWrap) {
-    if (bindingEntries.length === 0) {
-      settingsVarsWrap.innerHTML = `<p class="card-desc">No runtime variables configured.</p>`;
-    } else {
-      settingsVarsWrap.innerHTML = `<div class="action-paths-list">${bindingEntries
-        .map(
-          ([k, v]) => `
-        <div class="action-path-item">
-          <div class="action-path-urls">
-            <span class="action-path-slug"><code>${escapeHtml(k)}</code> <span class="cf-plan-pill">Plaintext</span></span>
-            <span class="action-path-sub">Value: <code>${escapeHtml(String(v))}</code></span>
-          </div>
-          <button type="button" class="btn-outline btn-xs" onclick="removeWorkerBinding('${escapeHtml(k)}')">
-            <i class="fa-solid fa-trash"></i> Delete
-          </button>
-        </div>`
-        )
-        .join('')}</div>`;
-    }
-  }
-
-  const settingsBindingsWrap = el('settingsBindingsSummaryWrap');
-  if (settingsBindingsWrap) {
-    settingsBindingsWrap.innerHTML = `
-      <div class="action-paths-list">
-        <div class="action-path-item">
-          <div class="action-path-urls">
-            <span class="action-path-slug"><i class="fa-regular fa-folder-open"></i> Local Disk Multi-File Storage (<code>env.FILES</code>)</span>
-            <span class="action-path-sub">${files.length} file${files.length === 1 ? '' : 's'} in <code>/home/user/storage/workers/${escapeHtml(w.name)}/</code> (${files.map((f) => escapeHtml(f.name)).join(', ')})</span>
-          </div>
-          <span class="cf-plan-pill">Connected</span>
-        </div>
-        <div class="action-path-item">
-          <div class="action-path-urls">
-            <span class="action-path-slug"><i class="fa-solid fa-microchip"></i> Live System Telemetry (<code>env.SYSTEM_INFO</code>)</span>
-            <span class="action-path-sub">Host: ${escapeHtml(sys.hostname || 'local')} · ${sys.cpus || 1} CPUs · ${sys.memoryTotalMb || 0} MB RAM</span>
-          </div>
-          <span class="cf-plan-pill">Connected</span>
-        </div>
-      </div>
-    `;
-  }
-
-  const logsToggle = el('settingLogsToggle');
-  if (logsToggle) logsToggle.checked = !w.observabilityConfig || w.observabilityConfig.logsEnabled !== false;
-  const issuesToggle = el('settingIssuesToggle');
-  if (issuesToggle) issuesToggle.checked = w.issueDetectionEnabled !== false;
-
-  const renameInp = el('detailSettingRenameInput');
-  if (renameInp && document.activeElement !== renameInp) {
-    renameInp.value = w.name;
-  }
-  const langSel = el('detailSettingLangSelect');
-  if (langSel) {
-    const allLangs = window.VSCODE_LANGS || appState.languages.map((l) => [l.label, l.id]);
-    langSel.innerHTML = allLangs
-      .map(
-        ([label, id]) =>
-          `<option value="${id}" ${id === w.language ? 'selected' : ''}>${escapeHtml(label)} (${escapeHtml(id)})</option>`
-      )
-      .join('');
-  }
-}
-
-function renderDetailIssuesSubtab(w) {
-  const container = el('detailIssuesContainer');
-  if (!container) return;
-
-  if (w.issueDetectionEnabled === false) {
-    // Matches Screenshot 5: Enable Issue detection card
-    container.innerHTML = `
-      <div class="cf-card" style="padding:48px 24px;text-align:center;">
-        <div style="width:48px;height:48px;margin:0 auto 14px;border-radius:12px;background:#eff6ff;color:#1d4ed8;display:flex;align-items:center;justify-content:center;font-size:22px;">
-          <i class="fa-solid fa-bug"></i>
-        </div>
-        <h2 style="font-size:18px;font-weight:600;margin-bottom:8px;">Enable Issue detection</h2>
-        <p style="font-size:13px;color:var(--text-secondary);max-width:460px;margin:0 auto 18px;line-height:1.55;">
-          Track exceptions, errors, and runtime failures across all files in <code>${escapeHtml(w.name)}</code>, making recurring failures easy to inspect and resolve.
-        </p>
-        <button type="button" class="btn-black" onclick="toggleWorkerIssueDetection(true)">
-          <i class="fa-solid fa-check"></i> Enable issues
-        </button>
-      </div>
-    `;
-    return;
-  }
-
-  // Matches Screenshot 6: Active Issues view
-  const allIssues = Array.isArray(w.issues) ? w.issues : [];
-  const activeIssues = allIssues.filter((i) => i.status !== 'resolved');
-  const resolvedIssues = allIssues.filter((i) => i.status === 'resolved');
-  const activeOccurrences = activeIssues.reduce((sum, i) => sum + (i.occurrences || 1), 0);
-  const latestOccurrence = allIssues[0]?.lastSeen ? formatRelativeTime(allIssues[0].lastSeen) : '-';
-
-  const filteredIssues =
-    appState.issuesFilterStatus === 'resolved'
-      ? resolvedIssues
-      : appState.issuesFilterStatus === 'all'
-      ? allIssues
-      : activeIssues;
-
-  container.innerHTML = `
-    <div class="cf-obs-filter-bar" style="margin-bottom:14px;">
-      <select class="cf-select" style="width:150px;" onchange="appState.issuesFilterStatus=this.value;renderDetailView();">
-        <option value="active" ${appState.issuesFilterStatus === 'active' ? 'selected' : ''}>Active (${activeIssues.length})</option>
-        <option value="resolved" ${appState.issuesFilterStatus === 'resolved' ? 'selected' : ''}>Resolved (${resolvedIssues.length})</option>
-        <option value="all" ${appState.issuesFilterStatus === 'all' ? 'selected' : ''}>All (${allIssues.length})</option>
-      </select>
-      <div style="margin-left:auto;display:flex;gap:8px;">
-        <button type="button" class="btn-outline btn-sm" onclick="fetchAppState()">
-          <i class="fa-solid fa-rotate"></i> Refresh
-        </button>
-        <button type="button" class="btn-outline btn-sm" onclick="toggleWorkerIssueDetection(false)">
-          Disable Issue Detection
-        </button>
-      </div>
-    </div>
-
-    <div class="cf-card" style="margin-bottom:16px;padding:16px 20px;">
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:16px;">
-        <div>
-          <div style="font-size:12px;color:var(--text-secondary);">Latest occurrence</div>
-          <strong style="font-size:20px;">${escapeHtml(latestOccurrence)}</strong>
-        </div>
-        <div>
-          <div style="font-size:12px;color:var(--text-secondary);">Active issues</div>
-          <strong style="font-size:20px;">${activeIssues.length}</strong>
-        </div>
-        <div>
-          <div style="font-size:12px;color:var(--text-secondary);">Active occurrences</div>
-          <strong style="font-size:20px;">${activeOccurrences}</strong>
-        </div>
-        <div>
-          <div style="font-size:12px;color:var(--text-secondary);">Resolved issues</div>
-          <strong style="font-size:20px;">${resolvedIssues.length}</strong>
-        </div>
-      </div>
-    </div>
-
-    <div class="cf-card" style="padding:24px;">
-      ${
-        filteredIssues.length === 0
-          ? `<div style="text-align:center;padding:24px 0;color:var(--text-secondary);">
-              <i class="fa-solid fa-magnifying-glass" style="font-size:20px;margin-bottom:8px;display:block;color:var(--text-muted);"></i>
-              <strong>No issues match this status</strong>
-              <p style="font-size:12.5px;margin-top:4px;">Your worker is running cleanly with 0 unhandled exceptions.</p>
-            </div>`
-          : `<div class="action-paths-list">${filteredIssues
-              .map(
-                (iss) => `
-              <div class="action-path-item">
-                <div class="action-path-urls">
-                  <span class="action-path-slug" style="color:#dc2626;"><i class="fa-solid fa-bug"></i> ${escapeHtml(iss.title)}</span>
-                  <span class="action-path-sub">File: <code>${escapeHtml(iss.filename || w.filename)}</code> · Occurrences: ${iss.occurrences || 1} · Last seen: ${formatRelativeTime(iss.lastSeen)}</span>
-                </div>
-                ${
-                  iss.status !== 'resolved'
-                    ? `<button type="button" class="btn-black btn-xs" onclick="resolveWorkerIssue('${escapeHtml(iss.id)}')">Resolve</button>`
-                    : `<span class="cf-plan-pill">Resolved</span>`
-                }
-              </div>`
-              )
-              .join('')}</div>`
-      }
-    </div>
-  `;
-}
-
-function renderDetailDomainsSubtab(w, displayHost) {
-  const container = el('detailDomainsContainer');
-  if (!container) return;
-  const primaryLink = getWorkerPrimaryPublishingLink(w);
-  const primaryPath = getWorkerPrimaryPublishingPath(w);
-  const customRoutes = Array.isArray(w.customRoutes) ? w.customRoutes : [];
-
-  container.innerHTML = `
-    <div class="cf-card" style="padding:20px 22px;margin-bottom:18px;">
-      <div class="cf-card-head-row" style="padding:0 0 12px 0;margin-bottom:12px;">
-        <div>
-          <h3 class="cf-settings-card-title">Primary Publishing Link</h3>
-          <p class="cf-settings-card-desc">Choose the primary publishing link (path or full URL) where <code>${escapeHtml(w.name)}</code> is served.</p>
-        </div>
-        <a href="${escapeHtml(primaryPath)}" target="_blank" rel="noopener" class="btn-outline btn-xs">
-          <span>Open ${escapeHtml(primaryLink)}</span>
-          <i class="fa-solid fa-arrow-up-right-from-square"></i>
-        </a>
-      </div>
-
-      <form onsubmit="event.preventDefault(); savePrimaryPublishingLinkFromDomains();" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
-        <input
-          type="text"
-          id="domainsPrimaryPublishInput"
-          value="${escapeHtml(primaryLink)}"
-          placeholder="e.g. /${escapeHtml(w.name)}, /ipdata, or https://example.com/ipdata"
-          style="flex:1;min-width:220px;height:36px;padding:0 12px;border:1px solid var(--border-strong);border-radius:10px;font-family:var(--font-mono);font-size:12.5px;"
-          required
-        />
-        <button type="submit" class="btn-black btn-sm">
-          <i class="fa-solid fa-check"></i> Save Primary Link
-        </button>
-      </form>
-
-      <div class="cf-settings-kv-rows">
-        <div class="cf-settings-kv-row">
-          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
-            <span class="cf-prod-badge">Active Link</span>
-            <a href="${escapeHtml(primaryPath)}" target="_blank" rel="noopener" style="font-family:var(--font-mono);font-size:13px;color:#111111;font-weight:600;">${escapeHtml(primaryLink)}</a>
-            <span style="font-size:12px;color:var(--text-muted);">(Local: <code>http://${escapeHtml(displayHost)}${escapeHtml(primaryPath)}</code>)</span>
-          </div>
-          <div style="display:flex;align-items:center;gap:12px;">
-            <button type="button" class="btn-outline btn-xs" onclick="copyTextToClipboard('${escapeHtml(primaryLink)}')">
-              <i class="fa-regular fa-copy"></i> Copy
-            </button>
-            <label class="cf-switch">
-              <input type="checkbox" ${w.productionUrlEnabled !== false ? 'checked' : ''} onchange="toggleWorkerUrlState('productionUrlEnabled', this.checked)" />
-              <span class="cf-slider"></span>
-            </label>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div class="cf-card" style="padding:20px 22px;">
-      <div class="cf-card-head-row" style="padding:0 0 14px 0;margin-bottom:14px;">
-        <div>
-          <h3 class="cf-settings-card-title">Additional Publishing Links &amp; Custom Routes</h3>
-          <p class="cf-settings-card-desc">Add any additional publishing links, custom paths, or domains that route directly to <code>${escapeHtml(w.name)}</code>.</p>
-        </div>
-        <div style="display:flex;gap:8px;">
-          <button type="button" class="btn-outline btn-sm" onclick="switchView('records')">
-            <i class="fa-solid fa-link"></i> Tunnel DNS
-          </button>
-        </div>
-      </div>
-
-      <form onsubmit="event.preventDefault(); addWorkerCustomRoute();" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px;">
-        <input type="text" id="newRoutePatternInput" placeholder="e.g. /ipdata, /api/ip, or https://api.example.com/ipdata" style="flex:1;min-width:220px;height:36px;padding:0 12px;border:1px solid var(--border-strong);border-radius:10px;font-family:var(--font-mono);font-size:12.5px;" required />
-        <select id="newRouteTypeSelect" class="cf-select" style="width:165px;height:36px;">
-          <option value="Publishing Link">Publishing Link</option>
-          <option value="Custom Domain">Custom Domain</option>
-          <option value="Route">Route</option>
-        </select>
-        <button type="submit" class="btn-black btn-sm">
-          <i class="fa-solid fa-plus"></i> Add Publishing Link
-        </button>
-      </form>
-
-      <div class="action-paths-list">
-        <div class="action-path-item">
-          <div class="action-path-urls">
-            <span class="action-path-slug"><a href="${escapeHtml(primaryPath)}" target="_blank" rel="noopener" style="color:#111111;text-decoration:none;"><code>${escapeHtml(primaryLink)}</code></a></span>
-            <span class="action-path-sub">Primary Publishing Link · Local: <code>http://${escapeHtml(displayHost)}${escapeHtml(primaryPath)}</code></span>
-          </div>
-          <span class="cf-ready-dot"><i class="fa-solid fa-circle" style="font-size:7px;"></i> Active</span>
-        </div>
-        ${customRoutes
-          .map((r) => {
-            const rHref = r.path || (String(r.pattern || '').startsWith('/') ? r.pattern : `/${w.name}`);
-            return `
-          <div class="action-path-item">
-            <div class="action-path-urls">
-              <span class="action-path-slug"><a href="${escapeHtml(rHref)}" target="_blank" rel="noopener" style="color:#111111;text-decoration:none;"><code>${escapeHtml(r.pattern)}</code></a></span>
-              <span class="action-path-sub">Type: ${escapeHtml(r.type || 'Publishing Link')} · Path: <code>${escapeHtml(rHref)}</code></span>
-            </div>
-            <div style="display:flex;gap:8px;align-items:center;">
-              <a href="${escapeHtml(rHref)}" target="_blank" rel="noopener" class="btn-outline btn-xs">Open</a>
-              <button type="button" class="btn-outline btn-xs" onclick="removeWorkerCustomRoute('${escapeHtml(r.id)}')">
-                <i class="fa-solid fa-trash"></i> Remove
-              </button>
-            </div>
-          </div>`;
-          })
-          .join('')}
-      </div>
-    </div>
-  `;
-}
-
-// 3. Quick Edit / VS Code Editor View (with Explorer Sidepanel, Multi-File CRUD & Devicon SVGs)
-function getActiveFileObj(worker) {
-  if (!worker) return null;
-  const files = Array.isArray(worker.files) && worker.files.length > 0
-    ? worker.files
-    : [{ name: worker.filename || 'worker.js', content: worker.code || '', sizeBytes: (worker.code || '').length, language: worker.language || 'javascript' }];
-  const desiredName = appState.activeFileByWorker[worker.name] || worker.filename || files[0].name;
-  return files.find((f) => f.name === desiredName) || files[0];
-}
-
-function renderEditorView() {
-  const worker = getActiveWorkerObj();
-  if (!worker) {
-    if (el('qeWorkerBreadcrumbName')) el('qeWorkerBreadcrumbName').textContent = 'No worker selected';
-    if (el('qeWorkersDevLinkText')) el('qeWorkersDevLinkText').textContent = '/';
-    if (el('wbSearchTitleText')) el('wbSearchTitleText').textContent = 'Robo Workers';
-    if (el('explorerWorkerHeaderName')) el('explorerWorkerHeaderName').textContent = 'EXPLORER';
-    if (el('explorerFilesList')) {
-      el('explorerFilesList').innerHTML = `<div style="padding:10px 12px;font-size:12px;color:var(--text-muted);">No workers yet. Click <strong>+</strong> to create one.</div>`;
-    }
-    if (el('editorFileTabs')) el('editorFileTabs').innerHTML = '';
-    if (el('workerCountSummary')) el('workerCountSummary').textContent = '0 files · 0 workers';
-    if (el('statusRuntimeText')) el('statusRuntimeText').textContent = 'Robo Workers';
-    return;
-  }
-
-  const files = Array.isArray(worker.files) && worker.files.length > 0
-    ? worker.files
-    : [{ name: worker.filename || 'worker.js', content: worker.code || '', sizeBytes: (worker.code || '').length, language: worker.language || 'javascript' }];
-  const activeFile = getActiveFileObj(worker);
-  appState.activeFileByWorker[worker.name] = activeFile.name;
-
-  const fileLanguage = activeFile.language || worker.language || 'javascript';
-  const langSpec = getLanguageSpec(fileLanguage);
-  const langLabelText = getLangDisplayName(fileLanguage);
-  const langLogoHtml = getLangLogoHtml(fileLanguage);
-  const workerNames = Object.keys(appState.workers).sort();
-  const workerCount = workerNames.length;
-  const primaryLink = getWorkerPrimaryPublishingLink(worker);
-  const primaryPath = getWorkerPrimaryPublishingPath(worker);
-
-  el('qeWorkerBreadcrumbName').textContent = worker.name;
-  el('qeWorkersDevLink').href = primaryPath;
-  el('qeWorkersDevLinkText').textContent = primaryLink;
-  if (el('wbSearchTitleText')) {
-    el('wbSearchTitleText').textContent = `${worker.name} — ${activeFile.name}`;
-  }
-
-  // Render Explorer Sidepanel (See, Create, Rename, Delete Files in Worker!)
-  renderExplorerSidepanel(worker, files, activeFile);
-
-  // Render Multi-File Editor Tabs for the Current Worker
-  const tabsContainer = el('editorFileTabs');
-  if (tabsContainer) {
-    tabsContainer.innerHTML = files
-      .map((f) => {
-        const isCurrent = f.name === activeFile.name;
-        const tabLogo = getLangLogoHtml(f.language || worker.language);
-        const canDelete = files.length > 1;
-        return `
-          <div class="file-tab ${isCurrent ? 'active' : ''}" onclick="selectWorkerFile('${escapeHtml(f.name)}')" title="${escapeHtml(f.name)} (${f.sizeBytes || 0} B)">
-            ${tabLogo}
-            <span class="file-name">${escapeHtml(f.name)}</span>
-            ${
-              canDelete
-                ? `<button type="button" class="file-tab-close" onclick="event.stopPropagation(); deleteWorkerFile('${escapeHtml(f.name)}');" title="Delete ${escapeHtml(f.name)}">×</button>`
-                : ''
-            }
-          </div>
-        `;
-      })
-      .join('');
-  }
-
-  el('workerCountSummary').textContent = `${files.length} file${files.length === 1 ? '' : 's'} · ${workerCount} worker${workerCount === 1 ? '' : 's'}`;
-
-  // Render Breadcrumbs with SVG Language Icon
-  const bcIcon = el('breadcrumbIcon');
-  if (bcIcon) bcIcon.innerHTML = langLogoHtml;
-  el('breadcrumbFile').textContent = activeFile.name;
-  el('breadcrumbSymbol').textContent = `${worker.name} › ${langLabelText}`;
-
-  el('deployVersionText').textContent = `${worker.deployId || '00000000'} (Active) Latest`;
-
-  const codeEditor = el('codeEditor');
-  const prevWorkerName = codeEditor.dataset.workerName;
-  if (
-    codeEditor.dataset.workerName !== worker.name ||
-    codeEditor.dataset.fileName !== activeFile.name ||
-    codeEditor.dataset.workerLang !== fileLanguage
-  ) {
-    codeEditor.value = activeFile.content !== undefined ? activeFile.content : worker.code || '';
-    codeEditor.dataset.workerName = worker.name;
-    codeEditor.dataset.fileName = activeFile.name;
-    codeEditor.dataset.workerLang = fileLanguage;
-
-    // Copy the exact /<worker> link URL from qeWorkersDevLink for the Preview & HTTP panes
-    const liveWorkerUrl = el('qeWorkersDevLink').href;
-    if (prevWorkerName !== worker.name || !el('httpUrlInput').value || el('httpUrlInput').value === '/worker') {
-      el('httpUrlInput').value = primaryPath;
-      if (el('previewUrlBadge')) el('previewUrlBadge').value = liveWorkerUrl;
-      el('openRawEndpointLink').href = liveWorkerUrl;
-      el('openRawEndpointLink').innerHTML = `Open ${escapeHtml(primaryLink)} <i class="fa-solid fa-arrow-up-right-from-square"></i>`;
-      if (el('previewExternalLink')) el('previewExternalLink').href = liveWorkerUrl;
-      const iframe = el('previewIframe');
-      if (iframe && iframe.dataset.loadedUrl !== liveWorkerUrl) {
-        iframe.src = liveWorkerUrl;
-        iframe.dataset.loadedUrl = liveWorkerUrl;
-      }
-    }
-  }
-
-  codeEditor.style.tabSize = String(worker.spaces || 2);
-  const hlPre = el('codeHighlight');
-  if (hlPre) hlPre.style.tabSize = String(worker.spaces || 2);
-
-  updateEditorHighlightAndLines();
-  updateCursorPosition();
-  runBasicDiagnostics(codeEditor.value, fileLanguage);
-  renderExplorerOutlineAndTimeline(worker, activeFile, codeEditor.value);
-  renderBottomPanel(worker);
-
-  el('statusIndentBtn').textContent = worker.indentUsingTabs
-    ? `Tab Size: ${worker.spaces || 4}`
-    : `Spaces: ${worker.spaces || 2}`;
-  el('statusEncodingBtn').textContent = worker.encoding || 'UTF-8';
-  el('statusEolBtn').textContent = worker.eol || 'LF';
-
-  const statusLangLogo = el('statusLangLogo');
-  if (statusLangLogo) statusLangLogo.innerHTML = langLogoHtml;
-  el('statusLangName').textContent = langLabelText;
-  el('statusLayoutBtn').textContent = worker.layout || 'Layout: US';
-  el('statusRuntimeText').textContent = formatRuntimeName(langSpec.runtime);
-
-  renderConsoleLogs(worker);
-}
-
-function renderExplorerSidepanel(worker, files, activeFile) {
-  const headerName = el('explorerWorkerHeaderName');
-  if (headerName) {
-    headerName.textContent = worker.name.toUpperCase();
-  }
-
-  const treeEl = el('explorerFilesList');
-  if (!treeEl) return;
-
-  treeEl.innerHTML = files
-    .map((f) => {
-      const isSelected = f.name === activeFile.name;
-      const logo = getLangLogoHtml(f.language || worker.language);
-      return `
-        <div class="explorer-file-row ${isSelected ? 'active' : ''}" onclick="selectWorkerFile('${escapeHtml(f.name)}')">
-          <div class="explorer-file-left">
-            ${logo}
-            <span class="explorer-file-name" title="${escapeHtml(f.name)} (${f.sizeBytes || 0} B)">${escapeHtml(f.name)}</span>
-          </div>
-          <div class="explorer-file-actions">
-            <button type="button" class="explorer-row-act" onclick="event.stopPropagation(); duplicateWorkerFile('${escapeHtml(f.name)}');" title="Duplicate ${escapeHtml(f.name)}">
-              <i class="fa-regular fa-copy"></i>
-            </button>
-            <button type="button" class="explorer-row-act" onclick="event.stopPropagation(); promptExplorerRenameFile('${escapeHtml(f.name)}');" title="Rename ${escapeHtml(f.name)}">
-              <i class="fa-solid fa-pen"></i>
-            </button>
-            <button type="button" class="explorer-row-act danger" onclick="event.stopPropagation(); deleteWorkerFile('${escapeHtml(f.name)}');" title="Delete ${escapeHtml(f.name)}">
-              <i class="fa-solid fa-trash-can"></i>
-            </button>
-          </div>
-        </div>
-      `;
-    })
-    .join('');
-}
-
-function renderExplorerOutlineAndTimeline(worker, activeFile, codeText) {
-  const outlineEl = el('explorerOutlineList');
-  if (outlineEl) {
-    const lines = String(codeText || '').split('\n');
-    const symbols = [];
-    lines.forEach((lnText, idx) => {
-      const mFn = lnText.match(/\b(async\s+fetch|function\s+\w+|const\s+\w+|let\s+\w+|def\s+\w+|class\s+\w+)/);
-      const mKey = lnText.match(/^\s*"([a-zA-Z0-9_-]+)"\s*:/);
-      if (mFn) {
-        symbols.push({ label: mFn[1].replace(/\s+/g, ' '), line: idx + 1 });
-      } else if (mKey && symbols.length < 20) {
-        symbols.push({ label: mKey[1], line: idx + 1 });
+        if (!typeToConfirm) setTimeout(() => okBtn.focus(), 30);
       }
     });
-    if (symbols.length === 0) {
-      outlineEl.innerHTML = `<div class="explorer-outline-item" style="color:var(--text-muted);">${escapeHtml(activeFile.name)} (Ln 1)</div>`;
-    } else {
-      outlineEl.innerHTML = symbols
-        .slice(0, 18)
+    let resolved = false;
+    const obs = new MutationObserver(() => {
+      if (!document.body.contains(m.el)) {
+        obs.disconnect();
+        if (!resolved) resolve(false);
+      }
+    });
+    obs.observe(document.body, { childList: true });
+  });
+}
+
+/* ==================================================================== state */
+const S = {
+  overview: null,
+  route: { page: 'workers' },
+  pollers: [],
+  ide: null,
+  theme: document.documentElement.dataset.theme || 'dark'
+};
+function workersList() {
+  return (S.overview && S.overview.workers) || [];
+}
+function findWorker(name) {
+  return workersList().find((w) => w.name === name);
+}
+async function loadOverview() {
+  S.overview = await api('GET', '/api/overview');
+  renderSide();
+  return S.overview;
+}
+
+function stopPollers() {
+  S.pollers.forEach((p) => clearInterval(p));
+  S.pollers = [];
+}
+function poll(fn, every) {
+  const id = setInterval(() => {
+    if (!document.hidden) fn();
+  }, every);
+  S.pollers.push(id);
+  return id;
+}
+
+/* ============================================================ hour buckets */
+function last24Hours() {
+  const out = [];
+  const now = Date.now();
+  for (let i = 23; i >= 0; i--) {
+    const d = new Date(now - i * 3600e3);
+    out.push({ key: d.toISOString().slice(0, 13), label: d.toLocaleTimeString([], { hour: '2-digit', hour12: false }) });
+  }
+  return out;
+}
+function hourSeries(hourly) {
+  return last24Hours().map(({ key, label }) => {
+    const b = (hourly && hourly[key]) || null;
+    return {
+      key,
+      label,
+      requests: b ? b.requests : 0,
+      errors: b ? b.errors : 0,
+      avgMs: b && b.requests ? b.totalMs / b.requests : null,
+      bytes: b ? b.bytes : 0
+    };
+  });
+}
+function mergeHourly(workers) {
+  const merged = {};
+  for (const w of workers) {
+    for (const [k, b] of Object.entries(w.hourly || {})) {
+      const m = merged[k] || (merged[k] = { requests: 0, errors: 0, totalMs: 0, bytes: 0 });
+      m.requests += b.requests;
+      m.errors += b.errors;
+      m.totalMs += b.totalMs;
+      m.bytes += b.bytes;
+    }
+  }
+  return merged;
+}
+
+/* ================================================================== charts */
+// 24 cells, one per hour; brightness = traffic relative to the busiest hour.
+function sparkStrip(hourly) {
+  const series = hourSeries(hourly);
+  const max = Math.max(1, ...series.map((s) => s.requests));
+  return `<div><div class="spark" role="img" aria-label="Requests per hour over the last 24 hours">${series
+    .map((s) => {
+      const tip = `${s.label}:00 · ${s.requests ? plural(s.requests, 'request') : 'no requests'}${s.errors ? `, ${s.errors} failed` : ''}`;
+      if (!s.requests) return `<i class="zero" title="${esc(tip)}"></i>`;
+      const o = (0.28 + 0.72 * Math.sqrt(s.requests / max)).toFixed(2);
+      return `<i class="${s.errors > s.requests / 2 ? 'err' : ''}" style="--o:${o}" title="${esc(tip)}"></i>`;
+    })
+    .join('')}</div><div class="spark-axis"><span>24h ago</span><span>now</span></div></div>`;
+}
+
+let chartSeq = 0;
+// Bars = requests (errors stacked in red), line = average response time.
+function hourChart(hourly, { height = 190 } = {}) {
+  const id = `ch${++chartSeq}`;
+  const series = hourSeries(hourly);
+  const W = 720;
+  const H = height;
+  const pad = { l: 34, r: 40, t: 12, b: 22 };
+  const iw = W - pad.l - pad.r;
+  const ih = H - pad.t - pad.b;
+  const maxR = Math.max(1, ...series.map((s) => s.requests));
+  const lat = series.map((s) => s.avgMs).filter((v) => v !== null);
+  const maxL = Math.max(1, ...lat);
+  const bw = iw / series.length;
+  const y = (v) => pad.t + ih - (v / maxR) * ih;
+  const yl = (v) => pad.t + ih - (v / maxL) * ih;
+  const ticks = [0, Math.ceil(maxR / 2), maxR];
+  let bars = '';
+  let pts = [];
+  series.forEach((s, i) => {
+    const x = pad.l + i * bw;
+    if (s.requests) {
+      const okH = ((s.requests - s.errors) / maxR) * ih;
+      const errH = (s.errors / maxR) * ih;
+      const bwid = Math.min(12, Math.max(2, bw - 8));
+      const bx = x + (bw - bwid) / 2;
+      bars += `<rect class="bar" x="${bx}" y="${pad.t + ih - okH - errH}" width="${bwid}" height="${Math.max(okH, 0)}" rx="${Math.min(4, bwid / 2)}"/>`;
+      if (s.errors) bars += `<rect class="bar err" x="${bx}" y="${pad.t + ih - errH}" width="${bwid}" height="${errH}" rx="${Math.min(4, bwid / 2)}"/>`;
+    }
+    if (s.avgMs !== null) pts.push(`${x + bw / 2},${yl(s.avgMs)}`);
+  });
+  const xLabels = series
+    .map((s, i) => (i % 4 === 0 ? `<text x="${pad.l + i * bw + bw / 2}" y="${H - 6}" text-anchor="middle">${esc(s.label)}</text>` : ''))
+    .join('');
+  const grid = ticks
+    .map((t) => `<line class="grid" x1="${pad.l}" x2="${W - pad.r}" y1="${y(t)}" y2="${y(t)}"/><text x="${pad.l - 6}" y="${y(t) + 3}" text-anchor="end">${t}</text>`)
+    .join('');
+  const latAxis = lat.length ? `<text x="${W - pad.r + 6}" y="${pad.t + 8}">${esc(ms(maxL))}</text><text x="${W - pad.r + 6}" y="${pad.t + ih}">0</text>` : '';
+  const hits = series
+    .map((s, i) => `<rect x="${pad.l + i * bw}" y="${pad.t}" width="${bw}" height="${ih}" fill="transparent" data-i="${i}"/>`)
+    .join('');
+  setTimeout(() => {
+    const wrap = document.getElementById(id);
+    if (!wrap) return;
+    const tip = wrap.querySelector('.chart-tip');
+    wrap.addEventListener('mousemove', (e) => {
+      const r = e.target.closest('rect[data-i]');
+      if (!r) return (tip.style.display = 'none');
+      const s = series[Number(r.dataset.i)];
+      tip.innerHTML = `<b>${esc(s.label)}:00</b> · ${plural(s.requests, 'request')}${s.errors ? ` · <span style="color:var(--err)">${s.errors} failed</span>` : ''}${s.avgMs !== null ? ` · avg ${esc(ms(s.avgMs))}` : ''}`;
+      tip.style.display = 'block';
+      const box = wrap.getBoundingClientRect();
+      tip.style.left = `${Math.min(box.width - tip.offsetWidth - 4, Math.max(4, e.clientX - box.left + 12))}px`;
+      tip.style.top = `${e.clientY - box.top - 34}px`;
+    });
+    wrap.addEventListener('mouseleave', () => (tip.style.display = 'none'));
+  });
+  return `<div class="chart-wrap" id="${id}">
+    <svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Requests and average response time per hour, last 24 hours">
+      ${grid}${bars}
+      ${pts.length > 1 ? `<polyline class="line" points="${pts.join(' ')}"/>` : ''}
+      ${pts.length === 1 ? `<circle cx="${pts[0].split(',')[0]}" cy="${pts[0].split(',')[1]}" r="3" fill="var(--violet)"/>` : ''}
+      ${latAxis}${xLabels}${hits}
+    </svg>
+    <div class="chart-tip" style="display:none"></div>
+  </div>`;
+}
+
+/* ======================================================= sliding indicator */
+// One soft "pill" slides between the active items of a segmented group (nav,
+// tabs, chips). Positions are remembered per group, so it still glides when
+// the group is re-rendered on navigation.
+const indPos = new Map();
+function slideInd(container, key) {
+  if (!container) return;
+  key = key || container.id || container.dataset.seg;
+  let ind = container.querySelector(':scope > .seg-ind');
+  if (!ind) {
+    ind = document.createElement('span');
+    ind.className = 'seg-ind';
+    container.prepend(ind);
+  }
+  const act = container.querySelector(':scope > .active');
+  if (!act) {
+    ind.style.opacity = '0';
+    return;
+  }
+  const next = { x: act.offsetLeft, y: act.offsetTop, w: act.offsetWidth, h: act.offsetHeight };
+  const apply = (q) => {
+    ind.style.width = `${q.w}px`;
+    ind.style.height = `${q.h}px`;
+    ind.style.transform = `translate(${q.x}px, ${q.y}px)`;
+  };
+  const prev = indPos.get(key);
+  if (!ind.dataset.placed) {
+    ind.style.transition = 'none';
+    apply(prev || next);
+    void ind.offsetWidth;
+    ind.style.transition = '';
+    ind.dataset.placed = '1';
+  }
+  ind.style.opacity = '1';
+  requestAnimationFrame(() => apply(next));
+  indPos.set(key, next);
+}
+
+/* ================================================================= sidebar */
+const NAV = [
+  { id: 'workers', href: '#/', label: 'Workers', icon: 'grid' },
+  { id: 'logs', href: '#/logs', label: 'Live logs', icon: 'logs' },
+  { id: 'tunnel', href: '#/tunnel', label: 'Domain & tunnel', icon: 'globe' },
+  { id: 'system', href: '#/system', label: 'System', icon: 'cpu' }
+];
+function renderSide() {
+  const page = S.route.page === 'worker' ? 'workers' : S.route.page;
+  $('#nav').className = 'seg';
+  $('#nav').innerHTML = NAV.map(
+    (n) =>
+      `<a class="nav-item ${page === n.id ? 'active' : ''}" href="${n.href}">${icon(n.icon)}<span>${n.label}</span>${
+        n.id === 'workers' && S.overview ? `<span class="count">${S.overview.workers.length}</span>` : ''
+      }</a>`
+  ).join('');
+  slideInd($('#nav'));
+  const ws = [...workersList()].sort((a, b) => a.name.localeCompare(b.name));
+  const cur = S.route.page === 'worker' ? S.route.name : '';
+  const hourNow = new Date().toISOString().slice(0, 13);
+  $('#navWorkers').innerHTML = ws.length
+    ? ws
         .map(
-          (s) => `
-          <div class="explorer-outline-item" onclick="jumpEditorToLine(${s.line})">
-            <i class="fa-solid fa-cube" style="font-size:10px;color:#0284c7;"></i>
-            <span>${escapeHtml(s.label)}</span>
-            <span style="margin-left:auto;color:var(--text-muted);font-size:10px;">:${s.line}</span>
-          </div>`
+          (w) =>
+            `<a class="nav-item nav-worker ${cur === w.name ? 'active' : ''}" href="#/w/${enc(w.name)}" title="${esc(w.name)}"><span class="dot ${
+              w.hourly && w.hourly[hourNow] ? 'live' : ''
+            }"></span><span class="nm">${esc(w.name)}</span>${
+              w.requestsToday ? `<span class="count">${num(w.requestsToday)}</span>` : ''
+            }</a>`
         )
-        .join('');
-    }
-  }
-
-  const timelineEl = el('explorerTimelineList');
-  if (timelineEl) {
-    const deployments = Array.isArray(worker.deployments) ? worker.deployments : [];
-    timelineEl.innerHTML = deployments
-      .slice(0, 10)
-      .map(
-        (d) => `
-        <div class="explorer-outline-item" title="${escapeHtml(d.source || 'Saved')}">
-          <i class="fa-solid fa-code-commit" style="font-size:10px;color:#16a34a;"></i>
-          <span>${escapeHtml(d.id)} · ${escapeHtml(d.filename || worker.filename)}</span>
-          <span style="margin-left:auto;color:var(--text-muted);font-size:10px;">${formatRelativeTime(d.timestamp)}</span>
-        </div>`
-      )
-      .join('');
+        .join('')
+    : `<div class="hint" style="padding:2px 11px">None yet</div>`;
+  $('#navWorkers').className = 'seg';
+  slideInd($('#navWorkers'));
+  const cfg = S.overview ? S.overview.config : null;
+  if (cfg) {
+    const host = cfg.subdomain && cfg.rootDomain ? `${cfg.subdomain}.${cfg.rootDomain}` : cfg.rootDomain || location.host;
+    $('#hostLabel').textContent = host;
   }
 }
 
-function renderBottomPanel(worker) {
-  const bodyEl = el('bottomPanelBody');
-  const termInputRow = el('bottomTerminalInputRow');
-  if (!bodyEl || !worker) return;
-  const filterQ = (el('bottomPanelFilterInput')?.value || '').trim().toLowerCase();
-
-  if (termInputRow) {
-    termInputRow.classList.toggle('hidden', appState.bottomPanelTab !== 'terminal');
-  }
-
-  if (appState.bottomPanelTab === 'problems') {
-    if (appState.diagnostics.length === 0) {
-      bodyEl.textContent = 'No problems have been detected in the workspace.';
-    } else {
-      bodyEl.textContent = appState.diagnostics
-        .map((d) => `[${d.severity.toUpperCase()}] ${d.message}`)
-        .join('\n');
-    }
-  } else if (appState.bottomPanelTab === 'terminal') {
-    const files = (worker.files || []).map((f) => `${f.name} (${f.sizeBytes || 0}B)`).join('  ');
-    const baseLines = [
-      `robo-workers:/home/user/storage/workers/${worker.name}$ ls -la`,
-      files || worker.filename,
-      `robo-workers:/home/user/storage/workers/${worker.name}$ curl -i http://localhost:${(appState.config && appState.config.publicPort) || 27715}/${worker.name}`,
-      `HTTP/1.1 ${appState.lastHttpStatus || 200} OK (${appState.lastHttpDurationMs || worker.lastDurationMs || 1} ms)`
-    ];
-    if (Array.isArray(appState.terminalHistory) && appState.terminalHistory.length > 0) {
-      baseLines.push(...appState.terminalHistory);
-    }
-    bodyEl.textContent = baseLines.join('\n');
-    bodyEl.scrollTop = bodyEl.scrollHeight;
-  } else {
-    // OUTPUT tab
-    const logs = (worker.logs || []).filter(
-      (l) => !filterQ || `${l.level} ${l.message}`.toLowerCase().includes(filterQ)
-    );
-    if (logs.length === 0) {
-      bodyEl.textContent = `[Robo Workers] Worker "${worker.name}" synced with /home/user/storage/workers/${worker.name}/`;
-    } else {
-      bodyEl.textContent = logs
-        .map((l) => `[${new Date(l.timestamp).toLocaleTimeString()}] [${l.level.toUpperCase()}] ${l.message}`)
-        .join('\n');
-    }
-  }
-}
-
-function buildLogsHtml(logs, workerName) {
-  if (!logs || logs.length === 0) {
-    return `<div class="log-row"><span class="log-time">--:--:--</span><span class="log-level info">READY</span><span>Worker "${escapeHtml(workerName || 'worker')}" ready. Pulls code from local storage on run.</span></div>`;
-  }
-  return logs
-    .map((entry) => {
-      const time = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString() : '';
-      const lvl = (entry.level || 'log').toLowerCase();
-      const rawMsg = String(entry.message || '');
-      const prefix = entry.worker ? `[${entry.worker}]` : '';
-      const hasPrefix = prefix && rawMsg.startsWith(prefix);
-      const workerTag = prefix && !hasPrefix ? `${escapeHtml(prefix)} ` : '';
-      return `<div class="log-row">
-        <span class="log-time">${time}</span>
-        <span class="log-level ${lvl}">${lvl}</span>
-        <span>${workerTag}${escapeHtml(rawMsg)}</span>
-      </div>`;
-    })
-    .join('');
-}
-
-function renderConsoleLogs(worker) {
-  const container = el('consoleLogs');
-  if (!container) return;
-  const invocations = Array.isArray(worker?.invocations) ? worker.invocations : [];
-  const logs = Array.isArray(worker?.logs) ? worker.logs : [];
-  const origin = window.location.origin;
-
-  if (invocations.length === 0 && logs.length === 0) {
-    container.innerHTML = `<div class="console-http-req-row">
-      <i class="fa-solid fa-caret-right console-caret"></i>
-      <span class="console-time">${new Date().toLocaleTimeString('en-GB', { hour12: false })}</span>
-      <span class="console-method">GET</span>
-      <span class="console-url">${escapeHtml(origin)}/${escapeHtml(worker ? worker.name : 'worker')}</span>
-    </div>`;
-    return;
-  }
-
-  const invRows = invocations
-    .slice()
-    .reverse()
-    .map((inv, idx) => {
-      const t = inv.timestamp
-        ? new Date(inv.timestamp).toLocaleTimeString('en-GB', { hour12: false })
-        : '';
-      const fullUrl = `${origin}${inv.path || '/' + (worker ? worker.name : 'worker')}`;
-      const detailId = `console-inv-detail-${idx}`;
-      return `<div style="border-bottom:1px solid #f1f5f9;">
-        <div class="console-http-req-row" style="border-bottom:none;cursor:pointer;" onclick="const d=document.getElementById('${detailId}'); if(d) d.classList.toggle('hidden');" title="Click to inspect request telemetry">
-          <i class="fa-solid fa-caret-right console-caret"></i>
-          <span class="console-time">${escapeHtml(t)}</span>
-          <span class="console-method">${escapeHtml(inv.method || 'GET')}</span>
-          <span class="console-url">${escapeHtml(fullUrl)}</span>
-        </div>
-        <div id="${detailId}" class="hidden" style="padding:4px 12px 8px 24px;font-family:var(--font-mono);font-size:11px;color:#475569;background:#f8fafc;">
-          Status: <strong>${inv.status || 200}</strong> · Client IP: <code>${escapeHtml(inv.clientIp || '127.0.0.1')}</code> (${escapeHtml(inv.os || 'Linux')} / ${escapeHtml(inv.browser || 'Browser')}) · CPU: <strong>${inv.cpuUs || 0} µs</strong> · Wall: <strong>${inv.durationMs || 0} ms</strong> · Rev: <code>${escapeHtml(inv.versionId || '')}</code>
-        </div>
-      </div>`;
-    })
-    .join('');
-
-  const customLogRows = logs
-    .filter((l) => !String(l.message || '').startsWith('[workerd:'))
-    .slice(-15)
-    .map((l) => {
-      const t = l.timestamp
-        ? new Date(l.timestamp).toLocaleTimeString('en-GB', { hour12: false })
-        : '';
-      return `<div class="log-row">
-        <span class="log-time">${escapeHtml(t)}</span>
-        <span class="log-level ${escapeHtml(l.level || 'log')}">${escapeHtml(l.level || 'log')}</span>
-        <span>${escapeHtml(l.message || '')}</span>
-      </div>`;
-    })
-    .join('');
-
-  container.innerHTML = invRows + customLogRows;
-  container.scrollTop = container.scrollHeight;
-}
-
-// 4. Public Links / Records & Tunnel View
-function renderRecordsView() {
-  const cfg = appState.config || {};
-  const subdomain = String(cfg.subdomain || '').trim();
-  const rootDomain = String(cfg.rootDomain || '').trim();
-  const customDomain = getConfiguredCustomDomain();
-  const localIp = cfg.localIp || '127.0.0.1';
-  const port = cfg.publicPort || 27715;
-  const tunnelId = cfg.tunnelId || '';
-  const cnameTarget = tunnelId ? `${tunnelId}.cfargotunnel.com` : '<tunnel-id>.cfargotunnel.com';
-
-  const statusBadge = el('dnsStatusBadge');
-  const status = cfg.dnsRecordStatus || 'unchecked';
-  statusBadge.textContent = status;
-  statusBadge.className = `status-tag ${status}`;
-
-  el('dnsStatusMessage').textContent =
-    cfg.dnsCheckMessage || 'No custom domain configured yet. Enter a domain in Settings to check DNS records.';
-  el('cnameSubdomainPreview').textContent = subdomain || '@';
-  el('cnameTargetPreview').textContent = cnameTarget;
-  el('openCloudflareDnsBtn').href = rootDomain
-    ? `https://dash.cloudflare.com/?to=/:account/${rootDomain}/dns`
-    : 'https://dash.cloudflare.com';
-
-  el('kvPublicHostname').textContent = customDomain || 'not configured';
-  el('kvTunnelId').textContent = tunnelId || 'not configured';
-  el('kvConnectorInstalled').textContent = cfg.connectorInstalled ? 'installed' : 'not installed';
-  el('kvConnectorRunning').textContent = cfg.connectorRunning ? 'yes' : 'no';
-  el('kvService').textContent = `http://127.0.0.1:${port}`;
-  el('kvLanTarget').textContent = `http://${localIp}:${port}`;
-
-  el('tunnelHowtoPre').textContent = [
-    `hostname: ${customDomain || 'not configured'}`,
-    `service: http://127.0.0.1:${port}`,
-    `network target: http://${localIp}:${port}`,
-    `network CIDRs: ${cfg.networkCidrs || 'not configured'}`,
-    `path rule: /*`,
-    `zone: ${rootDomain || 'not configured'}`,
-    `one tunnel record serves all paths`
-  ].join('\n');
-
-  const workerNames = Object.keys(appState.workers).sort();
-  el('actionPathsCountBadge').textContent = String(workerNames.length);
-  const pathsContainer = el('availableActionPathsList');
-  if (workerNames.length === 0) {
-    pathsContainer.textContent = 'No worker actions yet.';
-  } else {
-    pathsContainer.innerHTML = workerNames
-      .map((name) => {
-        const wObj = appState.workers[name];
-        const logoHtml = getLangLogoHtml(wObj?.language);
-        const primaryUrl = customDomain
-          ? `https://${customDomain}/${name}`
-          : `${window.location.origin}/${name}`;
-        return `<div class="action-path-item">
-          <div class="action-path-urls">
-            <span class="action-path-slug">${logoHtml} /${escapeHtml(name)}</span>
-            <span class="action-path-sub">Endpoint: ${escapeHtml(primaryUrl)} · LAN: http://${escapeHtml(localIp)}:${port}/${escapeHtml(name)}</span>
-          </div>
-          <div class="worker-row-actions">
-            <a href="/${encodeURIComponent(name)}" target="_blank" rel="noopener" class="btn-outline btn-sm">
-              <span>Open /${escapeHtml(name)}</span>
-              <i class="fa-solid fa-arrow-up-right-from-square"></i>
-            </a>
-            <button type="button" class="btn-outline btn-sm" onclick="copyTextToClipboard('${escapeHtml(primaryUrl)}')">
-              <i class="fa-regular fa-copy"></i> Copy URL
-            </button>
-            <button type="button" class="btn-black btn-sm" onclick="openWorkerInEditor('${escapeHtml(name)}')">
-              <i class="fa-solid fa-code"></i> Edit code
-            </button>
-          </div>
-        </div>`;
-      })
-      .join('');
-  }
-
-  if (document.activeElement !== el('settingSubdomain')) el('settingSubdomain').value = subdomain;
-  if (document.activeElement !== el('settingRootDomain')) el('settingRootDomain').value = rootDomain;
-  if (document.activeElement !== el('settingTunnelId')) el('settingTunnelId').value = tunnelId;
-  if (document.activeElement !== el('settingTunnelToken')) el('settingTunnelToken').value = cfg.tunnelToken || '';
-  if (document.activeElement !== el('settingLocalIp')) el('settingLocalIp').value = localIp;
-  if (document.activeElement !== el('settingNetworkCidrs')) el('settingNetworkCidrs').value = cfg.networkCidrs || '';
-}
-
-// 5. Websites & Nginx Proxy View
-function renderWebsitesView() {
-  const d = appState.clientDevice || {};
-  const cfg = appState.config || {};
-  const displayHost = getDisplayHost();
-
-  const clientList = el('websitesClientKvList');
-  if (clientList) {
-    clientList.innerHTML = `
-      <div class="kv-row"><dt>Client IP (from HTTP Request)</dt><dd>${escapeHtml(d.ip || '127.0.0.1')}</dd></div>
-      <div class="kv-row"><dt>X-Forwarded-For</dt><dd>${escapeHtml(d.forwardedFor || d.ip || '127.0.0.1')}</dd></div>
-      <div class="kv-row"><dt>Operating System</dt><dd>${escapeHtml(d.os || 'Linux')}</dd></div>
-      <div class="kv-row"><dt>Browser / Client</dt><dd>${escapeHtml(d.browser || 'Browser')}</dd></div>
-      <div class="kv-row"><dt>Device Category</dt><dd>${escapeHtml(d.deviceType || 'Desktop')}</dd></div>
-      <div class="kv-row"><dt>Accept-Language</dt><dd>${escapeHtml(d.language || 'en-US')}</dd></div>
-    `;
-  }
-
-  const gatewayList = el('websitesGatewayKvList');
-  if (gatewayList) {
-    const pubPort = cfg.publicPort || 27715;
-    const backPort = cfg.backendPort || 17156;
-    gatewayList.innerHTML = `
-      <div class="kv-row"><dt>Reverse Proxy</dt><dd>Nginx (:${pubPort} -> 127.0.0.1:${backPort})</dd></div>
-      <div class="kv-row"><dt>Active Host</dt><dd>${escapeHtml(displayHost)}</dd></div>
-      <div class="kv-row"><dt>HTTP Client-IP Headers</dt><dd>CF-Connecting-IP, X-Real-IP, X-Forwarded-For</dd></div>
-      <div class="kv-row"><dt>CORS Cross-Page Policy</dt><dd>Access-Control-Allow-Origin: * (JSON)</dd></div>
-      <div class="kv-row"><dt>Local Network Address</dt><dd>${escapeHtml(cfg.localIp || '127.0.0.1')}:${pubPort}</dd></div>
-    `;
-  }
-
-  const routesList = el('websitesRoutesList');
-  if (routesList) {
-    const names = Object.keys(appState.workers).sort();
-    routesList.innerHTML = names
-      .map((name) => {
-        const w = appState.workers[name];
-        const langSpec = getLanguageSpec(w.language);
-        const logoHtml = getLangLogoHtml(w.language);
-        return `
-        <div class="action-path-item">
-          <div class="action-path-urls">
-            <span class="action-path-slug">${logoHtml} /${escapeHtml(name)}</span>
-            <span class="action-path-sub">${escapeHtml(langSpec.label)} (${escapeHtml(formatRuntimeName(langSpec.runtime))}) · ${w.requests || 0} requests served</span>
-          </div>
-          <div class="worker-row-actions">
-            <a href="/${encodeURIComponent(name)}" target="_blank" rel="noopener" class="btn-outline btn-sm">
-              <i class="fa-solid fa-arrow-up-right-from-square"></i> Test Route
-            </a>
-            <button type="button" class="btn-black btn-sm" onclick="openWorkerInEditor('${escapeHtml(name)}')">
-              <i class="fa-solid fa-code"></i> Edit Code
-            </button>
-          </div>
-        </div>
-      `;
-      })
-      .join('');
-  }
-}
-
-// 6. Analytics & Unified Logs View
-function renderAnalyticsView() {
-  const allWorkers = Object.values(appState.workers);
-  const totalReqs = allWorkers.reduce((s, w) => s + (w.requests || 0), 0);
-  const totalErrs = allWorkers.reduce((s, w) => s + (w.errors || 0), 0);
-
-  let allLogs = [];
-  for (const w of allWorkers) {
-    for (const l of w.logs || []) {
-      allLogs.push({ ...l, worker: w.name });
-    }
-  }
-  allLogs.sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0));
-
-  const cards = el('analyticsSummaryCards');
-  if (cards) {
-    cards.innerHTML = `
-      <div class="cf-metric-mini-card">
-        <span class="cf-metric-mini-label"><i class="fa-solid fa-bolt"></i> Total Requests</span>
-        <strong class="cf-metric-mini-val">${totalReqs}</strong>
-        <div class="cf-metric-mini-foot">Across ${allWorkers.length} workers</div>
-      </div>
-      <div class="cf-metric-mini-card">
-        <span class="cf-metric-mini-label"><i class="fa-solid fa-circle-exclamation"></i> Total Errors</span>
-        <strong class="cf-metric-mini-val">${totalErrs}</strong>
-        <div class="cf-metric-mini-foot">100% uptime</div>
-      </div>
-      <div class="cf-metric-mini-card">
-        <span class="cf-metric-mini-label"><i class="fa-solid fa-terminal"></i> Log Events</span>
-        <strong class="cf-metric-mini-val">${allLogs.length}</strong>
-        <div class="cf-metric-mini-foot">Stored on disk</div>
-      </div>
-      <div class="cf-metric-mini-card">
-        <span class="cf-metric-mini-label"><i class="fa-solid fa-location-dot"></i> HTTP Client IP</span>
-        <strong class="cf-metric-mini-val">${escapeHtml(appState.clientDevice.ip || '127.0.0.1')}</strong>
-        <div class="cf-metric-mini-foot">${escapeHtml(appState.clientDevice.os || 'Linux')}</div>
-      </div>
-    `;
-  }
-
-  const filterQ = (el('analyticsLogFilterInput')?.value || '').trim().toLowerCase();
-  if (filterQ) {
-    allLogs = allLogs.filter((l) =>
-      `${l.worker} ${l.level} ${l.message}`.toLowerCase().includes(filterQ)
-    );
-  }
-
-  const logsBox = el('analyticsUnifiedLogs');
-  if (logsBox) {
-    logsBox.innerHTML = buildLogsHtml(allLogs, 'all-workers');
-  }
-}
-
-// 7. Local Storage & KV Browser View
-function renderStorageView() {
-  const container = el('storageFilesContainer');
-  if (!container) return;
-  const files = appState.storageFiles || [];
-  if (files.length === 0) {
-    container.innerHTML = `<div class="card"><p class="card-desc">No files found in local storage.</p></div>`;
-    return;
-  }
-
-  container.innerHTML = files
-    .map(
-      (f, idx) => `
-    <div class="card" style="margin-bottom:16px;">
-      <div class="card-title-row" style="justify-content:space-between;">
-        <div>
-          <strong style="font-family:var(--font-mono);font-size:13.5px;"><i class="fa-regular fa-file-code"></i> /home/user/${escapeHtml(f.path)}</strong>
-          <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
-            Category: ${escapeHtml(f.category)} · Size: ${f.sizeBytes} bytes · Last saved: ${new Date(f.updatedAt).toLocaleString()}
-          </div>
-        </div>
-        <button type="button" class="btn-outline btn-xs" onclick="document.getElementById('filePreview_${idx}').classList.toggle('hidden')">
-          <i class="fa-regular fa-eye"></i> Inspect Content
-        </button>
-      </div>
-      <pre id="filePreview_${idx}" class="tunnel-howto-pre hidden" style="margin-top:12px;max-height:240px;overflow-y:auto;">${escapeHtml(f.preview)}</pre>
-    </div>
-  `
+function setTopbar(crumbs, actions = '') {
+  $('#crumbs').innerHTML = crumbs
+    .map((c, i) =>
+      i === crumbs.length - 1
+        ? `<span class="cur">${c.html || esc(c.label)}</span>`
+        : `<a href="${c.href}">${esc(c.label)}</a><span class="sep">/</span>`
     )
     .join('');
+  $('#topActions').innerHTML = actions;
 }
 
-// 8. System Runtimes View
-function renderPlansView() {
-  const rt = appState.runtimeInfo || {};
-  const allWorkers = Object.values(appState.workers);
-  const totalReqs = allWorkers.reduce((sum, w) => sum + (w.requestsToday ?? w.requests ?? 0), 0);
-  if (el('plansRequestsTodayVal')) {
-    el('plansRequestsTodayVal').textContent = `${totalReqs} Request${totalReqs === 1 ? '' : 's'} made today`;
-  }
-  if (el('plansWorkersCountVal')) {
-    el('plansWorkersCountVal').textContent = `${allWorkers.length} worker${allWorkers.length === 1 ? '' : 's'}`;
-  }
-  const list = el('plansRuntimeKvList');
-  if (!list) return;
-  list.innerHTML = `
-    <div class="kv-row"><dt>Robo Workers Engine</dt><dd>Active</dd></div>
-    <div class="kv-row"><dt>Node.js Engine</dt><dd>${escapeHtml(rt.node || 'v20')}</dd></div>
-    <div class="kv-row"><dt>Python 3 Runtime</dt><dd>${escapeHtml(rt.python || 'Python 3')}</dd></div>
-    <div class="kv-row"><dt>Nginx Reverse Proxy</dt><dd>${escapeHtml(rt.nginx || 'nginx/1.26')}</dd></div>
-    <div class="kv-row"><dt>Cloudflared Connector</dt><dd>${escapeHtml(rt.cloudflared || 'installed')}</dd></div>
-    <div class="kv-row"><dt>Host Architecture</dt><dd>${escapeHtml(rt.platform || 'linux')} / ${escapeHtml(rt.arch || 'x64')}</dd></div>
-  `;
+/* ================================================================== router */
+function parseRoute() {
+  const h = decodeURIComponent(location.hash.replace(/^#/, '')) || '/';
+  const parts = h.split('/').filter(Boolean);
+  if (parts[0] === 'w' && parts[1]) return { page: 'worker', name: parts[1], tab: parts[2] || 'overview' };
+  if (['logs', 'tunnel', 'system'].includes(parts[0])) return { page: parts[0] };
+  return { page: 'workers' };
 }
 
-// ============================================================================
-// Editor Syntax Highlighting, Line Numbers & Instant Local Auto-Save
-// ============================================================================
-function updateEditorHighlightAndLines() {
-  const textarea = el('codeEditor');
-  const hlPre = el('codeHighlight');
-  const lineNumbersEl = el('lineNumbers');
-  if (!textarea) return;
-
-  const worker = getActiveWorkerObj();
-  const activeFile = getActiveFileObj(worker);
-  const lang = (activeFile && activeFile.language) || (worker && worker.language) || 'javascript';
-  const code = textarea.value || '';
-
-  if (hlPre) {
-    const highlighted =
-      typeof window.vscodeHighlight === 'function'
-        ? window.vscodeHighlight(code, lang)
-        : escapeHtml(code);
-    hlPre.innerHTML = highlighted + (code.endsWith('\n') ? ' ' : '');
-  }
-
-  if (lineNumbersEl) {
-    const lines = code.split('\n');
-    let html = '';
-    for (let i = 1; i <= lines.length; i++) {
-      html += `<span class="ln-row">${i}</span>`;
-    }
-    lineNumbersEl.innerHTML = html;
-  }
-
-  // Keep .code-stage and #codeEditor full-height so .code-editor-wrapper is the ONE scroll container
-  if (hlPre) {
-    const stage = textarea.parentElement;
-    const contentHeight = Math.max(
-      hlPre.scrollHeight || 0,
-      lineNumbersEl ? lineNumbersEl.scrollHeight || 0 : 0,
-      240
-    );
-    if (stage) stage.style.minHeight = `${contentHeight}px`;
-    textarea.style.height = `${contentHeight}px`;
-    if (textarea.scrollTop > 0) {
-      const wrapper = stage ? stage.parentElement : null;
-      if (wrapper) wrapper.scrollTop += textarea.scrollTop;
-      textarea.scrollTop = 0;
+let leaving = false;
+async function route() {
+  const next = parseRoute();
+  const ide = S.ide;
+  const leavingIde = ide && !(next.page === 'worker' && next.name === ide.name && next.tab === 'code');
+  if (leavingIde && ide.dirtyCount() > 0 && !leaving) {
+    leaving = true;
+    const ok = await confirmDialog({
+      title: 'Unsaved changes',
+      text: `You have unsaved changes in <b>${esc(ide.name)}</b>. Leave without saving?`,
+      ok: 'Leave',
+      danger: true
+    });
+    leaving = false;
+    if (!ok) {
+      history.replaceState(null, '', `#/w/${enc(ide.name)}/code`);
+      return;
     }
   }
-}
-
-function updateCursorPosition() {
-  const textarea = el('codeEditor');
-  if (!textarea) return;
-  const pos = textarea.selectionStart || 0;
-  const textUpToCursor = textarea.value.slice(0, pos);
-  const lines = textUpToCursor.split('\n');
-  const ln = lines.length;
-  const col = lines[lines.length - 1].length + 1;
-  el('statusCursorBtn').textContent = `Ln ${ln}, Col ${col}`;
-
-  const gutter = el('lineNumbers');
-  if (gutter) {
-    gutter.querySelectorAll('.ln-row.cur').forEach((n) => n.classList.remove('cur'));
-    const curRow = gutter.children[ln - 1];
-    if (curRow) curRow.classList.add('cur');
+  if (leavingIde) {
+    ide.dispose();
+    S.ide = null;
   }
-}
-
-function formatActiveDocument() {
-  const textarea = el('codeEditor');
-  const worker = getActiveWorkerObj();
-  if (!textarea || !worker) return;
-  const activeFile = getActiveFileObj(worker);
-  const lang = (activeFile && activeFile.language) || worker.language;
-
-  let code = textarea.value;
-  if (lang === 'json') {
-    try {
-      code = JSON.stringify(JSON.parse(code), null, worker.spaces || 2) + '\n';
-    } catch (_) {}
-  } else {
-    const unit = worker.indentUsingTabs ? '\t' : ' '.repeat(worker.spaces || 2);
-    code = code
-      .split('\n')
-      .map((line) => line.replace(/[ \t]+$/, '').replace(/^\t+/, (m) => unit.repeat(m.length)))
-      .join('\n');
-  }
-  textarea.value = code;
-  updateEditorHighlightAndLines();
-  scheduleAutoSave();
-  addNotification(`Formatted ${activeFile ? activeFile.name : worker.filename}`);
-}
-
-function runBasicDiagnostics(code, language) {
-  const diagnostics = [];
-  if (language === 'json') {
-    try {
-      JSON.parse(code);
-    } catch (err) {
-      diagnostics.push({ severity: 'error', message: `JSON Syntax: ${err.message}` });
-    }
-  } else if (language === 'javascript' || language === 'typescript') {
-    const openBraces = (code.match(/\{/g) || []).length;
-    const closeBraces = (code.match(/\}/g) || []).length;
-    if (openBraces !== closeBraces) {
-      diagnostics.push({
-        severity: 'warning',
-        message: `Unbalanced curly braces: ${openBraces} '{' vs ${closeBraces} '}'`
-      });
-    }
-  }
-  appState.diagnostics = diagnostics;
-  el('errorCountText').textContent = String(diagnostics.filter((d) => d.severity === 'error').length);
-  el('warnCountText').textContent = String(diagnostics.filter((d) => d.severity === 'warning').length);
-}
-
-function syncEditorBufferToMemory() {
-  const codeEditor = el('codeEditor');
-  if (!codeEditor) return;
-  const boundWorkerName = codeEditor.dataset.workerName || appState.activeWorker;
-  const w = appState.workers[boundWorkerName] || getActiveWorkerObj();
-  if (!w) return;
-  const boundFileName = codeEditor.dataset.fileName || appState.activeFileByWorker[w.name] || w.filename || 'worker.js';
-  if (!boundFileName) return;
-
-  const currentVal = codeEditor.value;
-  if (Array.isArray(w.files)) {
-    const fileEntry = w.files.find((f) => f.name === boundFileName);
-    if (fileEntry) {
-      fileEntry.content = currentVal;
-      fileEntry.sizeBytes = currentVal.length;
-    }
-  }
-  if (boundFileName === (w.filename || 'worker.js') || !w.files || w.files.length <= 1) {
-    w.code = currentVal;
-  }
-}
-
-async function saveActiveWorkerToStorage(options = {}) {
-  if (autoSaveTimer) {
-    clearTimeout(autoSaveTimer);
-    autoSaveTimer = null;
-  }
-  syncEditorBufferToMemory();
-  const worker = getActiveWorkerObj();
-  if (!worker) return false;
-  const activeFile = getActiveFileObj(worker);
-  const currentFileName = (activeFile && activeFile.name) || worker.filename || 'worker.js';
-  const isEntrypoint = currentFileName === (worker.filename || 'worker.js') || !worker.files || worker.files.length <= 1;
-  const liveEditorVal =
-    options.code !== undefined ? options.code : el('codeEditor') ? el('codeEditor').value : worker.code || '';
-  const prevFilesSnapshot = Array.isArray(worker.files) ? worker.files.map((f) => ({ ...f })) : [];
-
-  const pill = el('autosavePill');
-  const pillText = el('autosaveText');
-  if (pillText) pillText.textContent = 'Saving...';
-  if (pill) pill.classList.add('saving');
-
-  const isMetadataChange =
-    options.language !== undefined ||
-    options.spaces !== undefined ||
-    options.indentUsingTabs !== undefined ||
-    options.encoding !== undefined ||
-    options.eol !== undefined ||
-    options.layout !== undefined ||
-    options.bindings !== undefined ||
-    options.useLanguageTemplate;
-
+  stopPollers();
+  S.route = next;
+  closeNav();
+  const view = $('#view');
+  view.className = '';
+  renderSide();
+  if (!S.overview) loadOverview().catch(() => {});
   try {
-    if (!isMetadataChange && !isEntrypoint) {
-      // Save directly to the selected non-entrypoint file in the Explorer
-      const res = await fetch(`/api/workers/${encodeURIComponent(worker.name)}/files`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          filename: currentFileName,
-          content: liveEditorVal,
-          eol: worker.eol || 'LF',
-          deploy: Boolean(options.deploy),
-          deploySource: options.deploySource || `Saved ${currentFileName}`
-        })
+    if (next.page === 'workers') await viewWorkers(view);
+    else if (next.page === 'worker') await viewWorker(view, next.name, next.tab);
+    else if (next.page === 'logs') await viewLogs(view);
+    else if (next.page === 'tunnel') await viewTunnel(view);
+    else if (next.page === 'system') await viewSystem(view);
+  } catch (err) {
+    view.innerHTML = `<div class="page"><div class="empty" style="padding-top:12vh"><h4>That didn't load</h4><p>${esc(err.message)}</p><button class="btn" onclick="route()">Try again</button></div></div>`;
+  }
+}
+
+/* =========================================================== workers page */
+function pageSkeleton(view) {
+  view.innerHTML = `<div class="page"><div class="skel" style="height:28px;width:220px;margin-bottom:22px"></div><div class="stats">${'<div class="skel" style="height:92px"></div>'.repeat(5)}</div><div class="workers">${'<div class="skel" style="height:196px"></div>'.repeat(3)}</div></div>`;
+}
+
+async function viewWorkers(view) {
+  setTopbar([{ label: 'Workers' }], `<button class="btn primary" id="newWorkerTop">New worker</button>`);
+  $('#newWorkerTop').onclick = () => newWorkerDialog();
+  if (!S.overview) pageSkeleton(view);
+  await loadOverview();
+  const sortBy = store.get('ax-sort', 'activity');
+  view.innerHTML = `<div class="page">
+    <div class="page-head">
+      <div><h1 class="page-title">Workers</h1><p class="page-sub">Small programs running on ${esc(S.overview.system.hostname || 'this box')}. Save in the editor and they're live.</p></div>
+    </div>
+    <div class="figures" id="stats"></div>
+    <div class="toolbar">
+      <div class="search">${icon('search')}<input class="input" id="wSearch" placeholder="Filter workers…" aria-label="Filter workers" value="${esc(store.get('ax-filter', ''))}"></div>
+      <select class="select" id="wSort" style="width:auto" aria-label="Sort workers">
+        <option value="activity" ${sortBy === 'activity' ? 'selected' : ''}>Most active today</option>
+        <option value="updated" ${sortBy === 'updated' ? 'selected' : ''}>Recently edited</option>
+        <option value="name" ${sortBy === 'name' ? 'selected' : ''}>Name</option>
+      </select>
+    </div>
+    <div class="workers" id="wGrid"></div>
+  </div>`;
+  const paint = () => {
+    renderStats();
+    renderWorkerGrid();
+  };
+  $('#wSearch').addEventListener('input', (e) => {
+    store.set('ax-filter', e.target.value);
+    renderWorkerGrid();
+  });
+  $('#wSort').addEventListener('change', (e) => {
+    store.set('ax-sort', e.target.value);
+    renderWorkerGrid();
+  });
+  paint();
+  poll(async () => {
+    try {
+      await loadOverview();
+      if (S.route.page === 'workers') paint();
+    } catch (_) {}
+  }, 5000);
+}
+
+function renderStats() {
+  const o = S.overview;
+  const sys = o.system;
+  const merged = mergeHourly(o.workers);
+  const todayMs = o.workers.reduce((acc, w) => {
+    const d = w.daily && w.daily[new Date().toISOString().slice(0, 10)];
+    if (d) {
+      acc.ms += d.totalMs;
+      acc.n += d.requests;
+    }
+    return acc;
+  }, { ms: 0, n: 0 });
+  const memPct = sys.memoryTotalMb ? Math.round((sys.memoryUsedMb / sys.memoryTotalMb) * 100) : 0;
+  const errRate = o.totals.requestsToday ? ((o.totals.errorsToday / o.totals.requestsToday) * 100).toFixed(1) : '0';
+  const lastHour = merged[new Date().toISOString().slice(0, 13)];
+  const temp = sys.cpuTempC !== null && sys.cpuTempC !== undefined;
+  $('#stats').innerHTML = `
+    <div class="fig"><div class="k">Workers</div><div class="v">${num(o.totals.workers)}</div><div class="f">${o.defaultWorker ? `${esc(o.defaultWorker)} is the default` : 'No default worker'}</div></div>
+    <div class="fig"><div class="k">Requests today</div><div class="v">${num(o.totals.requestsToday)}</div><div class="f">${lastHour ? `${num(lastHour.requests)} in the last hour` : 'Quiet this hour'}</div></div>
+    <div class="fig"><div class="k">Errors today</div><div class="v ${o.totals.errorsToday ? 'err' : ''}">${num(o.totals.errorsToday)}<small>${errRate}%</small></div><div class="f">Responses over 500</div></div>
+    <div class="fig"><div class="k">Typical response</div><div class="v">${todayMs.n ? esc(ms(todayMs.ms / todayMs.n)) : '—'}</div><div class="f">Average across today</div></div>
+    <div class="fig"><div class="k">${esc(sys.hostname || 'Host')}</div><div class="v">${temp ? `${sys.cpuTempC}<small>°C</small>` : `${(sys.loadAvg || [0])[0]}<small>load</small>`}</div><div class="f">Memory ${memPct}% · load ${(sys.loadAvg || [0])[0]}</div><div class="meter"><i style="width:${memPct}%"></i></div></div>`;
+}
+
+function renderWorkerGrid() {
+  const q = ($('#wSearch')?.value || '').trim().toLowerCase();
+  const sortBy = $('#wSort')?.value || 'activity';
+  let ws = workersList().filter((w) => !q || `${w.name} ${w.language} ${w.publishingLink}`.toLowerCase().includes(q));
+  ws.sort((a, b) =>
+    sortBy === 'name'
+      ? a.name.localeCompare(b.name)
+      : sortBy === 'updated'
+      ? new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0)
+      : b.requestsToday - a.requestsToday || new Date(b.lastRunAt || 0) - new Date(a.lastRunAt || 0)
+  );
+  const def = S.overview.defaultWorker;
+  const cards = ws
+    .map((w) => {
+      const status = w.activeIssues
+        ? `<span class="tag err"><span class="d"></span>${plural(w.activeIssues, 'issue')}</span>`
+        : w.productionUrlEnabled === false
+        ? `<span class="tag warn"><span class="d"></span>Off</span>`
+        : `<span class="tag ok"><span class="d"></span>Live</span>`;
+      return `<a class="card wcard" href="#/w/${enc(w.name)}">
+        <div class="wcard-top">${langIcon(w.language)}
+          <div style="min-width:0"><div class="wname">${esc(w.name)}${def === w.name ? `<span class="def" title="Answers every path no other worker claims">default</span>` : ''}</div><div class="wlink">${esc(w.publishingPath)}</div></div>
+          ${status}
+        </div>
+        ${sparkStrip(w.hourly)}
+        <div class="wnums">
+          <div><b>${num(w.requestsToday)}</b>today</div>
+          <div><b class="${w.errorsToday ? 'err' : ''}">${num(w.errorsToday)}</b>errors</div>
+          <div><b>${esc(ms(w.lastDurationMs))}</b>last run</div>
+        </div>
+        <div class="wfoot">
+          <span>${esc(langName(w.language))} · ${plural(w.fileCount, 'file')} · edited ${esc(ago(w.updatedAt))}</span>
+          <span class="acts">
+            <button class="icon-btn sm" title="Edit code" data-act="code" data-w="${esc(w.name)}">${icon('code')}</button>
+            <button class="icon-btn sm" title="Open ${esc(w.publishingPath)}" data-act="open" data-w="${esc(w.name)}">${icon('external')}</button>
+          </span>
+        </div>
+      </a>`;
+    })
+    .join('');
+  const grid = $('#wGrid');
+  if (!grid) return;
+  grid.innerHTML =
+    cards +
+    `<button class="new-card" id="newCard" type="button"><b>New worker</b><span class="hint">JavaScript, TypeScript, Python, Shell or a page</span></button>`;
+  if (!ws.length && q) grid.insertAdjacentHTML('afterbegin', `<div class="empty" style="grid-column:1/-1"><h4>Nothing matches “${esc(q)}”</h4></div>`);
+  $('#newCard').onclick = () => newWorkerDialog();
+  grid.onclick = (e) => {
+    const b = e.target.closest('[data-act]');
+    if (!b) return;
+    e.preventDefault();
+    const w = findWorker(b.dataset.w);
+    if (b.dataset.act === 'code') location.hash = `#/w/${enc(b.dataset.w)}/code`;
+    if (b.dataset.act === 'open' && w) window.open(w.publishingPath, '_blank', 'noopener');
+  };
+}
+
+/* ============================================================ new worker */
+function newWorkerDialog() {
+  let chosen = 'javascript';
+  modal({
+    title: 'New worker',
+    body: `<div class="field"><label for="nwName">Name</label><input id="nwName" class="input mono" placeholder="my-worker" autocomplete="off" autofocus maxlength="64">
+      <span class="hint" id="nwHint">Letters, numbers, dots, dashes. It'll answer at <b class="mono">/<span id="nwPath">my-worker</span></b></span></div>
+      <div class="field"><span class="label">Start from</span><div class="tpl-grid" id="nwTpl">${TEMPLATES.map(
+        (t) => `<button type="button" class="tpl ${t.id === chosen ? 'on' : ''}" data-t="${t.id}">${langIcon(t.id, 'sm')}<b>${esc(t.name)}</b><span>${esc(t.desc)}</span></button>`
+      ).join('')}</div></div>`,
+    foot: `<button class="btn ghost" data-close>Cancel</button><button class="btn primary" id="nwGo">Create worker</button>`,
+    onMount(ov, close) {
+      const name = $('#nwName', ov);
+      const clean = (v) => v.trim().replace(/[^a-zA-Z0-9._-]/g, '-').replace(/^[-.]+|-+$/g, '').slice(0, 64);
+      name.addEventListener('input', () => {
+        const c = clean(name.value);
+        $('#nwPath', ov).textContent = c || 'my-worker';
+        const taken = findWorker(c);
+        $('#nwHint', ov).style.color = taken ? 'var(--err)' : '';
+        if (taken) $('#nwHint', ov).textContent = `"${c}" already exists`;
+        else $('#nwHint', ov).innerHTML = `Letters, numbers, dots, dashes. It'll answer at <b class="mono">/${esc(c || 'my-worker')}</b>`;
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      if (data.ok && data.worker) {
-        hasUnsavedEditorChanges = false;
-        if (!Array.isArray(data.worker.files) || data.worker.files.length === 0) {
-          data.worker.files = prevFilesSnapshot;
+      $('#nwTpl', ov).addEventListener('click', (e) => {
+        const b = e.target.closest('.tpl');
+        if (!b) return;
+        chosen = b.dataset.t;
+        $$('.tpl', ov).forEach((x) => x.classList.toggle('on', x === b));
+      });
+      const go = async () => {
+        const n = clean(name.value);
+        if (!n) return name.focus();
+        $('#nwGo', ov).disabled = true;
+        const r = await attempt(() => api('POST', '/api/workers', { name: n, language: chosen }));
+        $('#nwGo', ov).disabled = false;
+        if (!r) return;
+        close();
+        toast(`Created ${n}`);
+        await loadOverview();
+        location.hash = `#/w/${enc(n)}/code`;
+      };
+      $('#nwGo', ov).onclick = go;
+      name.addEventListener('keydown', (e) => e.key === 'Enter' && go());
+    }
+  });
+}
+
+/* ============================================================ worker page */
+const WTABS = [
+  { id: 'overview', label: 'Overview' },
+  { id: 'code', label: 'Code' },
+  { id: 'logs', label: 'Logs' },
+  { id: 'deployments', label: 'Versions' },
+  { id: 'settings', label: 'Settings' }
+];
+
+async function viewWorker(view, name, tab) {
+  if (!WTABS.some((t) => t.id === tab)) tab = 'overview';
+  const data = await api('GET', `/api/workers/${enc(name)}`).catch((err) => {
+    if (/not found/i.test(err.message)) {
+      view.innerHTML = `<div class="page"><div class="empty" style="padding-top:12vh"><h4>No worker called “${esc(name)}”</h4><p>It may have been renamed or deleted.</p><a class="btn" href="#/">Back to workers</a></div></div>`;
+      setTopbar([{ label: 'Workers', href: '#/' }, { label: name }]);
+      return null;
+    }
+    throw err;
+  });
+  if (!data) return;
+  if (!S.overview) loadOverview().catch(() => {});
+  const w = data.worker;
+  setTopbar(
+    [{ label: 'Workers', href: '#/' }, { html: `<span class="row" style="gap:8px">${langIcon(w.language, 'sm')}${esc(w.name)}</span>` }],
+    `<a class="btn ghost" href="${esc(w.summary.publishingPath)}" target="_blank" rel="noopener">Visit ${icon('external')}</a>
+     ${tab !== 'code' ? `<a class="btn primary" href="#/w/${enc(w.name)}/code">Edit code</a>` : ''}`
+  );
+  const tabsHtml = `<div class="tabs" role="tablist" data-seg="wtabs">${WTABS.map(
+    (t) =>
+      `<a class="tab ${t.id === tab ? 'active' : ''}" role="tab" aria-selected="${t.id === tab}" href="#/w/${enc(w.name)}/${t.id}">${t.label}${
+        t.id === 'deployments' && w.deployments.length ? `<span class="n">${w.deployments.length}</span>` : ''
+      }${t.id === 'overview' && w.summary.activeIssues ? `<span class="n err">${w.summary.activeIssues}</span>` : ''}</a>`
+  ).join('')}</div>`;
+  const head = `<div class="page-head" style="margin-bottom:18px"><div style="min-width:0"><h1 class="page-title">${esc(w.name)}</h1>
+    <p class="page-sub"><span class="mono">${esc(w.summary.publishingPath)}</span> · ${esc(langName(w.language))} · ${esc(RUNTIME_OF(w.language))} · edited ${esc(ago(w.updatedAt))}</p></div></div>`;
+
+  if (tab === 'code') {
+    view.className = '';
+    view.innerHTML = `<div class="ide-wrap"><div class="ide-top">${tabsHtml}<span class="grow"></span><span id="ideBar" class="row"></span></div><div id="ideRoot"></div></div>`;
+    slideInd($('.tabs', view));
+    await mountIde($('#ideRoot'), w);
+    return;
+  }
+  view.innerHTML = `<div class="page">${head}<div style="margin-bottom:26px">${tabsHtml}</div><div id="tabBody"></div></div>`;
+  slideInd($('.tabs', view));
+  const body = $('#tabBody');
+  if (tab === 'overview') renderWorkerOverview(body, w);
+  if (tab === 'logs') renderWorkerLogs(body, w);
+  if (tab === 'deployments') renderDeployments(body, w);
+  if (tab === 'settings') renderSettings(body, w);
+}
+
+/* ---------------------------------------------------------------- overview */
+function statusClass(s) {
+  return `s${String(s || 0)[0]}`;
+}
+function renderWorkerOverview(body, w) {
+  const paint = (w) => {
+    const sm = w.summary;
+    const inv = (w.invocations || []).slice().reverse();
+    const statusCounts = inv.reduce((acc, i) => {
+      const k = `${String(i.status)[0]}xx`;
+      acc[k] = (acc[k] || 0) + 1;
+      return acc;
+    }, {});
+    const durations = inv.map((i) => i.durationMs).filter((v) => typeof v === 'number').sort((a, b) => a - b);
+    const pct = (p) => (durations.length ? durations[Math.min(durations.length - 1, Math.floor((p / 100) * durations.length))] : null);
+    const issues = (w.issues || []).filter((i) => i.status === 'active');
+    const links = [sm.publishingPath, ...(w.customRoutes || []).map((r) => r.path || r.pattern)];
+    body.innerHTML = `
+      <div class="figures four">
+        <div class="fig"><div class="k">Requests today</div><div class="v">${num(sm.requestsToday)}</div><div class="f">${num(sm.requests)} all time</div></div>
+        <div class="fig"><div class="k">Errors today</div><div class="v ${sm.errorsToday ? 'err' : ''}">${num(sm.errorsToday)}</div><div class="f">${num(w.errors || 0)} all time</div></div>
+        <div class="fig"><div class="k">Response time</div><div class="v">${esc(ms(pct(50)))}<small>median</small></div><div class="f">95th percentile ${esc(ms(pct(95)))}</div></div>
+        <div class="fig"><div class="k">Last request</div><div class="v">${esc(ago(sm.lastRunAt))}</div><div class="f">${bytes(sm.totalBytesServed)} served so far</div></div>
+      </div>
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-head"><h3>Last 24 hours</h3><div class="tools legend"><span><i style="background:var(--chart)"></i>requests</span><span><i style="background:var(--err)"></i>errors</span><span><i style="background:var(--chart-2);height:2px"></i>average response</span></div></div>
+        <div class="card-body">${hourChart(w.hourly)}</div>
+      </div>
+      ${
+        issues.length
+          ? `<div class="card" style="margin-bottom:16px">
+        <div class="card-head"><h3 style="color:var(--err)">${plural(issues.length, 'active issue')}</h3><span class="sub">Repeated errors are grouped</span></div>
+        ${issues
+          .map(
+            (i) => `<div class="set-row"><div style="min-width:0"><h4 class="mono" style="font-size:12.5px;overflow-wrap:anywhere">${esc(i.title)}</h4><p>${plural(i.occurrences || 1, 'time')} · first ${esc(ago(i.firstSeen))} · last ${esc(ago(i.lastSeen))}${i.filename ? ` · ${esc(i.filename)}` : ''}</p></div>
+            <div class="row"><button class="btn sm" data-issue-view="${esc(i.id)}">Details</button><button class="btn sm" data-resolve="${esc(i.id)}">${icon('check')} Resolve</button></div></div>`
+          )
+          .join('')}
+      </div>`
+          : ''
+      }
+      <div class="grid2" style="margin-bottom:16px">
+        <div class="card">
+          <div class="card-head"><h3>Where it answers</h3><a class="tools btn sm ghost" href="#/w/${enc(w.name)}/settings">${icon('edit')} Edit</a></div>
+          <div class="card-body stack" style="gap:8px">
+            ${links
+              .map((l) => {
+                const full = /^https?:/i.test(l) ? l : `${location.origin}${l}`;
+                return `<div class="copy-line"><span>${esc(full)}</span><button class="icon-btn sm" data-copy="${esc(full)}" title="Copy">${icon('copy')}</button><a class="icon-btn sm" href="${esc(l)}" target="_blank" rel="noopener" title="Open">${icon('external')}</a></div>`;
+              })
+              .join('')}
+            ${w.isDefault ? `<p class="hint" style="margin:4px 0 0">This is the default worker, so it also answers any path no other worker claims.</p>` : ''}
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>Status codes</h3><span class="sub">last ${inv.length} requests</span></div>
+          <div class="card-body">${
+            inv.length
+              ? ['2xx', '3xx', '4xx', '5xx']
+                  .map((k) => {
+                    const n = statusCounts[k] || 0;
+                    const p = Math.round((n / inv.length) * 100);
+                    const col = { '2xx': 'var(--ok)', '3xx': 'var(--chart)', '4xx': 'var(--warn)', '5xx': 'var(--err)' }[k];
+                    return `<div style="display:grid;grid-template-columns:38px 1fr 54px;gap:10px;align-items:center;margin:6px 0;font-size:12.5px"><span class="mono">${k}</span><div class="meter" style="margin:0;height:7px"><i style="width:${p}%;background:${col}"></i></div><span class="mono" style="text-align:right;color:var(--muted)">${num(n)}</span></div>`;
+                  })
+                  .join('')
+              : `<div class="hint">No requests yet. Open it, or send one from the Code tab.</div>`
+          }</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Recent requests</h3><span class="live">live</span><a class="tools btn sm ghost" href="#/w/${enc(w.name)}/logs">All logs</a></div>
+        ${
+          inv.length
+            ? `<div class="table-scroll"><table class="table"><thead><tr><th>Time</th><th>Request</th><th>Status</th><th class="num">Duration</th><th class="num">Size</th><th>Client</th></tr></thead><tbody>${inv
+                .slice(0, 15)
+                .map(
+                  (i) => `<tr><td class="mono" style="color:var(--muted)" title="${esc(i.timestamp)}">${esc(clock(i.timestamp))}</td><td class="mono" style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><b style="font-weight:600">${esc(i.method)}</b> ${esc(i.path)}</td><td><span class="status ${statusClass(i.status)}">${esc(i.status)}</span></td><td class="num">${esc(ms(i.durationMs))}</td><td class="num">${bytes(i.responseBytes)}</td><td style="color:var(--muted);font-size:12.5px;white-space:nowrap">${esc(i.clientIp)} · ${esc(i.browser)}</td></tr>`
+                )
+                .join('')}</tbody></table></div>`
+            : `<div class="empty"><h4>No requests yet</h4><p>They'll appear here as they happen.</p></div>`
         }
-        appState.workers[data.worker.name] = data.worker;
-        renderAll();
-        if (pillText) pillText.textContent = options.deploy ? 'Deployed to storage' : 'Saved to storage';
-        if (pill) pill.classList.remove('saving');
-        return true;
-      }
-      return false;
+      </div>`;
+  };
+  paint(w);
+  body.onclick = async (e) => {
+    const c = e.target.closest('[data-copy]');
+    if (c) return copy(c.dataset.copy);
+    const r = e.target.closest('[data-resolve]');
+    if (r) {
+      await attempt(() => api('POST', `/api/workers/${enc(w.name)}/issues`, { resolveIssueId: r.dataset.resolve }), 'Issue resolved');
+      return refresh();
     }
-
-    const payload = {
-      code: isEntrypoint ? liveEditorVal : worker.code,
-      targetFilename: currentFileName,
-      targetFileContent: liveEditorVal,
-      files: prevFilesSnapshot,
-      language: options.language || worker.language,
-      spaces: options.spaces !== undefined ? options.spaces : worker.spaces,
-      indentUsingTabs:
-        options.indentUsingTabs !== undefined ? options.indentUsingTabs : worker.indentUsingTabs,
-      encoding: options.encoding || worker.encoding,
-      eol: options.eol || worker.eol,
-      layout: options.layout || worker.layout,
-      bindings: options.bindings || worker.bindings,
-      deploy: Boolean(options.deploy),
-      deploySource: options.deploySource,
-      useLanguageTemplate: Boolean(options.useLanguageTemplate)
-    };
-
-    const res = await fetch(`/api/workers/${encodeURIComponent(worker.name)}`, {
-      method: 'PUT',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    if (data.ok && data.worker) {
-      hasUnsavedEditorChanges = false;
-      if (!Array.isArray(data.worker.files) || data.worker.files.length === 0) {
-        data.worker.files = prevFilesSnapshot;
-      }
-      appState.workers[data.worker.name] = data.worker;
-      if (options.useLanguageTemplate) {
-        const updatedFileObj = getActiveFileObj(data.worker);
-        el('codeEditor').value = updatedFileObj ? updatedFileObj.content : data.worker.code;
-        el('codeEditor').dataset.workerLang = updatedFileObj?.language || data.worker.language;
-        el('codeEditor').dataset.fileName = updatedFileObj ? updatedFileObj.name : data.worker.filename;
-      }
-      renderAll();
-      if (pillText) pillText.textContent = options.deploy ? 'Deployed to storage' : 'Saved to storage';
-      if (pill) pill.classList.remove('saving');
-      return true;
-    }
-    return false;
-  } catch (err) {
-    if (pillText) pillText.textContent = 'Save error';
-    return false;
-  }
-}
-
-function scheduleAutoSave() {
-  hasUnsavedEditorChanges = true;
-  syncEditorBufferToMemory();
-  const pill = el('autosavePill');
-  const pillText = el('autosaveText');
-  if (pillText) pillText.textContent = 'Unsaved changes...';
-  if (pill) pill.classList.add('saving');
-  if (autoSaveTimer) clearTimeout(autoSaveTimer);
-  autoSaveTimer = setTimeout(() => {
-    saveActiveWorkerToStorage({ deploy: false });
-  }, 300);
-}
-
-// ============================================================================
-// HTTP Runner & Live Preview Execution (Pulls Code from Storage on Run)
-// ============================================================================
-function getTargetPreviewUrlPath() {
-  const worker = getActiveWorkerObj();
-  if (!worker) return '/';
-  const primaryPath = getWorkerPrimaryPublishingPath(worker);
-  const badge = el('previewUrlBadge');
-  if (badge && badge.dataset.userEditedWorker === worker.name && badge.value.trim()) {
-    let raw = badge.value.trim();
-    if (raw.startsWith(window.location.origin)) {
-      raw = raw.slice(window.location.origin.length) || '/';
-    } else if (/^https?:\/\//i.test(raw)) {
-      try {
-        const u = new URL(raw);
-        raw = u.pathname + u.search;
-      } catch (_) {}
-    }
-    if (!raw.startsWith('/')) raw = `/${raw}`;
-    return raw;
-  }
-  return primaryPath;
-}
-
-function updatePreviewPaneOutput() {
-  const worker = getActiveWorkerObj();
-  const iframe = el('previewIframe');
-  if (!iframe || !worker) return;
-
-  // Copy the exact /<worker> link logic from qeWorkersDevLink
-  const primaryLink = getWorkerPrimaryPublishingLink(worker);
-  const primaryPath = getWorkerPrimaryPublishingPath(worker);
-  if (el('qeWorkersDevLink')) {
-    el('qeWorkersDevLink').href = primaryPath;
-    if (el('qeWorkersDevLinkText')) el('qeWorkersDevLinkText').textContent = primaryLink;
-  }
-
-  const badge = el('previewUrlBadge');
-  let targetUrl = el('qeWorkersDevLink') ? el('qeWorkersDevLink').href : `${window.location.origin}${primaryPath}`;
-  if (badge && badge.dataset.userEditedWorker === worker.name && badge.value.trim()) {
-    const raw = badge.value.trim();
-    if (/^https?:\/\//i.test(raw)) {
-      targetUrl = raw;
-    } else {
-      targetUrl = `${window.location.origin}${raw.startsWith('/') ? raw : '/' + raw}`;
-    }
-  } else if (badge) {
-    badge.value = targetUrl;
-  }
-
-  if (el('previewExternalLink')) {
-    el('previewExternalLink').href = targetUrl;
-  }
-
-  let currentIframeHref = '';
-  try {
-    currentIframeHref =
-      iframe.contentWindow && iframe.contentWindow.location ? iframe.contentWindow.location.href : '';
-  } catch (_) {}
-
-  if (currentIframeHref && currentIframeHref !== 'about:blank' && currentIframeHref === targetUrl) {
-    try {
-      iframe.contentWindow.location.reload();
-      return;
-    } catch (_) {}
-  }
-
-  iframe.dataset.loadedUrl = targetUrl;
-  iframe.src = targetUrl;
-}
-
-async function executeCurrentWorkerHttpRequest(opts = {}) {
-  const worker = getActiveWorkerObj();
-  if (!worker) return;
-
-  if (autoSaveTimer) {
-    clearTimeout(autoSaveTimer);
-    autoSaveTimer = null;
-  }
-  if (!opts.skipSave) {
-    await saveActiveWorkerToStorage({ deploy: false });
-  }
-
-  const rawMethod = el('httpMethodSelect').value || 'GET';
-  const method = rawMethod === 'QUERY' ? 'POST' : rawMethod;
-  let urlPath = el('httpUrlInput').value.trim() || `/${worker.name}`;
-  if (!urlPath.startsWith('/')) urlPath = `/${urlPath}`;
-
-  const headers = {};
-  for (const h of appState.customHeaders) {
-    if (h.key && h.key.trim()) {
-      headers[h.key.trim()] = h.value || '';
-    }
-  }
-
-  const fetchOpts = { method, headers };
-  if (['POST', 'PUT', 'PATCH', 'QUERY'].includes(rawMethod)) {
-    const bodyText = el('httpRequestBody').value;
-    if (bodyText) fetchOpts.body = bodyText;
-  }
-
-  el('httpResponseOutput').textContent = `Pulling ${worker.filename} from storage and running...`;
-  const t0 = performance.now();
-
-  try {
-    const resp = await fetch(urlPath, fetchOpts);
-    const elapsed = Math.max(1, Math.round(performance.now() - t0));
-    const contentType = resp.headers.get('content-type') || 'text/plain';
-    const rawText = await resp.text();
-
-    appState.lastHttpRawResponse = rawText;
-    appState.lastHttpContentType = contentType;
-    appState.lastHttpStatus = resp.status;
-    appState.lastHttpDurationMs = elapsed;
-
-    const metaBar = el('httpResponseMeta');
-    metaBar.classList.remove('hidden');
-    const statusPill = el('httpStatusPill');
-    statusPill.innerHTML = `<i class="fa-solid fa-circle" style="font-size:8px;margin-right:4px;"></i> ${resp.status}`;
-    statusPill.className = `status-pill ${resp.status >= 400 ? 'error' : ''}`;
-    el('httpDurationText').textContent = `${elapsed} ms`;
-    el('httpContentTypeText').textContent = contentType.split(';')[0];
-    el('openRawEndpointLink').href = urlPath;
-    el('openRawEndpointLink').innerHTML = `Open ${escapeHtml(urlPath)} <i class="fa-solid fa-arrow-up-right-from-square"></i>`;
-
-    // Render full HTTP Response Headers list (matching Screenshots 11 & 12)
-    const headersBar = el('httpResponseHeadersBar');
-    if (headersBar) {
-      headersBar.classList.remove('hidden');
-      const headerEntries = [];
-      resp.headers.forEach((val, key) => {
-        headerEntries.push([key, val]);
-      });
-      headersBar.innerHTML = headerEntries
-        .map(
-          ([k, v]) =>
-            `<div class="http-resp-header-line"><strong>${escapeHtml(k)}:</strong> ${escapeHtml(v)}</div>`
-        )
-        .join('');
-    }
-
-    const ctLower = contentType.toLowerCase();
-    let formatted = rawText;
-    let highlightLang = '';
-    if (ctLower.includes('application/json')) {
-      try {
-        formatted = JSON.stringify(JSON.parse(rawText), null, 2);
-        highlightLang = 'json';
-      } catch (_) {}
-    } else if (ctLower.includes('text/html')) {
-      highlightLang = 'html';
-    } else if (ctLower.includes('xml') || ctLower.includes('svg')) {
-      highlightLang = 'xml';
-    } else if (ctLower.includes('text/css')) {
-      highlightLang = 'css';
-    } else if (ctLower.includes('yaml')) {
-      highlightLang = 'yaml';
-    } else if (ctLower.includes('markdown')) {
-      highlightLang = 'markdown';
-    } else if (ctLower.includes('javascript')) {
-      highlightLang = 'javascript';
-    }
-
-    if (highlightLang && typeof window.vscodeHighlight === 'function') {
-      el('httpResponseOutput').innerHTML = window.vscodeHighlight(formatted, highlightLang);
-    } else {
-      el('httpResponseOutput').textContent = formatted;
-    }
-
-    updatePreviewPaneOutput();
-    await fetchAppState();
-  } catch (err) {
-    el('httpResponseOutput').textContent = `Request failed: ${err.message}`;
-  }
-}
-
-// ============================================================================
-// Interactive VS Code Status Bar Pickers (with 72 Language SVG Icons!)
-// ============================================================================
-function openCommandPalette({ title, placeholder, showSearch = true, items, onSelect }) {
-  const overlay = el('paletteOverlay');
-  const titleEl = el('paletteTitle');
-  const searchWrap = el('paletteSearchWrap');
-  const searchInput = el('paletteSearchInput');
-  const listEl = el('paletteList');
-
-  titleEl.textContent = title;
-  searchWrap.classList.toggle('hidden', !showSearch);
-  searchInput.value = '';
-  searchInput.placeholder = placeholder || 'Type to filter...';
-  overlay.classList.remove('hidden');
-
-  function renderItems(filterText = '') {
-    const q = filterText.trim().toLowerCase();
-    const filtered = items.filter(
-      (item) =>
-        !q ||
-        item.label.toLowerCase().includes(q) ||
-        (item.meta && item.meta.toLowerCase().includes(q)) ||
-        (item.id && item.id.toLowerCase().includes(q))
-    );
-
-    if (filtered.length === 0) {
-      listEl.innerHTML = `<div style="padding:14px;color:#64748b;font-size:13px;">No matching results</div>`;
-      return;
-    }
-
-    listEl.innerHTML = filtered
-      .map(
-        (item, idx) => `
-      <button type="button" class="palette-option ${item.active ? 'selected' : ''}" data-idx="${idx}">
-        <span class="palette-option-left">
-          ${item.iconHtml ? item.iconHtml : ''}
-          <span>${escapeHtml(item.label)}</span>
-        </span>
-        <span class="palette-meta">${escapeHtml(item.meta || '')}</span>
-      </button>
-    `
-      )
-      .join('');
-
-    listEl.querySelectorAll('.palette-option').forEach((btn, i) => {
-      btn.addEventListener('click', () => {
-        overlay.classList.add('hidden');
-        onSelect(filtered[i]);
-      });
-    });
-  }
-
-  renderItems('');
-  searchInput.oninput = () => renderItems(searchInput.value);
-  searchInput.onkeydown = (e) => {
-    if (e.key === 'Escape') {
-      overlay.classList.add('hidden');
-    } else if (e.key === 'Enter') {
-      const firstBtn = listEl.querySelector('.palette-option');
-      if (firstBtn) firstBtn.click();
+    const iv = e.target.closest('[data-issue-view]');
+    if (iv) {
+      const iss = (w.issues || []).find((i) => i.id === iv.dataset.issueView);
+      if (iss) modal({ title: 'Issue details', wide: true, body: `<pre class="code-view">${esc(iss.message)}</pre>` });
     }
   };
-  if (showSearch) {
-    setTimeout(() => searchInput.focus(), 20);
-  }
+  const refresh = async () => {
+    try {
+      const d = await api('GET', `/api/workers/${enc(w.name)}`);
+      w = d.worker;
+      if (S.route.page === 'worker' && S.route.tab === 'overview') paint(w);
+    } catch (_) {}
+  };
+  poll(refresh, 4000);
 }
 
-function openLanguageModePicker() {
-  const worker = getActiveWorkerObj();
-  if (!worker) return;
+/* -------------------------------------------------------------------- logs */
+function logLineHtml(entry, fresh, workerName) {
+  if (entry._req) {
+    const i = entry;
+    return `<div class="logline ${fresh ? 'new' : ''}" data-lv="req"><span class="t">${esc(clock(i.timestamp))}</span><span class="lv req">${esc(i.method)}</span><span class="m">${workerName ? `<span class="w">${esc(workerName)}</span>` : ''}<span class="status ${statusClass(i.status)}">${esc(i.status)}</span> ${esc(i.path)} · ${esc(ms(i.durationMs))} · ${bytes(i.responseBytes)} · ${esc(i.clientIp)}</span></div>`;
+  }
+  const lv = String(entry.level || 'log').toLowerCase();
+  return `<div class="logline ${fresh ? 'new' : ''}" data-lv="${esc(lv)}"><span class="t">${esc(clock(entry.timestamp))}</span><span class="lv ${esc(lv)}">${esc(lv)}</span><span class="m">${workerName ? `<span class="w">${esc(workerName)}</span>` : ''}${esc(entry.message)}</span></div>`;
+}
 
-  // All 72 languages from vscode.html with their embedded SVG logos!
-  const vscodeLangList = window.VSCODE_LANGS || [
-    ['JavaScript', 'javascript'],
-    ['TypeScript', 'typescript'],
-    ['Python', 'python'],
-    ['Shell Script', 'shellscript'],
-    ['JSON', 'json'],
-    ['HTML', 'html'],
-    ['CSS', 'css'],
-    ['Go', 'go'],
-    ['Rust', 'rust'],
-    ['C', 'c'],
-    ['C++', 'cpp'],
-    ['PHP', 'php'],
-    ['Ruby', 'ruby'],
-    ['Lua', 'lua'],
-    ['SQL', 'sql'],
-    ['YAML', 'yaml'],
-    ['Markdown', 'markdown'],
-    ['Plain Text', 'plaintext']
-  ];
+// Live tail of one or more workers: merges logs and requests by timestamp.
+function createTail({ box, workers, filter, onCount, showWorker = false, max = 800 }) {
+  const since = {};
+  let entries = [];
+  let paused = false;
+  let first = true;
+  const render = (freshIds = new Set()) => {
+    const f = filter();
+    const shown = entries.filter((e) => {
+      const lv = e._req ? 'req' : String(e.level || 'log').toLowerCase();
+      if (!f.levels.has(lv === 'log' ? 'info' : lv)) return false;
+      if (f.q) {
+        const hay = e._req ? `${e.method} ${e.path} ${e.status} ${e.clientIp}` : String(e.message);
+        if (!hay.toLowerCase().includes(f.q)) return false;
+      }
+      return true;
+    });
+    const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
+    box.innerHTML = shown.length
+      ? shown.map((e) => logLineHtml(e, freshIds.has(e._id), showWorker ? e._w : '')).join('')
+      : `<div class="empty"><h4>${entries.length ? 'Nothing matches the filter' : 'Quiet so far'}</h4><p>${entries.length ? '' : 'Requests, console.log() output and errors appear here as they happen.'}</p></div>`;
+    if (nearBottom || first) box.scrollTop = box.scrollHeight;
+    first = false;
+    if (onCount) onCount(shown.length, entries.length);
+  };
+  const fetchOnce = async () => {
+    if (paused) return;
+    const fresh = new Set();
+    for (const name of workers()) {
+      try {
+        const d = await api('GET', `/api/workers/${enc(name)}/activity${since[name] ? `?since=${enc(since[name])}` : ''}`);
+        const add = [
+          ...d.logs.map((l) => ({ ...l, _w: name, _id: `l${name}${l.id}` })),
+          ...d.invocations.map((i) => ({ ...i, _req: true, _w: name, _id: `i${name}${i.id}` }))
+        ];
+        if (since[name]) add.forEach((a) => fresh.add(a._id));
+        since[name] = d.now;
+        entries.push(...add);
+      } catch (_) {}
+    }
+    entries.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
+    if (entries.length > max) entries = entries.slice(-max);
+    render(fresh);
+  };
+  return {
+    start() {
+      fetchOnce();
+      poll(fetchOnce, 2000);
+    },
+    render: () => render(),
+    clear() {
+      entries = [];
+      render();
+    },
+    setPaused(v) {
+      paused = v;
+    },
+    refetch: fetchOnce
+  };
+}
 
-  const items = vscodeLangList.map(([label, id]) => ({
-    id,
-    label,
-    iconHtml: getLangLogoHtml(id),
-    meta: id === worker.language ? `(${id}) · configured` : `(${id})`,
-    active: id === worker.language
-  }));
+function logsToolbar(id) {
+  return `<div class="toolbar" style="margin:0;padding:14px 16px 8px">
+    <div class="search" style="max-width:280px">${icon('search')}<input class="input" id="${id}Q" placeholder="Filter…" aria-label="Filter logs"></div>
+    <div class="chips" id="${id}Lv">${['req', 'info', 'warn', 'error']
+      .map((l) => `<button type="button" class="chip on" data-lv="${l}">${{ req: 'Requests', info: 'Info', warn: 'Warnings', error: 'Errors' }[l]}</button>`)
+      .join('')}</div>
+    <span class="hint" id="${id}Count" style="margin-left:auto"></span>
+    <button class="btn sm" id="${id}Pause">${icon('pause')} Pause</button>
+  </div>`;
+}
+function wireLogsToolbar(id, tail) {
+  const levels = new Set(['req', 'info', 'warn', 'error']);
+  $(`#${id}Q`).addEventListener('input', debounce(() => tail.render(), 120));
+  $(`#${id}Lv`).addEventListener('click', (e) => {
+    const c = e.target.closest('.chip');
+    if (!c) return;
+    c.classList.toggle('on');
+    c.classList.contains('on') ? levels.add(c.dataset.lv) : levels.delete(c.dataset.lv);
+    tail.render();
+  });
+  let paused = false;
+  $(`#${id}Pause`).onclick = (e) => {
+    paused = !paused;
+    tail.setPaused(paused);
+    e.currentTarget.innerHTML = paused ? `${icon('play')} Resume` : `${icon('pause')} Pause`;
+    if (!paused) tail.refetch();
+  };
+  return () => ({ levels, q: ($(`#${id}Q`).value || '').trim().toLowerCase() });
+}
 
-  openCommandPalette({
-    title: 'Select Language Mode',
-    placeholder: 'Select Language Mode (type to filter 72 languages)...',
-    showSearch: true,
-    items,
-    onSelect: async (chosen) => {
-      const logoHtml = getLangLogoHtml(chosen.id);
-      openCommandPalette({
-        title: `Switch "${worker.name}" to ${chosen.label}`,
-        showSearch: false,
-        items: [
-          {
-            id: 'template',
-            iconHtml: logoHtml,
-            label: `Switch to ${chosen.label} and load ${chosen.label} starter template`,
-            meta: 'Recommended',
-            active: true
-          },
-          {
-            id: 'keep',
-            iconHtml: logoHtml,
-            label: `Switch to ${chosen.label} and keep current editor code as-is`,
-            meta: 'Preserve code'
-          }
-        ],
-        onSelect: async (subChoice) => {
-          addNotification(`Language mode changed to ${chosen.label}`);
-          await saveActiveWorkerToStorage({
-            language: chosen.id,
-            useLanguageTemplate: subChoice.id === 'template',
-            deploy: true,
-            deploySource: `Switched to ${chosen.label}`
-          });
+function renderWorkerLogs(body, w) {
+  body.innerHTML = `<div class="card">
+    ${logsToolbar('wl')}
+    <div class="logbox" id="wlBox" style="height:calc(100vh - 290px);min-height:320px"></div>
+    <div class="card-head" style="padding-bottom:16px"><span class="live">Live, every 2 seconds</span>
+      <div class="tools"><button class="btn sm danger" id="wlClear">Clear logs</button></div></div>
+  </div>`;
+  let getFilter = () => ({ levels: new Set(['req', 'info', 'warn', 'error']), q: '' });
+  const tail = createTail({
+    box: $('#wlBox'),
+    workers: () => [w.name],
+    filter: () => getFilter(),
+    onCount: (shown, total) => ($('#wlCount').textContent = `${num(shown)} of ${num(total)} lines`)
+  });
+  getFilter = wireLogsToolbar('wl', tail);
+  tail.start();
+  $('#wlClear').onclick = async () => {
+    if (!(await confirmDialog({ title: 'Clear logs', text: `Delete all stored logs and the request history of <b>${esc(w.name)}</b>?`, ok: 'Clear', danger: true }))) return;
+    await attempt(() => api('DELETE', `/api/workers/${enc(w.name)}/logs?invocations=1`), 'Logs cleared');
+    tail.clear();
+  };
+}
+
+/* ------------------------------------------------------------- versions */
+function renderDeployments(body, w) {
+  const deps = w.deployments || [];
+  body.innerHTML = `
+    <div class="card" style="margin-bottom:16px"><div class="card-body row">
+      <div class="grow"><b style="font-weight:600">A version is a snapshot of every file.</b><div class="hint">Saving in the editor goes live straight away. Make a version first when you want something to roll back to.</div></div>
+      <button class="btn primary" id="depNew">Make a version now</button>
+    </div></div>
+    <div class="card">
+      <div class="card-head"><h3>History</h3><span class="sub">${plural(deps.length, 'version')} · newest first · keeps 25</span></div>
+      ${
+        deps.length
+          ? `<ul class="timeline">${deps
+              .map(
+                (d) => `<li class="${d.id === w.deployId ? 'current' : ''}">
+              <span class="node"></span>
+              <div style="min-width:0">
+                <div class="row" style="gap:8px"><span class="id">${esc(d.id)}</span>${d.id === w.deployId ? '<span class="tag ok"><span class="d"></span>Current</span>' : ''}<span style="color:var(--text-2)">${esc(d.source || 'Saved')}</span></div>
+                <div class="meta">${esc(ago(d.timestamp))} · ${esc(new Date(d.timestamp).toLocaleString())} · by ${esc(d.author || 'admin')} · ${esc((d.fileNames || [d.filename]).join(', '))}</div>
+              </div>
+              <div class="row" style="gap:6px">
+                ${d.hasSnapshot ? `<button class="btn sm" data-view="${esc(d.id)}">${icon('eye')} View</button>` : ''}
+                ${d.id !== w.deployId && d.hasSnapshot ? `<button class="btn sm" data-rollback="${esc(d.id)}">${icon('undo')} Roll back</button>` : ''}
+              </div>
+            </li>`
+              )
+              .join('')}</ul>`
+          : `<div class="empty"><h4>No versions yet</h4></div>`
+      }
+    </div>`;
+  $('#depNew').onclick = async () => {
+    const r = await attempt(() => api('POST', `/api/workers/${enc(w.name)}/deployments`, { source: 'Created from dashboard' }));
+    if (r) {
+      toast(`Version ${r.worker.deployId} created`);
+      route();
+    }
+  };
+  body.onclick = async (e) => {
+    const v = e.target.closest('[data-view]');
+    if (v) {
+      const snap = await attempt(() => api('GET', `/api/workers/${enc(w.name)}/deployments/${v.dataset.view}`));
+      if (!snap) return;
+      const names = Object.keys(snap.files);
+      modal({
+        title: `Version ${snap.id}`,
+        wide: true,
+        body: `<div class="chips" id="snapFiles">${names.map((n, i) => `<button class="chip ${i ? '' : 'on'}" data-f="${esc(n)}">${esc(n)}</button>`).join('')}</div><pre class="code-view" id="snapCode"></pre>`,
+        onMount(ov) {
+          const show = (n) => {
+            $('#snapCode', ov).innerHTML =
+              typeof window.vscodeHighlight === 'function' ? window.vscodeHighlight(snap.files[n], langOfFile(n)) : esc(snap.files[n]);
+            $$('#snapFiles .chip', ov).forEach((c) => c.classList.toggle('on', c.dataset.f === n));
+          };
+          $('#snapFiles', ov).onclick = (ev) => {
+            const c = ev.target.closest('.chip');
+            if (c) show(c.dataset.f);
+          };
+          if (names[0]) show(names[0]);
         }
       });
     }
-  });
-}
-
-function openIndentationPicker() {
-  const worker = getActiveWorkerObj();
-  if (!worker) return;
-
-  openCommandPalette({
-    title: 'Select Indentation',
-    showSearch: false,
-    items: [
-      { label: 'Indent Using Spaces: 2', spaces: 2, tabs: false, meta: '2 spaces', active: !worker.indentUsingTabs && worker.spaces === 2 },
-      { label: 'Indent Using Spaces: 4', spaces: 4, tabs: false, meta: '4 spaces', active: !worker.indentUsingTabs && worker.spaces === 4 },
-      { label: 'Indent Using Spaces: 8', spaces: 8, tabs: false, meta: '8 spaces', active: !worker.indentUsingTabs && worker.spaces === 8 },
-      { label: 'Indent Using Tabs (Tab Size: 2)', spaces: 2, tabs: true, meta: 'Tab = 2', active: worker.indentUsingTabs && worker.spaces === 2 },
-      { label: 'Indent Using Tabs (Tab Size: 4)', spaces: 4, tabs: true, meta: 'Tab = 4', active: worker.indentUsingTabs && worker.spaces === 4 },
-      { label: 'Format Document & Trim Trailing Whitespace', action: 'format', meta: 'Shift+Alt+F' }
-    ],
-    onSelect: async (item) => {
-      if (item.action === 'format') {
-        formatActiveDocument();
-        return;
+    const rb = e.target.closest('[data-rollback]');
+    if (rb) {
+      const ok = await confirmDialog({
+        title: `Roll back to ${rb.dataset.rollback}?`,
+        text: `Every file of <b>${esc(w.name)}</b> is replaced with that version and goes live immediately. Files that version didn't have are removed.`,
+        ok: 'Roll back',
+        danger: true
+      });
+      if (!ok) return;
+      const r = await attempt(() => api('POST', `/api/workers/${enc(w.name)}/deployments`, { action: 'rollback', versionId: rb.dataset.rollback }));
+      if (r) {
+        toast(`Rolled back to ${rb.dataset.rollback}`);
+        route();
       }
-      addNotification(`Indentation set to ${item.label}`);
-      await saveActiveWorkerToStorage({ spaces: item.spaces, indentUsingTabs: item.tabs });
     }
-  });
+  };
 }
 
-function openEncodingPicker() {
-  const worker = getActiveWorkerObj();
-  if (!worker) return;
+/* ---------------------------------------------------------------- settings */
+function renderSettings(body, w) {
+  const files = (w.files || []).map((f) => f.name);
+  const obs = w.observabilityConfig || {};
+  const envs = Object.entries(w.bindings || {});
+  body.innerHTML = `
+    <div class="stack" style="gap:16px">
+    <div class="card">
+      <div class="card-head" style="padding-bottom:0"><h3>General</h3></div>
+      <div class="set-row"><div><h4>Name</h4><p>Renaming also moves its default URL from /${esc(w.name)}.</p></div>
+        <form class="row" id="fRename"><input class="input mono" style="width:220px" id="sName" value="${esc(w.name)}" aria-label="Worker name" maxlength="64"><button class="btn">Rename</button></form></div>
+      <div class="set-row"><div><h4>Entry file</h4><p>The file that runs on each request. Its type decides the runtime (${esc(RUNTIME_OF(w.language))} now).</p></div>
+        <select class="select" id="sEntry" style="width:220px" aria-label="Entry file">${files.map((f) => `<option ${f === w.filename ? 'selected' : ''}>${esc(f)}</option>`).join('')}</select></div>
+      <div class="set-row"><div><h4>Default worker</h4><p>Answer every path that no other worker claims (e.g. <span class="mono">/</span>, <span class="mono">/anything</span>). Only one worker can be the default.</p></div>
+        <label class="switch"><input type="checkbox" id="sDefault" ${w.isDefault ? 'checked' : ''}><span></span></label></div>
+    </div>
 
-  const rawEncodings = window.VSCODE_ENCODINGS || [
-    ['UTF-8', 'utf8'],
-    ['UTF-8 with BOM', 'utf8bom'],
-    ['UTF-16 LE', 'utf16le'],
-    ['UTF-16 BE', 'utf16be'],
-    ['Western (ISO 8859-1)', 'iso88591'],
-    ['ASCII', 'ascii']
-  ];
+    <div class="card">
+      <div class="card-head"><h3>Routes</h3><span class="sub">Paths that reach this worker</span></div>
+      <div class="set-row"><div><h4>Main path</h4><p>A path like <span class="mono">/api</span>, or a full URL on your domain.</p></div>
+        <form class="row" id="fMain"><input class="input mono" style="width:260px" id="sMain" value="${esc(w.publishingLink || '/' + w.name)}" aria-label="Main path"><button class="btn">Save</button></form></div>
+      <div class="card-body">
+        <div class="label" style="margin-bottom:8px">Extra paths</div>
+        <div class="stack" style="gap:6px" id="routeList">${
+          (w.customRoutes || []).length
+            ? w.customRoutes
+                .map(
+                  (r) => `<div class="copy-line"><span>${esc(r.pattern)}</span><a class="icon-btn sm" href="${esc(r.path || r.pattern)}" target="_blank" rel="noopener" title="Open">${icon('external')}</a><button class="icon-btn sm" data-del-route="${esc(r.id)}" title="Remove">${icon('x')}</button></div>`
+                )
+                .join('')
+            : '<div class="hint">None. The worker also always answers at its name.</div>'
+        }</div>
+        <form class="row" id="fRoute" style="margin-top:10px"><input class="input mono grow" id="sRoute" placeholder="/another-path" aria-label="New path"><button class="btn">Add path</button></form>
+      </div>
+    </div>
 
-  openCommandPalette({
-    title: 'Select File Encoding',
-    placeholder: 'Select File Encoding to Save or Reopen...',
-    showSearch: true,
-    items: rawEncodings.map(([label, code]) => ({
-      label,
-      meta: code,
-      active: (worker.encoding || 'UTF-8') === label
-    })),
-    onSelect: async (item) => {
-      addNotification(`Encoding updated to ${item.label}`);
-      await saveActiveWorkerToStorage({ encoding: item.label });
+    <div class="card">
+      <div class="card-head"><h3>Environment variables</h3><span class="sub">Available as <span class="mono">env.NAME</span> in JS, and as environment variables in Python/Shell</span></div>
+      <div class="card-body">
+        <div id="envRows">${envs.map(([k, v]) => envRow(k, v)).join('')}</div>
+        <div class="row" style="margin-top:10px"><button class="btn sm" id="envAdd" type="button">Add a variable</button><span class="grow"></span><button class="btn primary sm" id="envSave" type="button">Save variables</button></div>
+        <p class="hint" style="margin:10px 0 0">Stored as plain text in this worker's folder on the Pi.</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>Logging</h3></div>
+      <div class="set-row"><div><h4>Keep logs</h4><p>Store console output and errors (last 200 lines).</p></div><label class="switch"><input type="checkbox" id="sLogs" ${obs.logsEnabled !== false ? 'checked' : ''}><span></span></label></div>
+      <div class="set-row"><div><h4>Issue tracking</h4><p>Group repeated 5xx errors into issues on the overview.</p></div><label class="switch"><input type="checkbox" id="sIssues" ${w.issueDetectionEnabled !== false ? 'checked' : ''}><span></span></label></div>
+    </div>
+
+    <div class="card danger-zone">
+      <div class="set-row"><div><h4>Delete worker</h4><p>Removes its code, versions and logs from the Pi. This can't be undone.</p></div><button class="btn danger" id="sDelete">Delete ${esc(w.name)}</button></div>
+    </div>
+    </div>`;
+
+  const base = `/api/workers/${enc(w.name)}`;
+  $('#fRename').onsubmit = async (e) => {
+    e.preventDefault();
+    const n = $('#sName').value.trim();
+    if (!n || n === w.name) return;
+    const r = await attempt(() => api('PUT', base, { newName: n }));
+    if (r) {
+      toast(`Renamed to ${r.worker.name}`);
+      await loadOverview();
+      location.hash = `#/w/${enc(r.worker.name)}/settings`;
     }
-  });
-}
-
-function openEolPicker() {
-  const worker = getActiveWorkerObj();
-  if (!worker) return;
-
-  openCommandPalette({
-    title: 'Select End of Line Sequence',
-    showSearch: false,
-    items: [
-      { label: 'LF', meta: 'Unix / Raspberry Pi / macOS (\\n)', active: (worker.eol || 'LF') === 'LF' },
-      { label: 'CRLF', meta: 'Windows (\\r\\n)', active: worker.eol === 'CRLF' }
-    ],
-    onSelect: async (item) => {
-      addNotification(`Line endings set to ${item.label}`);
-      await saveActiveWorkerToStorage({ eol: item.label });
+  };
+  $('#sEntry').onchange = async (e) => {
+    const r = await attempt(() => api('PUT', `${base}/files`, { filename: e.target.value, setAsEntrypoint: true }), `Entry file is now ${e.target.value}`);
+    if (r) route();
+  };
+  $('#sDefault').onchange = async (e) => {
+    const r = await attempt(() => api('POST', '/api/default-worker', { name: e.target.checked ? w.name : '' }));
+    if (r) {
+      toast(e.target.checked ? `${w.name} is now the default worker` : 'No default worker');
+      loadOverview();
+    } else e.target.checked = !e.target.checked;
+  };
+  $('#fMain').onsubmit = async (e) => {
+    e.preventDefault();
+    const r = await attempt(() => api('POST', `${base}/routes`, { publishingLink: $('#sMain').value.trim() || `/${w.name}` }), 'Main path saved');
+    if (r) route();
+  };
+  $('#fRoute').onsubmit = async (e) => {
+    e.preventDefault();
+    const p = $('#sRoute').value.trim();
+    if (!p) return;
+    const r = await attempt(() => api('POST', `${base}/routes`, { addRoute: { pattern: p, type: 'Route' } }), `Added ${p}`);
+    if (r) route();
+  };
+  $('#routeList').onclick = async (e) => {
+    const b = e.target.closest('[data-del-route]');
+    if (!b) return;
+    const r = await attempt(() => api('POST', `${base}/routes`, { removeRouteId: b.dataset.delRoute }), 'Path removed');
+    if (r) route();
+  };
+  $('#envAdd').onclick = () => {
+    $('#envRows').insertAdjacentHTML('beforeend', envRow('', ''));
+    $$('#envRows .env-row input')[$$('#envRows .env-row input').length - 2].focus();
+  };
+  $('#envRows').onclick = (e) => {
+    const b = e.target.closest('[data-del-env]');
+    if (b) b.closest('.env-row').remove();
+  };
+  $('#envSave').onclick = async () => {
+    const out = {};
+    for (const row of $$('#envRows .env-row')) {
+      const [k, v] = $$('input', row).map((i) => i.value);
+      const key = k.trim();
+      if (!key) continue;
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) return toast(`"${key}" isn't a valid variable name (letters, digits, _)`, 'err');
+      out[key] = v;
     }
-  });
-}
-
-function openLayoutPicker() {
-  const worker = getActiveWorkerObj();
-  if (!worker) return;
-
-  const layouts = [
-    { label: 'Layout: US', meta: 'English (US QWERTY)' },
-    { label: 'Layout: UK', meta: 'English (UK)' },
-    { label: 'Layout: Intl', meta: 'US International' },
-    { label: 'Layout: Dvorak', meta: 'US Dvorak' },
-    { label: 'Layout: Colemak', meta: 'US Colemak' },
-    { label: 'Layout: German', meta: 'Deutsch (QWERTZ)' },
-    { label: 'Layout: French', meta: 'Français (AZERTY)' }
-  ];
-
-  openCommandPalette({
-    title: 'Select Keyboard Layout',
-    showSearch: true,
-    items: layouts.map((l) => ({
-      ...l,
-      active: (worker.layout || 'Layout: US') === l.label
-    })),
-    onSelect: async (item) => {
-      addNotification(`Keyboard layout set to ${item.label}`);
-      await saveActiveWorkerToStorage({ layout: item.label });
+    await attempt(() => api('PUT', base, { bindings: out }), `Saved ${plural(Object.keys(out).length, 'variable')}`);
+  };
+  const obsSave = (patch) => attempt(() => api('POST', `${base}/observability`, { observabilityConfig: patch }), 'Saved');
+  $('#sLogs').onchange = (e) => obsSave({ logsEnabled: e.target.checked });
+  $('#sIssues').onchange = (e) => attempt(() => api('POST', `${base}/issues`, { enabled: e.target.checked }), 'Saved');
+  $('#sDelete').onclick = async () => {
+    const ok = await confirmDialog({
+      title: `Delete ${w.name}?`,
+      text: `This deletes every file, version and log of this worker from the Pi.`,
+      ok: 'Delete forever',
+      danger: true,
+      typeToConfirm: w.name
+    });
+    if (!ok) return;
+    const r = await attempt(() => api('DELETE', base));
+    if (r) {
+      toast(`Deleted ${w.name}`);
+      await loadOverview();
+      location.hash = '#/';
     }
-  });
+  };
+}
+function envRow(k, v) {
+  return `<div class="env-row"><input class="input mono" placeholder="NAME" value="${esc(k)}" aria-label="Variable name" spellcheck="false"><input class="input mono" placeholder="value" value="${esc(v)}" aria-label="Variable value" spellcheck="false"><button class="icon-btn" type="button" data-del-env title="Remove">${icon('x')}</button></div>`;
 }
 
-function openGoToLinePicker() {
-  const textarea = el('codeEditor');
-  const lines = textarea.value.split('\n');
-
-  openCommandPalette({
-    title: `Go to Line (1 - ${lines.length})`,
-    placeholder: 'Type a line number to jump to...',
-    showSearch: true,
-    items: lines.slice(0, 100).map((text, idx) => ({
-      line: idx + 1,
-      label: `${idx + 1}: ${text.trim() || '(empty line)'}`,
-      meta: `Ln ${idx + 1}`
-    })),
-    onSelect: (item) => {
-      const targetLine = item.line || 1;
-      let offset = 0;
-      for (let i = 0; i < targetLine - 1 && i < lines.length; i++) {
-        offset += lines[i].length + 1;
-      }
-      textarea.focus();
-      textarea.setSelectionRange(offset, offset);
-      updateCursorPosition();
-    }
-  });
-}
-
-function openProblemsPicker() {
-  const items =
-    appState.diagnostics.length > 0
-      ? appState.diagnostics.map((d) => ({
-          label: d.message,
-          meta: d.severity.toUpperCase()
-        }))
-      : [
-          {
-            label: 'No syntax errors or warnings detected in current worker.',
-            meta: '0 problems'
-          }
-        ];
-
-  openCommandPalette({
-    title: 'Problems & Diagnostics',
-    showSearch: false,
-    items,
-    onSelect: () => {}
-  });
-}
-
-function openNotificationsPicker() {
-  openCommandPalette({
-    title: 'Notifications & Auto-Save Log',
-    showSearch: false,
-    items: appState.notifications.map((n) => ({
-      label: n.text,
-      meta: n.time
-    })),
-    onSelect: () => {}
-  });
-}
-
-function openQuickJumpPalette() {
-  const workerItems = Object.values(appState.workers).map((w) => {
-    const langSpec = getLanguageSpec(w.language);
-    return {
-      type: 'worker',
-      name: w.name,
-      iconHtml: getLangLogoHtml(w.language),
-      label: `Worker: ${w.name} (/${w.name})`,
-      meta: `${langSpec.label} · Open in Quick Edit`
+/* ===================================================================== IDE */
+const MONACO_BASE = 'https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min';
+let monacoPromise = null;
+function loadMonaco() {
+  if (window.monaco) return Promise.resolve(window.monaco);
+  if (store.get('ax-editor', 'monaco') === 'basic') return Promise.reject(new Error('basic editor chosen'));
+  if (monacoPromise) return monacoPromise;
+  monacoPromise = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Monaco took too long to load')), 9000);
+    const s = document.createElement('script');
+    s.src = `${MONACO_BASE}/vs/loader.js`;
+    s.onerror = () => {
+      clearTimeout(timer);
+      reject(new Error('Monaco could not be loaded (offline?)'));
     };
-  });
-
-  openCommandPalette({
-    title: 'Go to Worker or Page (Ctrl+K)',
-    placeholder: 'Search workers, pages, or actions...',
-    showSearch: true,
-    items: [
-      ...workerItems,
-      { type: 'view', view: 'applications', label: 'Workers & Pages: Overview', meta: 'Dashboard' },
-      { type: 'view', view: 'detail', label: 'Active Worker Details (Metrics, Bindings, Deployments)', meta: 'Details' },
-      { type: 'view', view: 'editor', label: 'Quick Edit: VS Code Editor', meta: 'Code Editor' },
-      { type: 'view', view: 'records', label: 'Public links: Cloudflare Tunnel & DNS Records', meta: 'Tunnel' },
-      { type: 'view', view: 'websites', label: 'Websites & Nginx Client-IP Proxy', meta: 'Gateway' },
-      { type: 'view', view: 'analytics', label: 'Analytics & Live Invocation Logs', meta: 'Observability' },
-      { type: 'view', view: 'storage', label: 'Local Storage & Auto-Saved Files', meta: 'Disk Storage' },
-      { type: 'view', view: 'plans', label: 'System & Installed Runtimes', meta: 'System' },
-      { type: 'create', label: 'Create New Worker', meta: 'New Action' }
-    ],
-    onSelect: (item) => {
-      if (item.type === 'worker') window.openWorkerInEditor(item.name);
-      else if (item.type === 'view') switchView(item.view);
-      else if (item.type === 'create') openWorkerModal('create');
-    }
-  });
-}
-
-// ============================================================================
-// Worker Creation, Renaming, Deletion & Publishing Links Helpers
-// ============================================================================
-function openWorkerModal(mode, initialName = '') {
-  workerModalMode = mode;
-  const overlay = el('workerModalOverlay');
-  const titleEl = el('workerModalTitle');
-  const nameInput = el('modalWorkerNameInput');
-  const pubInput = el('modalWorkerPublishLinkInput');
-  const langGroup = el('modalWorkerLangGroup');
-  const langSelect = el('modalWorkerLangSelect');
-
-  const allLangs = window.VSCODE_LANGS || appState.languages.map((l) => [l.label, l.id]);
-  langSelect.innerHTML = allLangs
-    .map(([label, id]) => `<option value="${id}" ${id === 'javascript' ? 'selected' : ''}>${escapeHtml(label)} (${escapeHtml(id)})</option>`)
-    .join('');
-
-  if (mode === 'rename') {
-    const existingWorker = appState.workers[initialName];
-    titleEl.textContent = `Edit Worker "${initialName}" & Publishing Link`;
-    nameInput.value = initialName;
-    if (pubInput) {
-      pubInput.value = existingWorker ? getWorkerPrimaryPublishingLink(existingWorker) : `/${initialName}`;
-      pubInput.dataset.customized = 'true';
-    }
-    langGroup.classList.add('hidden');
-  } else {
-    const suggestedName = `worker-${Object.keys(appState.workers).length + 1}`;
-    titleEl.textContent = 'Create New Worker';
-    nameInput.value = suggestedName;
-    if (pubInput) {
-      pubInput.value = `/${suggestedName}`;
-      pubInput.dataset.customized = 'false';
-    }
-    langGroup.classList.remove('hidden');
-  }
-
-  overlay.classList.remove('hidden');
-  setTimeout(() => {
-    nameInput.focus();
-    nameInput.select();
-  }, 20);
-}
-
-window.openPublishLinksEditor = function () {
-  const editorCard = el('overviewPublishLinkEditor');
-  if (editorCard) {
-    editorCard.classList.remove('hidden');
-    const inp = el('overviewPrimaryPublishInput');
-    if (inp) {
-      const w = getActiveWorkerObj();
-      inp.value = getWorkerPrimaryPublishingLink(w);
-      setTimeout(() => {
-        inp.focus();
-        inp.select();
-      }, 20);
-    }
-  } else {
-    switchDetailSubtab('domains');
-  }
-};
-
-window.openWorkerPublishLinksEditor = async function (workerName) {
-  if (!appState.workers[workerName]) return;
-  appState.activeWorker = workerName;
-  await fetch('/api/active-worker', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: workerName })
-  });
-  renderWorkerDropdown();
-  switchView('detail');
-  switchDetailSubtab('overview');
-  window.openPublishLinksEditor();
-};
-
-window.savePrimaryPublishingLinkFromOverview = async function () {
-  const w = getActiveWorkerObj();
-  const inp = el('overviewPrimaryPublishInput');
-  if (!w || !inp) return;
-  const linkVal = inp.value.trim() || `/${w.name}`;
-  const res = await fetch(`/api/workers/${encodeURIComponent(w.name)}/routes`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ publishingLink: linkVal })
-  });
-  const data = await res.json();
-  if (data.ok && data.worker) {
-    appState.workers[w.name] = data.worker;
-    addNotification(`Saved primary publishing link: ${data.worker.publishingLink}`);
-    await fetchAppState();
-  }
-};
-
-window.addAdditionalPublishingLinkFromOverview = async function () {
-  const w = getActiveWorkerObj();
-  const inp = el('overviewAddPublishInput');
-  if (!w || !inp) return;
-  const pattern = inp.value.trim();
-  if (!pattern) return;
-  inp.value = '';
-  const res = await fetch(`/api/workers/${encodeURIComponent(w.name)}/routes`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ addRoute: { pattern, type: 'Publishing Link' } })
-  });
-  const data = await res.json();
-  if (data.ok && data.worker) {
-    appState.workers[w.name] = data.worker;
-    addNotification(`Added publishing link: ${pattern}`);
-    await fetchAppState();
-  }
-};
-
-window.savePrimaryPublishingLinkFromDomains = async function () {
-  const w = getActiveWorkerObj();
-  const inp = el('domainsPrimaryPublishInput');
-  if (!w || !inp) return;
-  const linkVal = inp.value.trim() || `/${w.name}`;
-  const res = await fetch(`/api/workers/${encodeURIComponent(w.name)}/routes`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ publishingLink: linkVal })
-  });
-  const data = await res.json();
-  if (data.ok && data.worker) {
-    appState.workers[w.name] = data.worker;
-    addNotification(`Saved primary publishing link: ${data.worker.publishingLink}`);
-    await fetchAppState();
-  }
-};
-
-window.openWorkerInEditor = async function (name) {
-  if (!appState.workers[name]) return;
-  syncEditorBufferToMemory();
-  if (autoSaveTimer) {
-    clearTimeout(autoSaveTimer);
-    autoSaveTimer = null;
-    await saveActiveWorkerToStorage({ deploy: false });
-  }
-  appState.activeWorker = name;
-  await fetch('/api/active-worker', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name })
-  });
-  renderWorkerDropdown();
-  switchView('editor');
-  executeCurrentWorkerHttpRequest();
-};
-
-window.openWorkerFileInEditor = async function (workerName, fileName) {
-  if (!appState.workers[workerName]) return;
-  syncEditorBufferToMemory();
-  if (autoSaveTimer) {
-    clearTimeout(autoSaveTimer);
-    autoSaveTimer = null;
-    await saveActiveWorkerToStorage({ deploy: false });
-  }
-  appState.activeWorker = workerName;
-  appState.activeFileByWorker[workerName] = fileName;
-  await fetch('/api/active-worker', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: workerName })
-  });
-  renderWorkerDropdown();
-  switchView('editor');
-};
-
-window.selectWorkerFile = async function (fileName) {
-  const w = getActiveWorkerObj();
-  if (!w) return;
-  syncEditorBufferToMemory();
-  if (autoSaveTimer) {
-    clearTimeout(autoSaveTimer);
-    autoSaveTimer = null;
-  }
-  await saveActiveWorkerToStorage({ deploy: false });
-  appState.activeFileByWorker[w.name] = fileName;
-  const primaryPath = getWorkerPrimaryPublishingPath(w);
-  if (el('httpUrlInput') && el('httpUrlInput').value.startsWith(`/${w.name}/`)) {
-    el('httpUrlInput').value = primaryPath;
-  }
-  if (el('previewUrlBadge') && el('previewUrlBadge').value.includes(`/${w.name}/`)) {
-    el('previewUrlBadge').value = `${window.location.origin}${primaryPath}`;
-  }
-  renderEditorView();
-};
-
-window.promptExplorerCreateFile = function () {
-  const sidebar = el('editorExplorerSidebar');
-  if (sidebar && sidebar.classList.contains('hidden')) {
-    sidebar.classList.remove('hidden');
-    el('actExplorerBtn')?.classList.add('active');
-    el('toggleExplorerBtn')?.classList.add('active');
-  }
-  const form = el('explorerInlineForm');
-  const label = el('explorerInlineLabel');
-  const inp = el('explorerInlineInput');
-  if (!form || !inp) return;
-  appState.explorerInlineMode = { type: 'create' };
-  label.textContent = 'Create new file in worker:';
-  const w = getActiveWorkerObj();
-  const count = (w && Array.isArray(w.files) ? w.files.length : 1) + 1;
-  inp.value = `helper-${count}.js`;
-  form.classList.remove('hidden');
-  setTimeout(() => {
-    inp.focus();
-    inp.select();
-  }, 15);
-};
-
-window.promptExplorerRenameFile = function (targetFileName) {
-  const w = getActiveWorkerObj();
-  if (!w) return;
-  const activeFile = getActiveFileObj(w);
-  const fileToRename = targetFileName || (activeFile && activeFile.name) || w.filename;
-  const form = el('explorerInlineForm');
-  const label = el('explorerInlineLabel');
-  const inp = el('explorerInlineInput');
-  if (!form || !inp) return;
-  appState.explorerInlineMode = { type: 'rename', targetFile: fileToRename };
-  label.textContent = `Rename "${fileToRename}" to:`;
-  inp.value = fileToRename;
-  form.classList.remove('hidden');
-  setTimeout(() => {
-    inp.focus();
-    inp.select();
-  }, 15);
-};
-
-window.submitExplorerInlineForm = async function () {
-  const w = getActiveWorkerObj();
-  const form = el('explorerInlineForm');
-  const inp = el('explorerInlineInput');
-  if (!w || !inp || !appState.explorerInlineMode) return;
-  const val = inp.value.trim();
-  if (!val) return;
-
-  const mode = appState.explorerInlineMode;
-  form.classList.add('hidden');
-  appState.explorerInlineMode = null;
-
-  syncEditorBufferToMemory();
-  if (autoSaveTimer) {
-    clearTimeout(autoSaveTimer);
-    autoSaveTimer = null;
-  }
-  await saveActiveWorkerToStorage({ deploy: false });
-
-  if (mode.type === 'create') {
-    const res = await fetch(`/api/workers/${encodeURIComponent(w.name)}/files`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ filename: val, overwrite: true })
-    });
-    const data = await res.json();
-    if (data.ok && data.worker) {
-      appState.workers[w.name] = data.worker;
-      appState.activeFileByWorker[w.name] = data.file ? data.file.name : val;
-      addNotification(`Created file "${appState.activeFileByWorker[w.name]}" in ${w.name}`);
-      renderAll();
-    } else if (data.error) {
-      addNotification(data.error, 'info');
-    }
-  } else if (mode.type === 'rename') {
-    const res = await fetch(`/api/workers/${encodeURIComponent(w.name)}/files`, {
-      method: 'PUT',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ filename: mode.targetFile, newFilename: val })
-    });
-    const data = await res.json();
-    if (data.ok && data.worker) {
-      appState.workers[w.name] = data.worker;
-      appState.activeFileByWorker[w.name] = data.filename || val;
-      addNotification(`Renamed "${mode.targetFile}" -> "${appState.activeFileByWorker[w.name]}"`);
-      renderAll();
-    }
-  }
-};
-
-window.deleteWorkerFile = async function (targetFileName) {
-  const w = getActiveWorkerObj();
-  if (!w) return;
-  syncEditorBufferToMemory();
-  const activeFile = getActiveFileObj(w);
-  const fileToDelete = targetFileName || (activeFile && activeFile.name) || w.filename;
-  const res = await fetch(`/api/workers/${encodeURIComponent(w.name)}/files`, {
-    method: 'DELETE',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ filename: fileToDelete })
-  });
-  const data = await res.json();
-  if (data.ok && data.worker) {
-    appState.workers[w.name] = data.worker;
-    const nextFile = (data.files && data.files[0] && data.files[0].name) || data.worker.filename;
-    appState.activeFileByWorker[w.name] = nextFile;
-    el('codeEditor').dataset.fileName = '';
-    addNotification(`Deleted file "${fileToDelete}" from ${w.name}`);
-    renderAll();
-  }
-};
-
-window.setWorkerEntrypointFile = async function (targetFileName) {
-  const w = getActiveWorkerObj();
-  if (!w) return;
-  syncEditorBufferToMemory();
-  if (autoSaveTimer) {
-    clearTimeout(autoSaveTimer);
-    autoSaveTimer = null;
-  }
-  await saveActiveWorkerToStorage({ deploy: false });
-  const res = await fetch(`/api/workers/${encodeURIComponent(w.name)}/files`, {
-    method: 'PUT',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ filename: targetFileName, setAsEntrypoint: true, deploy: true, deploySource: `Set entrypoint ${targetFileName}` })
-  });
-  const data = await res.json();
-  if (data.ok && data.worker) {
-    appState.workers[w.name] = data.worker;
-    appState.activeFileByWorker[w.name] = targetFileName;
-    addNotification(`Set "${targetFileName}" as entrypoint for ${w.name}`);
-    renderAll();
-  }
-};
-
-window.duplicateWorkerFile = async function (sourceFileName) {
-  const w = getActiveWorkerObj();
-  if (!w || !sourceFileName) return;
-  syncEditorBufferToMemory();
-  if (autoSaveTimer) {
-    clearTimeout(autoSaveTimer);
-    autoSaveTimer = null;
-  }
-  await saveActiveWorkerToStorage({ deploy: false });
-  const srcFile = (w.files || []).find((f) => f.name === sourceFileName);
-  const dotIdx = sourceFileName.lastIndexOf('.');
-  const copyName =
-    dotIdx > 0
-      ? `${sourceFileName.slice(0, dotIdx)}-copy${sourceFileName.slice(dotIdx)}`
-      : `${sourceFileName}-copy`;
-  const res = await fetch(`/api/workers/${encodeURIComponent(w.name)}/files`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      filename: copyName,
-      content: srcFile ? srcFile.content : ''
-    })
-  });
-  const data = await res.json();
-  if (data.ok && data.worker) {
-    appState.workers[w.name] = data.worker;
-    appState.activeFileByWorker[w.name] = data.file ? data.file.name : copyName;
-    el('codeEditor').dataset.fileName = '';
-    addNotification(`Duplicated "${sourceFileName}" as "${copyName}"`);
-    renderAll();
-  }
-};
-
-window.jumpEditorToLine = function (lineNumber) {
-  const textarea = el('codeEditor');
-  if (!textarea) return;
-  const lines = textarea.value.split('\n');
-  let offset = 0;
-  for (let i = 0; i < lineNumber - 1 && i < lines.length; i++) {
-    offset += lines[i].length + 1;
-  }
-  textarea.focus();
-  textarea.setSelectionRange(offset, offset);
-  updateCursorPosition();
-};
-
-window.toggleWorkerIssueDetection = async function (enabled) {
-  const w = getActiveWorkerObj();
-  if (!w) return;
-  const res = await fetch(`/api/workers/${encodeURIComponent(w.name)}/issues`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ enabled: Boolean(enabled) })
-  });
-  const data = await res.json();
-  if (data.ok && data.worker) {
-    appState.workers[w.name] = data.worker;
-    addNotification(`Issue detection ${enabled ? 'enabled' : 'disabled'} for ${w.name}`);
-    renderDetailView();
-  }
-};
-
-window.resolveWorkerIssue = async function (issueId) {
-  const w = getActiveWorkerObj();
-  if (!w) return;
-  const res = await fetch(`/api/workers/${encodeURIComponent(w.name)}/issues`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ resolveIssueId: issueId })
-  });
-  const data = await res.json();
-  if (data.ok && data.worker) {
-    appState.workers[w.name] = data.worker;
-    addNotification(`Resolved issue ${issueId}`);
-    renderDetailView();
-  }
-};
-
-window.toggleWorkerUrlState = async function (field, checked) {
-  const w = getActiveWorkerObj();
-  if (!w) return;
-  const res = await fetch(`/api/workers/${encodeURIComponent(w.name)}/routes`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ [field]: Boolean(checked) })
-  });
-  const data = await res.json();
-  if (data.ok && data.worker) {
-    appState.workers[w.name] = data.worker;
-    addNotification(`Updated URL visibility for ${w.name}`);
-    renderDetailView();
-  }
-};
-
-window.addWorkerCustomRoute = async function () {
-  const w = getActiveWorkerObj();
-  const patInp = el('newRoutePatternInput');
-  const typeSel = el('newRouteTypeSelect');
-  if (!w || !patInp) return;
-  const pattern = patInp.value.trim();
-  if (!pattern) return;
-  const type = typeSel ? typeSel.value : 'Route';
-  patInp.value = '';
-  const res = await fetch(`/api/workers/${encodeURIComponent(w.name)}/routes`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ addRoute: { pattern, type } })
-  });
-  const data = await res.json();
-  if (data.ok && data.worker) {
-    appState.workers[w.name] = data.worker;
-    addNotification(`Added ${type}: ${pattern}`);
-    renderDetailView();
-  }
-};
-
-window.removeWorkerCustomRoute = async function (routeId) {
-  const w = getActiveWorkerObj();
-  if (!w) return;
-  const res = await fetch(`/api/workers/${encodeURIComponent(w.name)}/routes`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ removeRouteId: routeId })
-  });
-  const data = await res.json();
-  if (data.ok && data.worker) {
-    appState.workers[w.name] = data.worker;
-    addNotification(`Removed route from ${w.name}`);
-    renderDetailView();
-  }
-};
-
-window.openWorkerDetail = async function (name) {
-  if (!appState.workers[name]) return;
-  appState.activeWorker = name;
-  await fetch('/api/active-worker', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name })
-  });
-  renderWorkerDropdown();
-  switchView('detail');
-};
-
-window.promptRenameWorker = function (name) {
-  appState.activeWorker = name;
-  openWorkerModal('rename', name);
-};
-
-window.deleteWorkerByName = async function (name) {
-  const res = await fetch(`/api/workers/${encodeURIComponent(name)}`, {
-    method: 'DELETE'
-  });
-  const data = await res.json();
-  if (data.ok) {
-    addNotification(`Deleted worker "${name}"`);
-    await fetchAppState();
-  }
-};
-
-window.removeWorkerBinding = async function (key) {
-  const w = getActiveWorkerObj();
-  if (!w) return;
-  const nextBindings = { ...(w.bindings || {}) };
-  delete nextBindings[key];
-  await saveActiveWorkerToStorage({ bindings: nextBindings, deploy: true, deploySource: 'Updated Bindings' });
-  addNotification(`Removed binding env.${key}`);
-};
-
-window.rollbackWorkerVersion = async function (versionId) {
-  const w = getActiveWorkerObj();
-  if (!w || !versionId) return;
-  const res = await fetch(`/api/workers/${encodeURIComponent(w.name)}/deployments`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ action: 'rollback', versionId })
-  });
-  const data = await res.json();
-  if (data.ok && data.worker) {
-    appState.workers[w.name] = data.worker;
-    if (el('codeEditor') && el('codeEditor').dataset.workerName === w.name) {
-      el('codeEditor').dataset.fileName = '';
-    }
-    addNotification(`Rolled back ${w.name} to version ${versionId}`);
-    renderAll();
-  }
-};
-
-window.copyTextToClipboard = async function (text) {
-  try {
-    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-      await navigator.clipboard.writeText(text);
-    } else {
-      const ta = document.createElement('textarea');
-      ta.value = text;
-      ta.style.position = 'fixed';
-      ta.style.opacity = '0';
-      document.body.appendChild(ta);
-      ta.focus();
-      ta.select();
-      try {
-        document.execCommand('copy');
-      } catch (_) {}
-      ta.remove();
-    }
-    addNotification(`Copied to clipboard: ${text}`);
-  } catch (_) {}
-};
-
-// ============================================================================
-// Event Listeners Setup
-// ============================================================================
-document.addEventListener('DOMContentLoaded', async () => {
-  renderAll();
-  const initialPath = (window.location.pathname || '/').replace(/^\/+|\/+$/g, '').toLowerCase();
-  const validInitialViews = ['editor', 'records', 'websites', 'analytics', 'storage', 'plans', 'detail'];
-  switchView(validInitialViews.includes(initialPath) ? initialPath : 'applications');
-
-  // Top Header & Sidebar navigation
-  el('brandBtn').addEventListener('click', () => switchView('applications'));
-  el('sidebarAccountBtn').addEventListener('click', () => switchView('websites'));
-  el('topEditorSwitchBtn').addEventListener('click', () => switchView('editor'));
-  el('topRecordsSwitchBtn').addEventListener('click', () => switchView('records'));
-  el('topQuickSearchBtn').addEventListener('click', openQuickJumpPalette);
-  el('topAddBtn').addEventListener('click', () => openWorkerModal('create'));
-
-  const refreshIpBtn = el('refreshDashboardIpBtn');
-  if (refreshIpBtn) {
-    refreshIpBtn.addEventListener('click', refreshDashboardClientIpFromHttp);
-  }
-
-  document.querySelectorAll('.cf-side-item, .cf-side-subitem').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      if (btn.dataset.view) switchView(btn.dataset.view);
-    });
-  });
-
-  // Overview search / filter / sort & sidebar buttons
-  el('workerSearchInput').addEventListener('input', renderApplicationsView);
-  el('workerSearchBtn').addEventListener('click', renderApplicationsView);
-  el('workerFilterSelect').addEventListener('change', renderApplicationsView);
-  el('workerSortSelect').addEventListener('change', renderApplicationsView);
-
-  el('createWorkerMainBtn').addEventListener('click', () => openWorkerModal('create'));
-  el('asideCreateWorkerLink').addEventListener('click', () => openWorkerModal('create'));
-  el('asideOpenEditorLink').addEventListener('click', () => switchView('editor'));
-  el('goToRecordsFromAppsBtn').addEventListener('click', () => switchView('records'));
-  el('copyClientIpBox').addEventListener('click', () =>
-    window.copyTextToClipboard(appState.clientDevice.ip || '127.0.0.1')
-  );
-  el('qaOpenEditor').addEventListener('click', () => switchView('editor'));
-  el('qaConfigureTunnel').addEventListener('click', () => switchView('records'));
-  el('qaCheckDns').addEventListener('click', () => {
-    switchView('records');
-    el('topCheckRecordBtn').click();
-  });
-
-  // Worker Detail View & All 8 Sub-tabs
-  el('detailBackToOverviewBtn').addEventListener('click', () => switchView('applications'));
-  el('detailEditCodeBtn').addEventListener('click', () => switchView('editor'));
-  if (el('detailRunActionBtn')) {
-    el('detailRunActionBtn').addEventListener('click', async () => {
-      const w = getActiveWorkerObj();
-      if (!w) return;
-      await fetch(`/${encodeURIComponent(w.name)}`);
-      await fetchAppState();
-      addNotification(`Executed /${w.name} and updated live metrics`);
-    });
-  }
-  if (el('stepOpenEditor')) el('stepOpenEditor').addEventListener('click', () => switchView('editor'));
-  if (el('stepOpenPublicLinks')) el('stepOpenPublicLinks').addEventListener('click', () => switchDetailSubtab('domains'));
-  if (el('stepOpenSettings')) el('stepOpenSettings').addEventListener('click', () => switchDetailSubtab('settings'));
-  if (el('jumpToBindingsSubtabBtn')) el('jumpToBindingsSubtabBtn').addEventListener('click', () => switchDetailSubtab('bindings'));
-  if (el('jumpToMetricsSubtabBtn')) el('jumpToMetricsSubtabBtn').addEventListener('click', () => switchDetailSubtab('metrics'));
-  if (el('jumpToDeploymentsSubtabBtn')) el('jumpToDeploymentsSubtabBtn').addEventListener('click', () => switchDetailSubtab('deployments'));
-  if (el('jumpToDomainsSubtabBtn')) el('jumpToDomainsSubtabBtn').addEventListener('click', () => switchDetailSubtab('domains'));
-  if (el('settingsJumpBindingsBtn')) {
-    el('settingsJumpBindingsBtn').addEventListener('click', () => {
-      const box = el('settingsInlineVarBox');
-      if (box) {
-        box.classList.toggle('hidden');
-        el('settingsNewVarKeyInput')?.focus();
-      } else {
-        switchDetailSubtab('bindings');
-      }
-    });
-  }
-  if (el('settingsSaveVarBtn')) {
-    el('settingsSaveVarBtn').addEventListener('click', async () => {
-      const w = getActiveWorkerObj();
-      const kInp = el('settingsNewVarKeyInput');
-      const vInp = el('settingsNewVarValInput');
-      if (!w || !kInp || !vInp) return;
-      const key = kInp.value.trim();
-      const val = vInp.value;
-      if (!key) return;
-      const nextBindings = { ...(w.bindings || {}), [key]: val };
-      kInp.value = '';
-      vInp.value = '';
-      el('settingsInlineVarBox')?.classList.add('hidden');
-      await saveActiveWorkerToStorage({ bindings: nextBindings, deploy: true, deploySource: 'Updated Runtime Variables' });
-      addNotification(`Saved variable env.${key}`);
-    });
-  }
-  if (el('settingsOpenExplorerBtn')) el('settingsOpenExplorerBtn').addEventListener('click', () => switchView('editor'));
-  if (el('deploymentsRefreshBtn')) el('deploymentsRefreshBtn').addEventListener('click', fetchAppState);
-  if (el('deploymentsCreateNewBtn')) {
-    el('deploymentsCreateNewBtn').addEventListener('click', async () => {
-      const w = getActiveWorkerObj();
-      if (!w) return;
-      const res = await fetch(`/api/workers/${encodeURIComponent(w.name)}/deployments`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ action: 'deploy', source: 'Deployed from Dashboard' })
-      });
-      const data = await res.json();
-      if (data.ok && data.worker) {
-        appState.workers[w.name] = data.worker;
-        addNotification(`Deployed new revision ${data.worker.deployId} for ${w.name}`);
-        renderAll();
-      }
-    });
-  }
-
-  if (el('metricsVersionFilterSelect')) el('metricsVersionFilterSelect').addEventListener('change', renderDetailView);
-  if (el('metricsTimeRangeSelect')) el('metricsTimeRangeSelect').addEventListener('change', renderDetailView);
-  if (el('metricsTriggerTestBtn')) {
-    el('metricsTriggerTestBtn').addEventListener('click', async () => {
-      const w = getActiveWorkerObj();
-      if (!w) return;
-      await fetch(`/${encodeURIComponent(w.name)}`);
-      await fetchAppState();
-      addNotification(`Invoked /${w.name} and updated all 12 metrics charts`);
-    });
-  }
-
-  if (el('obsTypeFilterSelect')) el('obsTypeFilterSelect').addEventListener('change', renderDetailView);
-  if (el('obsQuerySearchInput')) el('obsQuerySearchInput').addEventListener('input', renderDetailView);
-  if (el('obsRunTestBtn')) {
-    el('obsRunTestBtn').addEventListener('click', async () => {
-      const w = getActiveWorkerObj();
-      if (!w) return;
-      await fetch(`/${encodeURIComponent(w.name)}`);
-      await fetchAppState();
-      addNotification(`Captured live invocation event for /${w.name}`);
-    });
-  }
-  if (el('obsClearLogsBtn')) {
-    el('obsClearLogsBtn').addEventListener('click', async () => {
-      const w = getActiveWorkerObj();
-      if (!w) return;
-      await fetch(`/api/workers/${encodeURIComponent(w.name)}/logs`, { method: 'DELETE' });
-      await fetchAppState();
-      addNotification(`Cleared logs for ${w.name}`);
-    });
-  }
-  if (el('obsLiveTailBtn')) {
-    let liveTailInterval = null;
-    el('obsLiveTailBtn').addEventListener('click', () => {
-      const btn = el('obsLiveTailBtn');
-      const txt = el('obsLiveTailBtnText');
-      if (liveTailInterval) {
-        clearInterval(liveTailInterval);
-        liveTailInterval = null;
-        btn.classList.remove('btn-black');
-        btn.classList.add('btn-outline');
-        if (txt) txt.textContent = 'Live Tail';
-        addNotification('Stopped Live Tail stream');
-      } else {
-        btn.classList.remove('btn-outline');
-        btn.classList.add('btn-black');
-        if (txt) txt.textContent = 'Streaming Live...';
-        addNotification('Started Live Tail real-time event stream');
-        liveTailInterval = setInterval(async () => {
-          if (appState.currentView !== 'detail' || appState.currentDetailSubtab !== 'observability') return;
-          await fetchAppState();
-        }, 2000);
-      }
-    });
-  }
-
-  if (el('settingLogsToggle')) {
-    el('settingLogsToggle').addEventListener('change', async (e) => {
-      const w = getActiveWorkerObj();
-      if (!w) return;
-      await fetch(`/api/workers/${encodeURIComponent(w.name)}/observability`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ observabilityConfig: { logsEnabled: e.target.checked } })
-      });
-      await fetchAppState();
-    });
-  }
-
-  if (el('settingIssuesToggle')) {
-    el('settingIssuesToggle').addEventListener('change', (e) => {
-      window.toggleWorkerIssueDetection(e.target.checked);
-    });
-  }
-
-  document.querySelectorAll('#detailSubtabsBar .cf-subtab').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      if (btn.dataset.subtab) switchDetailSubtab(btn.dataset.subtab);
-    });
-  });
-
-  // Explorer Sidepanel, Activity Bar, Workbench Bar & Bottom Panel Controls
-  function toggleExplorerSidebar() {
-    const sb = el('editorExplorerSidebar');
-    if (!sb) return;
-    const isHidden = sb.classList.toggle('hidden');
-    el('actExplorerBtn')?.classList.toggle('active', !isHidden);
-    el('toggleExplorerBtn')?.classList.toggle('active', !isHidden);
-  }
-
-  function toggleBottomPanel() {
-    const bp = el('editorBottomPanel');
-    if (!bp) return;
-    const isHidden = bp.classList.toggle('hidden');
-    el('toggleBottomPanelBtn')?.classList.toggle('active', !isHidden);
-    renderBottomPanel(getActiveWorkerObj());
-  }
-
-  function toggleRightInspectorPane() {
-    const rp = el('editorInspectorPane');
-    if (!rp) return;
-    const isHidden = rp.classList.toggle('hidden');
-    el('toggleRightPaneBtn')?.classList.toggle('active', !isHidden);
-  }
-
-  if (el('actExplorerBtn')) el('actExplorerBtn').addEventListener('click', toggleExplorerSidebar);
-  if (el('toggleExplorerBtn')) el('toggleExplorerBtn').addEventListener('click', toggleExplorerSidebar);
-  if (el('toggleBottomPanelBtn')) el('toggleBottomPanelBtn').addEventListener('click', toggleBottomPanel);
-  if (el('bottomPanelCloseBtn')) el('bottomPanelCloseBtn').addEventListener('click', toggleBottomPanel);
-  if (el('toggleRightPaneBtn')) el('toggleRightPaneBtn').addEventListener('click', toggleRightInspectorPane);
-
-  if (el('actSearchBtn')) el('actSearchBtn').addEventListener('click', () => el('tabActFindBtn')?.click());
-  if (el('wbSearchPill')) el('wbSearchPill').addEventListener('click', () => el('tabActFindBtn')?.click());
-  if (el('actNewFileBtn')) el('actNewFileBtn').addEventListener('click', window.promptExplorerCreateFile);
-  if (el('actSettingsBtn')) el('actSettingsBtn').addEventListener('click', openLanguageModePicker);
-
-  if (el('explorerNewFileBtn')) el('explorerNewFileBtn').addEventListener('click', window.promptExplorerCreateFile);
-  if (el('explorerTopNewFileBtn')) el('explorerTopNewFileBtn').addEventListener('click', window.promptExplorerCreateFile);
-  if (el('tabActNewFileBtn')) el('tabActNewFileBtn').addEventListener('click', window.promptExplorerCreateFile);
-  if (el('explorerRenameFileBtn')) el('explorerRenameFileBtn').addEventListener('click', () => window.promptExplorerRenameFile());
-  if (el('explorerRefreshBtn')) el('explorerRefreshBtn').addEventListener('click', fetchAppState);
-  if (el('explorerDeleteFileBtn')) el('explorerDeleteFileBtn').addEventListener('click', () => window.deleteWorkerFile());
-
-  if (el('explorerInlineSubmitBtn')) el('explorerInlineSubmitBtn').addEventListener('click', window.submitExplorerInlineForm);
-  if (el('explorerInlineCancelBtn')) {
-    el('explorerInlineCancelBtn').addEventListener('click', () => {
-      el('explorerInlineForm')?.classList.add('hidden');
-      appState.explorerInlineMode = null;
-    });
-  }
-  if (el('explorerInlineInput')) {
-    el('explorerInlineInput').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        window.submitExplorerInlineForm();
-      } else if (e.key === 'Escape') {
-        e.preventDefault();
-        el('explorerInlineForm')?.classList.add('hidden');
-        appState.explorerInlineMode = null;
-      }
-    });
-  }
-
-  if (el('explorerWorkerFolderToggle')) {
-    el('explorerWorkerFolderToggle').addEventListener('click', () => {
-      const tree = el('explorerFilesList');
-      const caret = el('explorerFolderCaret');
-      if (!tree) return;
-      const hidden = tree.classList.toggle('hidden');
-      if (caret) caret.className = hidden ? 'fa-solid fa-chevron-right' : 'fa-solid fa-chevron-down';
-    });
-  }
-
-  if (el('explorerOutlineToggle')) {
-    el('explorerOutlineToggle').addEventListener('click', () => {
-      const list = el('explorerOutlineList');
-      const caret = el('explorerOutlineCaret');
-      if (!list) return;
-      const hidden = list.classList.toggle('hidden');
-      if (caret) caret.className = hidden ? 'fa-solid fa-chevron-right' : 'fa-solid fa-chevron-down';
-    });
-  }
-
-  if (el('explorerTimelineToggle')) {
-    el('explorerTimelineToggle').addEventListener('click', () => {
-      const list = el('explorerTimelineList');
-      const caret = el('explorerTimelineCaret');
-      if (!list) return;
-      const hidden = list.classList.toggle('hidden');
-      if (caret) caret.className = hidden ? 'fa-solid fa-chevron-right' : 'fa-solid fa-chevron-down';
-    });
-  }
-
-  if (el('wbPrevFileBtn')) {
-    el('wbPrevFileBtn').addEventListener('click', () => {
-      const w = getActiveWorkerObj();
-      if (!w || !Array.isArray(w.files) || w.files.length < 2) return;
-      const cur = appState.activeFileByWorker[w.name];
-      const idx = w.files.findIndex((f) => f.name === cur);
-      const prevIdx = (idx - 1 + w.files.length) % w.files.length;
-      window.selectWorkerFile(w.files[prevIdx].name);
-    });
-  }
-
-  if (el('wbNextFileBtn')) {
-    el('wbNextFileBtn').addEventListener('click', () => {
-      const w = getActiveWorkerObj();
-      if (!w || !Array.isArray(w.files) || w.files.length < 2) return;
-      const cur = appState.activeFileByWorker[w.name];
-      const idx = w.files.findIndex((f) => f.name === cur);
-      const nextIdx = (idx + 1) % w.files.length;
-      window.selectWorkerFile(w.files[nextIdx].name);
-    });
-  }
-
-  document.querySelectorAll('.vscode-bp-tab').forEach((tabBtn) => {
-    tabBtn.addEventListener('click', () => {
-      document.querySelectorAll('.vscode-bp-tab').forEach((b) => b.classList.remove('active'));
-      tabBtn.classList.add('active');
-      appState.bottomPanelTab = tabBtn.dataset.btab || 'output';
-      renderBottomPanel(getActiveWorkerObj());
-    });
-  });
-
-  async function executeBottomTerminalCommand() {
-    const inp = el('bottomTerminalCmdInput');
-    const w = getActiveWorkerObj();
-    if (!inp || !w) return;
-    const cmd = inp.value.trim();
-    if (!cmd) return;
-    inp.value = '';
-    if (!Array.isArray(appState.terminalHistory)) appState.terminalHistory = [];
-    appState.terminalHistory.push(`robo-workers:/home/user/storage/workers/${w.name}$ ${cmd}`);
-
-    const parts = cmd.split(/\s+/);
-    const base = parts[0].toLowerCase();
-    if (base === 'clear') {
-      appState.terminalHistory = [];
-    } else if (base === 'ls') {
-      const fileStr = (w.files || []).map((f) => `${f.name} (${f.sizeBytes || 0}B)`).join('  ');
-      appState.terminalHistory.push(fileStr || w.filename);
-    } else if (base === 'pwd') {
-      appState.terminalHistory.push(`/home/user/storage/workers/${w.name}`);
-    } else if (base === 'cat') {
-      const target = parts[1] || w.filename;
-      const found = (w.files || []).find((f) => f.name === target);
-      appState.terminalHistory.push(found ? found.content : `cat: ${target}: No such file in worker "${w.name}"`);
-    } else if (base === 'curl') {
-      const targetUrl = parts.find((p) => p.startsWith('/') || p.startsWith('http')) || `/${w.name}`;
-      const pathOnly = targetUrl.startsWith('http') ? new URL(targetUrl).pathname : targetUrl;
-      const t0 = performance.now();
-      const resp = await fetch(pathOnly);
-      const txt = await resp.text();
-      const ms = Math.round(performance.now() - t0);
-      appState.terminalHistory.push(`HTTP/1.1 ${resp.status} OK (${ms} ms)\n${txt}`);
-      await fetchAppState();
-    } else if (base === 'status') {
-      const sys = appState.systemTelemetry || {};
-      appState.terminalHistory.push(
-        `Worker: ${w.name} | Runtime: ${w.language} | Revision: ${w.deployId} | Host RAM: ${sys.memoryUsedMb || 0}/${sys.memoryTotalMb || 0} MB | Requests: ${w.requests || 0}`
+    s.onload = () => {
+      // workers from a CDN need a same-origin data: shim
+      window.MonacoEnvironment = {
+        getWorkerUrl() {
+          return `data:text/javascript;charset=utf-8,${encodeURIComponent(
+            `self.MonacoEnvironment={baseUrl:'${MONACO_BASE}/'};importScripts('${MONACO_BASE}/vs/base/worker/workerMain.js');`
+          )}`;
+        }
+      };
+      window.require.config({ paths: { vs: `${MONACO_BASE}/vs` } });
+      window.require(
+        ['vs/editor/editor.main'],
+        () => {
+          clearTimeout(timer);
+          defineMonacoThemes(window.monaco);
+          resolve(window.monaco);
+        },
+        (err) => {
+          clearTimeout(timer);
+          reject(err);
+        }
       );
-    } else {
-      appState.terminalHistory.push(`Available commands: ls, pwd, cat <file>, curl /${w.name}, status, clear`);
-    }
-    renderBottomPanel(w);
-  }
-
-  if (el('bottomTerminalRunBtn')) {
-    el('bottomTerminalRunBtn').addEventListener('click', executeBottomTerminalCommand);
-  }
-  if (el('bottomTerminalCmdInput')) {
-    el('bottomTerminalCmdInput').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        executeBottomTerminalCommand();
-      }
-    });
-  }
-
-  if (el('bottomPanelFilterInput')) {
-    el('bottomPanelFilterInput').addEventListener('input', () => renderBottomPanel(getActiveWorkerObj()));
-  }
-  if (el('bottomPanelClearBtn')) {
-    el('bottomPanelClearBtn').addEventListener('click', () => {
-      if (el('bottomPanelBody')) el('bottomPanelBody').textContent = '';
-    });
-  }
-
-  if (el('previewUrlBadge')) {
-    el('previewUrlBadge').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        el('previewUrlBadge').dataset.userEditedWorker = appState.activeWorker;
-        updatePreviewPaneOutput();
-      }
-    });
-  }
-
-  el('metricsTriggerTestBtn').addEventListener('click', async () => {
-    const w = getActiveWorkerObj();
-    if (!w) return;
-    await fetch(`/${encodeURIComponent(w.name)}`);
-    await fetchAppState();
-    addNotification(`Triggered test request to /${w.name}`);
+    };
+    document.head.appendChild(s);
+  }).catch((err) => {
+    monacoPromise = null;
+    throw err;
   });
-
-  el('deploymentsCreateNewBtn').addEventListener('click', async () => {
-    await saveActiveWorkerToStorage({ deploy: true, deploySource: 'Manual Deployment' });
-    addNotification(`Created new deployment revision for ${appState.activeWorker}`);
-  });
-
-  el('addBindingForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const k = el('bindingKeyInput').value.trim();
-    const v = el('bindingValInput').value.trim();
-    if (!k) return;
-    const w = getActiveWorkerObj();
-    if (!w) return;
-    const nextBindings = { ...(w.bindings || {}), [k]: v };
-    el('bindingKeyInput').value = '';
-    el('bindingValInput').value = '';
-    await saveActiveWorkerToStorage({ bindings: nextBindings, deploy: true, deploySource: `Added Binding ${k}` });
-    addNotification(`Saved binding env.${k}`);
-  });
-
-  el('obsRunTestBtn').addEventListener('click', async () => {
-    const w = getActiveWorkerObj();
-    if (!w) return;
-    await fetch(`/${encodeURIComponent(w.name)}`);
-    await fetchAppState();
-  });
-
-  el('obsClearLogsBtn').addEventListener('click', async () => {
-    const w = getActiveWorkerObj();
-    if (!w) return;
-    await fetch(`/api/logs/${encodeURIComponent(w.name)}`, { method: 'DELETE' });
-    await fetchAppState();
-  });
-
-  el('detailSettingRenameBtn').addEventListener('click', async () => {
-    const newName = el('detailSettingRenameInput').value.trim();
-    const oldName = appState.activeWorker;
-    if (!newName || newName === oldName) return;
-    const res = await fetch(`/api/workers/${encodeURIComponent(oldName)}`, {
-      method: 'PUT',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ newName })
-    });
-    const data = await res.json();
-    if (data.ok && data.worker) {
-      appState.activeWorker = data.worker.name;
-      await fetchAppState();
-      addNotification(`Renamed worker to ${data.worker.name}`);
+  return monacoPromise;
+}
+function defineMonacoThemes(monaco) {
+  monaco.editor.defineTheme('ax-dark', {
+    base: 'vs-dark',
+    inherit: true,
+    rules: [
+      { token: '', foreground: 'e9e3d8' },
+      { token: 'comment', foreground: '6f695f', fontStyle: 'italic' },
+      { token: 'keyword', foreground: 'd9c3a0' },
+      { token: 'string', foreground: 'b7c99f' },
+      { token: 'number', foreground: 'e6b98a' },
+      { token: 'regexp', foreground: 'e6b98a' },
+      { token: 'type', foreground: 'c9b6e0' },
+      { token: 'delimiter', foreground: '9a9286' }
+    ],
+    colors: {
+      'editor.background': '#1a1917',
+      'editor.foreground': '#e9e3d8',
+      'editor.lineHighlightBackground': '#211f1d',
+      'editor.lineHighlightBorder': '#00000000',
+      'editorLineNumber.foreground': '#4f4a43',
+      'editorLineNumber.activeForeground': '#b9b1a4',
+      'editor.selectionBackground': '#ecdcbf33',
+      'editor.inactiveSelectionBackground': '#ecdcbf1c',
+      'editorCursor.foreground': '#ecdcbf',
+      'editorIndentGuide.background1': '#2a2826',
+      'editorIndentGuide.activeBackground1': '#3a3734',
+      'editorWidget.background': '#211f1d',
+      'editorWidget.border': '#33302c',
+      'editorSuggestWidget.selectedBackground': '#2c2a27',
+      'scrollbarSlider.background': '#ecdcbf1a',
+      'scrollbarSlider.hoverBackground': '#ecdcbf2e'
     }
   });
-
-  el('detailSettingLangBtn').addEventListener('click', async () => {
-    const nextLang = el('detailSettingLangSelect').value;
-    await saveActiveWorkerToStorage({
-      language: nextLang,
-      useLanguageTemplate: true,
-      deploy: true,
-      deploySource: `Runtime changed to ${nextLang}`
-    });
-    addNotification(`Switched runtime to ${nextLang}`);
-  });
-
-  el('detailDownloadBtn').addEventListener('click', () => {
-    const w = getActiveWorkerObj();
-    if (!w) return;
-    const blob = new Blob([w.code || ''], { type: 'text/plain;charset=utf-8' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = w.filename || `${w.name}.js`;
-    a.click();
-  });
-
-  el('detailDeleteWorkerBtn').addEventListener('click', async () => {
-    await window.deleteWorkerByName(appState.activeWorker);
-    switchView('applications');
-  });
-
-  // Websites, Analytics & Storage Page buttons
-  el('websitesGoToRecordsBtn').addEventListener('click', () => switchView('records'));
-  el('analyticsRefreshBtn').addEventListener('click', fetchAppState);
-  el('analyticsLogFilterInput').addEventListener('input', renderAnalyticsView);
-  el('analyticsClearAllLogsBtn').addEventListener('click', async () => {
-    await fetch('/api/logs/_all', { method: 'DELETE' });
-    await fetchAppState();
-  });
-  el('storageRefreshBtn').addEventListener('click', fetchAppState);
-
-  // Quick Edit Topbar buttons
-  el('qeBackToDashboardBtn').addEventListener('click', () => switchView('applications'));
-  el('qeGoToRecordsBtn').addEventListener('click', () => switchView('records'));
-  el('backToAppsBtn').addEventListener('click', () => switchView('applications'));
-
-  el('workerSelect').addEventListener('change', async (e) => {
-    await window.openWorkerInEditor(e.target.value);
-  });
-
-  el('newWorkerQuickBtn').addEventListener('click', () => openWorkerModal('create'));
-  el('renameWorkerQuickBtn').addEventListener('click', () =>
-    openWorkerModal('rename', appState.activeWorker)
-  );
-
-  // Worker Modal Form
-  el('workerModalCloseBtn').addEventListener('click', () =>
-    el('workerModalOverlay').classList.add('hidden')
-  );
-  el('workerModalCancelBtn').addEventListener('click', () =>
-    el('workerModalOverlay').classList.add('hidden')
-  );
-  if (el('modalWorkerNameInput') && el('modalWorkerPublishLinkInput')) {
-    el('modalWorkerNameInput').addEventListener('input', (e) => {
-      const pubInp = el('modalWorkerPublishLinkInput');
-      if (workerModalMode === 'create' && pubInp && pubInp.dataset.customized !== 'true') {
-        const clean = e.target.value.trim().replace(/[^a-zA-Z0-9._-]/g, '-');
-        pubInp.value = clean ? `/${clean}` : '/';
-      }
-    });
-    el('modalWorkerPublishLinkInput').addEventListener('input', (e) => {
-      e.target.dataset.customized = 'true';
-    });
-  }
-  el('workerModalForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const rawName = el('modalWorkerNameInput').value.trim();
-    if (!rawName) return;
-    const publishingLink = el('modalWorkerPublishLinkInput')
-      ? el('modalWorkerPublishLinkInput').value.trim() || `/${rawName}`
-      : `/${rawName}`;
-
-    if (workerModalMode === 'create') {
-      const language = el('modalWorkerLangSelect').value || 'javascript';
-      const res = await fetch('/api/workers', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ name: rawName, language, publishingLink })
-      });
-      const data = await res.json();
-      if (data.ok && data.worker) {
-        addNotification(`Created worker "${data.worker.name}" at ${data.worker.publishingLink || '/' + data.worker.name}`);
-        el('workerModalOverlay').classList.add('hidden');
-        await fetchAppState();
-        switchView('editor');
-        await executeCurrentWorkerHttpRequest({ skipSave: true });
-      }
-    } else {
-      const oldName = appState.activeWorker;
-      const res = await fetch(`/api/workers/${encodeURIComponent(oldName)}`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ newName: rawName, publishingLink })
-      });
-      const data = await res.json();
-      if (data.ok && data.worker) {
-        addNotification(`Saved worker "${data.worker.name}" (${data.worker.publishingLink || '/' + data.worker.name})`);
-        el('workerModalOverlay').classList.add('hidden');
-        appState.activeWorker = data.worker.name;
-        await fetchAppState();
-      }
+  monaco.editor.defineTheme('ax-light', {
+    base: 'vs',
+    inherit: true,
+    rules: [
+      { token: '', foreground: '2a251e' },
+      { token: 'comment', foreground: 'a0968a', fontStyle: 'italic' },
+      { token: 'keyword', foreground: '8a5a2b' },
+      { token: 'string', foreground: '4f7a3f' },
+      { token: 'number', foreground: 'a3601f' },
+      { token: 'type', foreground: '6b4f8a' }
+    ],
+    colors: {
+      'editor.background': '#f9f6f1',
+      'editor.lineHighlightBackground': '#f1ece4',
+      'editor.lineHighlightBorder': '#00000000',
+      'editorLineNumber.foreground': '#c4baab',
+      'editorLineNumber.activeForeground': '#6d6355',
+      'editor.selectionBackground': '#2a251e1f',
+      'editorCursor.foreground': '#2a251e',
+      'editorIndentGuide.background1': '#e8e1d6'
     }
   });
+}
 
-  // Deploy button & dropdown menu
-  el('deployBtn').addEventListener('click', async () => {
-    const saved = await saveActiveWorkerToStorage({ deploy: true, deploySource: 'Quick Edit Deploy' });
-    if (saved !== false) {
-      addNotification(`Deployed "${appState.activeWorker}" to Robo Workers`);
-    } else {
-      addNotification(`Error saving "${appState.activeWorker}" to storage`, 'info');
+// Editor backends share one tiny interface: open(file), value(), dispose(), layout(), setTheme()
+function monacoBackend(monaco, host, ide) {
+  const models = new Map();
+  const viewStates = new Map();
+  let current = null;
+  const editor = monaco.editor.create(host, {
+    theme: S.theme === 'light' ? 'ax-light' : 'ax-dark',
+    fontFamily: "'Geist Mono', ui-monospace, monospace",
+    fontSize: 13,
+    lineHeight: 21,
+    minimap: { enabled: false },
+    scrollBeyondLastLine: false,
+    smoothScrolling: true,
+    automaticLayout: true,
+    tabSize: 2,
+    padding: { top: 12 },
+    renderLineHighlight: 'all',
+    fixedOverflowWidgets: true
+  });
+  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => ide.save());
+  editor.onDidChangeModelContent(() => {
+    if (current) ide.onEdit(current, editor.getValue());
+  });
+  const uri = (f) => monaco.Uri.parse(`file:///${enc(ide.name)}/${enc(f)}`);
+  return {
+    kind: 'monaco',
+    open(f) {
+      if (current) viewStates.set(current, editor.saveViewState());
+      let m = models.get(f);
+      if (!m) {
+        m = monaco.editor.createModel(ide.files.get(f).current, EXT_TO_MONACO[extOf(f)] || 'plaintext', uri(f));
+        models.set(f, m);
+      }
+      current = f;
+      editor.setModel(m);
+      if (viewStates.get(f)) editor.restoreViewState(viewStates.get(f));
+      editor.focus();
+    },
+    drop(f) {
+      const m = models.get(f);
+      if (m) m.dispose();
+      models.delete(f);
+      viewStates.delete(f);
+      if (current === f) current = null;
+    },
+    value: () => editor.getValue(),
+    layout: () => editor.layout(),
+    setTheme: (t) => monaco.editor.setTheme(t === 'light' ? 'ax-light' : 'ax-dark'),
+    dispose() {
+      editor.dispose();
+      models.forEach((m) => m.dispose());
     }
-    await executeCurrentWorkerHttpRequest({ skipSave: true });
+  };
+}
+
+function basicBackend(host, ide) {
+  host.innerHTML = `<div class="fallback-editor"><div class="gutter" aria-hidden="true"></div><div class="stage"><pre aria-hidden="true"></pre><textarea spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Code editor"></textarea></div></div>`;
+  const ta = $('textarea', host);
+  const pre = $('pre', host);
+  const gutter = $('.gutter', host);
+  let current = null;
+  const paint = () => {
+    const code = ta.value;
+    const lang = langOfFile(current || '');
+    pre.innerHTML = (typeof window.vscodeHighlight === 'function' ? window.vscodeHighlight(code, lang) : esc(code)) + '\n';
+    const lines = code.split('\n').length;
+    gutter.innerHTML = Array.from({ length: lines }, (_, i) => i + 1).join('<br>');
+    ta.style.height = `${pre.scrollHeight}px`;
+    ta.style.width = `${pre.scrollWidth}px`;
+  };
+  ta.addEventListener('input', () => {
+    paint();
+    if (current) ide.onEdit(current, ta.value);
   });
-
-  el('deployMenuBtn').addEventListener('click', (e) => {
-    e.stopPropagation();
-    el('deployDropdown').classList.toggle('hidden');
-  });
-
-  document.addEventListener('click', () => {
-    el('deployDropdown').classList.add('hidden');
-  });
-
-  el('menuDeployNow').addEventListener('click', async () => {
-    const saved = await saveActiveWorkerToStorage({ deploy: true, deploySource: 'Quick Edit Deploy' });
-    if (saved !== false) {
-      addNotification(`Deployed "${appState.activeWorker}" to Robo Workers`);
-    }
-    await executeCurrentWorkerHttpRequest({ skipSave: true });
-  });
-
-  el('menuOpenEndpoint').addEventListener('click', () => {
-    window.open(`/${appState.activeWorker}`, '_blank');
-  });
-
-  el('menuLoadTemplate').addEventListener('click', async () => {
-    const w = getActiveWorkerObj();
-    if (!w) return;
-    await saveActiveWorkerToStorage({
-      language: w.language,
-      useLanguageTemplate: true,
-      deploy: true,
-      deploySource: 'Reset Template'
-    });
-    await executeCurrentWorkerHttpRequest({ skipSave: true });
-  });
-
-  el('menuDownloadFile').addEventListener('click', () => {
-    const w = getActiveWorkerObj();
-    if (!w) return;
-    const blob = new Blob([el('codeEditor').value], { type: 'text/plain;charset=utf-8' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = w.filename || `${w.name}.js`;
-    a.click();
-  });
-
-  el('menuDeleteWorker').addEventListener('click', async () => {
-    await window.deleteWorkerByName(appState.activeWorker);
-  });
-
-  // Code Editor events
-  const codeEditor = el('codeEditor');
-  codeEditor.addEventListener('input', () => {
-    updateEditorHighlightAndLines();
-    updateCursorPosition();
-    const w = getActiveWorkerObj();
-    runBasicDiagnostics(codeEditor.value, w ? w.language : 'javascript');
-    scheduleAutoSave();
-  });
-
-  codeEditor.addEventListener('click', updateCursorPosition);
-  codeEditor.addEventListener('keyup', updateCursorPosition);
-
-  codeEditor.addEventListener('keydown', (e) => {
+  ta.addEventListener('keydown', (e) => {
     if (e.key === 'Tab') {
       e.preventDefault();
-      const w = getActiveWorkerObj();
-      const indent = w && w.indentUsingTabs ? '\t' : ' '.repeat((w && w.spaces) || 2);
-      const start = codeEditor.selectionStart;
-      const end = codeEditor.selectionEnd;
-      codeEditor.value =
-        codeEditor.value.substring(0, start) + indent + codeEditor.value.substring(end);
-      codeEditor.selectionStart = codeEditor.selectionEnd = start + indent.length;
-      updateEditorHighlightAndLines();
-      updateCursorPosition();
-      scheduleAutoSave();
+      const s = ta.selectionStart;
+      ta.setRangeText('  ', s, ta.selectionEnd, 'end');
+      ta.dispatchEvent(new Event('input'));
     }
   });
+  return {
+    kind: 'basic',
+    open(f) {
+      current = f;
+      ta.value = ide.files.get(f).current;
+      paint();
+      ta.focus();
+    },
+    drop(f) {
+      if (current === f) current = null;
+    },
+    value: () => ta.value,
+    layout() {},
+    setTheme() {},
+    dispose() {
+      host.innerHTML = '';
+    }
+  };
+}
 
-  // Inspector Tabs (Preview vs HTTP)
-  el('tabPreviewBtn').addEventListener('click', () => {
-    el('tabPreviewBtn').classList.add('active');
-    el('tabHttpBtn').classList.remove('active');
-    el('panePreview').classList.remove('hidden');
-    el('paneHttp').classList.add('hidden');
-    executeCurrentWorkerHttpRequest();
-  });
-
-  el('tabHttpBtn').addEventListener('click', () => {
-    el('tabHttpBtn').classList.add('active');
-    el('tabPreviewBtn').classList.remove('active');
-    el('paneHttp').classList.remove('hidden');
-    el('panePreview').classList.add('hidden');
-  });
-
-  el('httpMethodSelect').addEventListener('change', (e) => {
-    const m = e.target.value;
-    el('httpBodySection').classList.toggle('hidden', !['POST', 'PUT', 'PATCH', 'QUERY'].includes(m));
-  });
-
-  el('httpSendBtn').addEventListener('click', executeCurrentWorkerHttpRequest);
-  el('refreshPreviewBtn').addEventListener('click', executeCurrentWorkerHttpRequest);
-  el('httpUrlInput').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') executeCurrentWorkerHttpRequest();
-  });
-
-  el('addHeaderBtn').addEventListener('click', () => {
-    appState.customHeaders.push({ key: '', value: '' });
-    renderCustomHeaders();
-  });
-
-  function renderCustomHeaders() {
-    const container = el('httpHeadersList');
-    container.innerHTML = appState.customHeaders
-      .map(
-        (h, idx) => `
-      <div class="header-row">
-        <input type="text" placeholder="Header-Name" value="${escapeHtml(h.key)}" data-idx="${idx}" data-field="key" />
-        <input type="text" placeholder="Value" value="${escapeHtml(h.value)}" data-idx="${idx}" data-field="value" />
-        <button type="button" class="header-remove-btn" data-remove="${idx}"><i class="fa-solid fa-xmark"></i></button>
-      </div>
-    `
-      )
-      .join('');
-
-    container.querySelectorAll('input').forEach((inp) => {
-      inp.addEventListener('input', (e) => {
-        const i = Number(e.target.dataset.idx);
-        const f = e.target.dataset.field;
-        appState.customHeaders[i][f] = e.target.value;
-      });
-    });
-
-    container.querySelectorAll('[data-remove]').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const i = Number(btn.dataset.remove);
-        appState.customHeaders.splice(i, 1);
-        renderCustomHeaders();
-      });
-    });
-  }
-
-  el('clearConsoleBtn').addEventListener('click', async () => {
-    const w = getActiveWorkerObj();
-    if (!w) return;
-    await fetch(`/api/logs/${encodeURIComponent(w.name)}`, { method: 'DELETE' });
-    w.logs = [];
-    renderConsoleLogs(w);
-  });
-
-  // Bottom VS Code Blue Status Bar Interactive Buttons
-  el('statusLanguageBtn').addEventListener('click', openLanguageModePicker);
-  el('statusIndentBtn').addEventListener('click', openIndentationPicker);
-  el('statusEncodingBtn').addEventListener('click', openEncodingPicker);
-  el('statusEolBtn').addEventListener('click', openEolPicker);
-  el('statusFormatBtn').addEventListener('click', formatActiveDocument);
-  el('statusLayoutBtn').addEventListener('click', openLayoutPicker);
-  el('statusCursorBtn').addEventListener('click', openGoToLinePicker);
-  el('statusProblemsBtn').addEventListener('click', openProblemsPicker);
-  el('statusBranchBtn').addEventListener('click', () => switchView('storage'));
-  el('statusNotifyBtn').addEventListener('click', openNotificationsPicker);
-
-  // Tab Strip Action Buttons & Find-in-File Widget (from vscode.html)
-  const tabActNew = el('tabActNewBtn');
-  if (tabActNew) {
-    tabActNew.addEventListener('click', () => {
-      if (getActiveWorkerObj()) {
-        window.promptExplorerCreateFile();
-      } else {
-        openWorkerModal('create');
+class Ide {
+  constructor(root, w) {
+    this.root = root;
+    this.name = w.name;
+    this.worker = w;
+    this.entry = w.filename;
+    this.files = new Map((w.files || []).map((f) => [f.name, { saved: f.content, current: f.content, size: f.sizeBytes }]));
+    this.tabs = [];
+    this.active = null;
+    this.autosave = store.get('ax-autosave', true);
+    this.panel = store.get('ax-panel', 'preview');
+    this.saving = false;
+    this.saveError = '';
+    this.consoleOpen = store.get('ax-console', true);
+    this.autosaveSoon = debounce(() => this.autosave && this.save(true), 1200);
+    this.onKey = (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        this.save();
       }
-    });
+    };
   }
-  const tabActMore = el('tabActMoreBtn');
-  if (tabActMore) tabActMore.addEventListener('click', openQuickJumpPalette);
-
-  function openFindWidget() {
-    const fw = el('findWidget');
-    const fwInp = el('fwInput');
-    if (!fw || !fwInp) return;
-    fw.classList.remove('hidden');
-    const sel = codeEditor.value.slice(codeEditor.selectionStart, codeEditor.selectionEnd);
-    if (sel && !sel.includes('\n')) fwInp.value = sel;
-    fwInp.focus();
-    fwInp.select();
-    updateFindCount();
+  dirtyCount() {
+    let n = 0;
+    this.files.forEach((f) => (n += f.current !== f.saved ? 1 : 0));
+    return n;
   }
+  async init() {
+    const sm = this.worker.summary;
+    $('#ideBar').innerHTML = `
+        <span class="save-state" id="ideState"></span>
+        <label class="row hint" style="gap:8px;margin-left:8px" title="Save shortly after you stop typing. Saved code is live immediately."><label class="switch"><input type="checkbox" id="ideAuto" ${this.autosave ? 'checked' : ''}><span></span></label><span class="hide-sm">Auto-save</span></label>
+        <button class="btn sm" id="ideVersion" title="Snapshot every file so you can roll back to it later"><span class="hide-sm">Make a version</span><span class="hide-lg">Version</span></button>
+        <button class="btn sm primary" id="ideSave" title="Save (Ctrl+S)">Save</button>`;
+    this.root.innerHTML = `<div class="ide">
+      <aside class="files" aria-label="Files">
+        <div class="files-head">Files<span class="tools"><button class="icon-btn sm" id="ideNewFile" title="New file" aria-label="New file">${icon('plus')}</button></span></div>
+        <div class="files-list" id="ideFiles"></div>
+      </aside>
+      <section class="editor-col">
+        <div class="editor-tabs" id="ideTabs" role="tablist" aria-label="Open files"></div>
+        <div class="editor-host" id="ideHost"><div class="empty" style="padding-top:18vh"><p>Loading the editor…</p></div></div>
+        <div class="console ${this.consoleOpen ? '' : 'collapsed'}" id="ideConsole">
+          <div class="console-head"><b>Console</b><span class="live"></span><span class="hint" id="ideConsoleCount"></span>
+            <span class="tools"><button class="icon-btn sm" id="ideConsoleClear" title="Clear view">${icon('trash')}</button><button class="icon-btn sm" id="ideConsoleToggle" title="Show / hide console">${icon(this.consoleOpen ? 'chevDown' : 'chevUp')}</button></span></div>
+          <div class="logbox" id="ideLog"></div>
+        </div>
+      </section>
+      <section class="side-panel" aria-label="Preview and request tester">
+        <div class="panel-tabs"><div class="tabs" role="tablist" data-seg="ptabs">
+          <button class="tab ${this.panel === 'preview' ? 'active' : ''}" data-panel="preview" role="tab">Preview</button>
+          <button class="tab ${this.panel === 'request' ? 'active' : ''}" data-panel="request" role="tab">Request</button>
+        </div></div>
+        <div class="panel-body" id="idePanel"></div>
+      </section>
+    </div>`;
+    // tabs: entry first, then the rest
+    this.tabs = [this.entry, ...[...this.files.keys()].filter((f) => f !== this.entry)].filter((f) => this.files.has(f)).slice(0, 6);
+    this.renderFiles();
+    this.renderPanel();
+    this.wire();
+    slideInd($('.side-panel .tabs', this.root));
 
-  function closeFindWidget() {
-    const fw = el('findWidget');
-    if (fw) fw.classList.add('hidden');
-    codeEditor.focus();
-  }
-
-  function getFindMatches() {
-    const q = (el('fwInput')?.value || '').toLowerCase();
-    if (!q) return [];
-    const src = codeEditor.value.toLowerCase();
-    const matches = [];
-    let idx = src.indexOf(q);
-    while (idx !== -1) {
-      matches.push(idx);
-      idx = src.indexOf(q, idx + Math.max(1, q.length));
+    try {
+      const monaco = await loadMonaco();
+      $('#ideHost').innerHTML = '';
+      this.ed = monacoBackend(monaco, $('#ideHost'), this);
+    } catch (err) {
+      this.ed = basicBackend($('#ideHost'), this);
+      if (store.get('ax-editor', 'monaco') !== 'basic') toast(`Using the basic editor: ${err.message}`, 'err');
     }
-    return matches;
-  }
+    if (!this.root.isConnected) return this.ed.dispose(); // navigated away while loading
+    this.open(this.entry && this.files.has(this.entry) ? this.entry : [...this.files.keys()][0]);
 
-  function updateFindCount() {
-    const countEl = el('fwCount');
-    if (!countEl) return;
-    const q = el('fwInput')?.value || '';
-    const matches = getFindMatches();
-    countEl.textContent = !q || matches.length === 0 ? 'No results' : `${matches.length} found`;
+    this.tail = createTail({
+      box: $('#ideLog'),
+      workers: () => [this.name],
+      filter: () => ({ levels: new Set(['req', 'info', 'warn', 'error']), q: '' }),
+      onCount: (n) => ($('#ideConsoleCount').textContent = n ? `${plural(n, 'line')}` : ''),
+      max: 300
+    });
+    this.tail.start();
+    this.renderState();
+    document.addEventListener('keydown', this.onKey);
+    this.unload = (e) => {
+      if (this.dirtyCount()) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    };
+    window.addEventListener('beforeunload', this.unload);
   }
-
-  function stepFindMatch(dir) {
-    const q = el('fwInput')?.value || '';
-    const matches = getFindMatches();
-    if (!q || matches.length === 0) {
-      updateFindCount();
+  wire() {
+    $('#ideSave').onclick = () => this.save();
+    $('#ideAuto').onchange = (e) => {
+      this.autosave = e.target.checked;
+      store.set('ax-autosave', this.autosave);
+      if (this.autosave && this.dirtyCount()) this.save(true);
+    };
+    $('#ideVersion').onclick = async () => {
+      if (this.dirtyCount()) await this.save();
+      const r = await attempt(() => api('POST', `/api/workers/${enc(this.name)}/deployments`, { source: 'Created from editor' }));
+      if (r) toast(`Version ${r.worker.deployId} created. Roll back to it any time from Versions`);
+    };
+    $('#ideNewFile').onclick = () => this.newFileInput();
+    $('#ideFiles').onclick = (e) => {
+      const act = e.target.closest('[data-fact]');
+      const row = e.target.closest('[data-file]');
+      if (!row) return;
+      const f = row.dataset.file;
+      if (act) {
+        e.stopPropagation();
+        if (act.dataset.fact === 'rename') return this.renameInput(f, row);
+        if (act.dataset.fact === 'delete') return this.deleteFile(f);
+        if (act.dataset.fact === 'entry') return this.setEntry(f);
+      }
+      this.open(f);
+    };
+    $('#ideTabs').onclick = (e) => {
+      const t = e.target.closest('[data-tab]');
+      if (t) this.open(t.dataset.tab);
+    };
+    $('#ideConsoleToggle').onclick = () => {
+      this.consoleOpen = !this.consoleOpen;
+      store.set('ax-console', this.consoleOpen);
+      $('#ideConsole').classList.toggle('collapsed', !this.consoleOpen);
+      $('#ideConsoleToggle').innerHTML = icon(this.consoleOpen ? 'chevDown' : 'chevUp');
+    };
+    $('#ideConsoleClear').onclick = () => this.tail && this.tail.clear();
+    $$('.side-panel [data-panel]', this.root).forEach((b) =>
+      b.addEventListener('click', () => {
+        this.panel = b.dataset.panel;
+        store.set('ax-panel', this.panel);
+        $$('.side-panel [data-panel]', this.root).forEach((x) => x.classList.toggle('active', x === b));
+        slideInd($('.side-panel .tabs', this.root));
+        this.renderPanel();
+      })
+    );
+  }
+  open(f) {
+    if (!f || !this.files.has(f)) return;
+    this.active = f;
+    if (!this.tabs.includes(f)) this.tabs.push(f);
+    if (this.tabs.length > 8) this.tabs = this.tabs.filter((t) => t === f || t !== this.tabs[0]).slice(-8);
+    if (this.ed) this.ed.open(f);
+    this.renderFiles();
+  }
+  onEdit(f, value) {
+    const file = this.files.get(f);
+    if (!file) return;
+    file.current = value;
+    this.renderFiles();
+    this.renderState();
+    this.autosaveSoon();
+  }
+  renderFiles() {
+    const names = [...this.files.keys()].sort((a, b) => (a === this.entry ? -1 : b === this.entry ? 1 : a.localeCompare(b)));
+    $('#ideFiles').innerHTML = names
+      .map((f) => {
+        const file = this.files.get(f);
+        const dirty = file.current !== file.saved;
+        return `<div class="file ${f === this.active ? 'active' : ''}" data-file="${esc(f)}" role="button" tabindex="0" title="${esc(f)}">
+          ${langIcon(langOfFile(f), 'sm')}<span class="nm">${esc(f)}</span>
+          ${dirty ? '<span class="dirty" title="Unsaved"></span>' : f === this.entry ? '<span class="entry" title="Runs on each request">ENTRY</span>' : ''}
+          <span class="acts">
+            ${f !== this.entry ? `<button class="icon-btn sm" data-fact="entry" title="Make this the entry file">${icon('star')}</button>` : ''}
+            <button class="icon-btn sm" data-fact="rename" title="Rename">${icon('edit')}</button>
+            ${this.files.size > 1 ? `<button class="icon-btn sm" data-fact="delete" title="Delete">${icon('trash')}</button>` : ''}
+          </span></div>`;
+      })
+      .join('');
+    $('#ideTabs').innerHTML = this.tabs
+      .filter((f) => this.files.has(f))
+      .map((f) => {
+        const file = this.files.get(f);
+        return `<button class="etab ${f === this.active ? 'active' : ''}" data-tab="${esc(f)}" role="tab" aria-selected="${f === this.active}">${langIcon(langOfFile(f), 'sm')}${esc(f)}${file.current !== file.saved ? '<span class="dirty"></span>' : ''}</button>`;
+      })
+      .join('');
+  }
+  renderState() {
+    const el = $('#ideState');
+    if (!el) return;
+    const d = this.dirtyCount();
+    el.className = `save-state ${this.saveError ? 'err' : d ? 'dirty' : ''}`;
+    el.innerHTML = this.saving
+      ? `${icon('refresh')} Saving…`
+      : this.saveError
+      ? `${icon('alert')} ${esc(this.saveError)}`
+      : d
+      ? `● ${plural(d, 'unsaved file')}`
+      : `${icon('check')} <span class="hide-sm">Saved and live at</span> <a class="mono" href="${esc(this.worker.summary.publishingPath)}" target="_blank" rel="noopener">${esc(this.worker.summary.publishingPath)}</a>`;
+    const btn = $('#ideSave');
+    if (btn) btn.disabled = !d || this.saving;
+  }
+  async save(quiet = false) {
+    if (this.saving) {
+      this.saveAgain = true;
       return;
     }
-    const pos = dir > 0 ? codeEditor.selectionEnd : codeEditor.selectionStart - 1;
-    let pickIdx = 0;
-    if (dir > 0) {
-      pickIdx = matches.findIndex((m) => m >= pos);
-      if (pickIdx === -1) pickIdx = 0;
-    } else {
-      pickIdx = -1;
-      for (let i = matches.length - 1; i >= 0; i--) {
-        if (matches[i] <= pos) {
-          pickIdx = i;
-          break;
-        }
+    const dirty = [...this.files.entries()].filter(([, f]) => f.current !== f.saved);
+    if (!dirty.length) return;
+    this.saving = true;
+    this.saveError = '';
+    this.renderState();
+    try {
+      for (const [name, f] of dirty) {
+        const content = f.current;
+        await api('PUT', `/api/workers/${enc(this.name)}/files`, { filename: name, content });
+        f.saved = content;
       }
-      if (pickIdx === -1) pickIdx = matches.length - 1;
+      if (!quiet) toast(`Saved ${dirty.length === 1 ? dirty[0][0] : plural(dirty.length, 'file')}`);
+      this.reloadPreview();
+    } catch (err) {
+      this.saveError = `Not saved: ${err.message}`;
+      if (!quiet) toast(this.saveError, 'err');
+    } finally {
+      this.saving = false;
+      this.renderFiles();
+      this.renderState();
+      if (this.saveAgain) {
+        this.saveAgain = false;
+        this.save(true);
+      }
     }
-    const start = matches[pickIdx];
-    codeEditor.focus();
-    codeEditor.setSelectionRange(start, start + q.length);
-    updateCursorPosition();
-    const countEl = el('fwCount');
-    if (countEl) countEl.textContent = `${pickIdx + 1} of ${matches.length}`;
   }
-
-  const tabActFind = el('tabActFindBtn');
-  if (tabActFind) tabActFind.addEventListener('click', openFindWidget);
-  const fwInput = el('fwInput');
-  if (fwInput) {
-    fwInput.addEventListener('input', () => stepFindMatch(1));
-    fwInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        stepFindMatch(e.shiftKey ? -1 : 1);
-      } else if (e.key === 'Escape') {
-        e.preventDefault();
-        closeFindWidget();
-      }
+  newFileInput() {
+    const list = $('#ideFiles');
+    if ($('.file-input', list)) return $('.file-input', list).focus();
+    list.insertAdjacentHTML('afterbegin', `<input class="input mono file-input" placeholder="name.js" aria-label="New file name">`);
+    const inp = $('.file-input', list);
+    inp.focus();
+    const done = async (commit) => {
+      const n = inp.value.trim();
+      inp.remove();
+      if (!commit || !n) return;
+      const r = await attempt(() => api('POST', `/api/workers/${enc(this.name)}/files`, { filename: n, content: '' }));
+      if (!r || !r.file) return;
+      this.files.set(r.file.name, { saved: r.file.content, current: r.file.content, size: r.file.sizeBytes });
+      this.open(r.file.name);
+    };
+    inp.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') done(true);
+      if (e.key === 'Escape') done(false);
     });
+    inp.addEventListener('blur', () => done(Boolean(inp.value.trim())));
   }
-  const fwPrev = el('fwPrevBtn');
-  if (fwPrev) fwPrev.addEventListener('click', () => stepFindMatch(-1));
-  const fwNext = el('fwNextBtn');
-  if (fwNext) fwNext.addEventListener('click', () => stepFindMatch(1));
-  const fwClose = el('fwCloseBtn');
-  if (fwClose) fwClose.addEventListener('click', closeFindWidget);
+  renameInput(f, row) {
+    row.outerHTML = `<input class="input mono file-input" value="${esc(f)}" aria-label="New name for ${esc(f)}">`;
+    const inp = $('.file-input', $('#ideFiles'));
+    inp.focus();
+    inp.setSelectionRange(0, f.lastIndexOf('.') > 0 ? f.lastIndexOf('.') : f.length);
+    let finished = false;
+    const done = async (commit) => {
+      if (finished) return;
+      finished = true;
+      const n = inp.value.trim();
+      if (!commit || !n || n === f) return this.renderFiles();
+      const file = this.files.get(f);
+      const r = await attempt(() => api('PUT', `/api/workers/${enc(this.name)}/files`, { filename: f, newFilename: n, content: file.current }));
+      if (!r) return this.renderFiles();
+      const newName = r.filename;
+      this.files.delete(f);
+      this.files.set(newName, { saved: file.current, current: file.current, size: file.size });
+      if (this.entry === f) this.entry = newName;
+      this.tabs = this.tabs.map((t) => (t === f ? newName : t));
+      if (this.ed) this.ed.drop(f);
+      this.open(newName);
+      this.renderState();
+    };
+    inp.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') done(true);
+      if (e.key === 'Escape') done(false);
+    });
+    inp.addEventListener('blur', () => done(true));
+  }
+  async deleteFile(f) {
+    if (!(await confirmDialog({ title: `Delete ${f}?`, text: `It's removed from <b>${esc(this.name)}</b> right away. Older versions keep their copy.`, ok: 'Delete', danger: true }))) return;
+    const r = await attempt(() => api('DELETE', `/api/workers/${enc(this.name)}/files?filename=${enc(f)}`));
+    if (!r) return;
+    this.files.delete(f);
+    this.tabs = this.tabs.filter((t) => t !== f);
+    if (this.ed) this.ed.drop(f);
+    this.entry = r.worker.filename;
+    // the server keeps at least one file (it may have created worker.js)
+    for (const nf of r.files || []) if (!this.files.has(nf.name)) this.files.set(nf.name, { saved: nf.content, current: nf.content, size: nf.sizeBytes });
+    if (this.active === f) this.open(this.entry);
+    else this.renderFiles();
+    this.reloadPreview();
+  }
+  async setEntry(f) {
+    const r = await attempt(() => api('PUT', `/api/workers/${enc(this.name)}/files`, { filename: f, setAsEntrypoint: true }), `${f} now runs on each request`);
+    if (!r) return;
+    this.entry = f;
+    this.renderFiles();
+    this.reloadPreview();
+  }
 
-  el('paletteCloseBtn').addEventListener('click', () =>
-    el('paletteOverlay').classList.add('hidden')
-  );
-  el('paletteOverlay').addEventListener('click', (e) => {
-    if (e.target === el('paletteOverlay')) el('paletteOverlay').classList.add('hidden');
+  /* ------- right panel */
+  renderPanel() {
+    const box = $('#idePanel');
+    const path = this.worker.summary.publishingPath;
+    if (this.panel === 'preview') {
+      box.innerHTML = `<div class="urlbar"><input class="input" id="pvUrl" value="${esc(path)}" aria-label="Preview path"><button class="icon-btn" id="pvGo" title="Reload">${icon('refresh')}</button><a class="icon-btn" id="pvOpen" href="${esc(path)}" target="_blank" rel="noopener" title="Open in new tab">${icon('external')}</a></div>
+        <iframe class="preview-frame" id="pvFrame" title="Worker preview" sandbox="allow-scripts allow-forms allow-same-origin allow-popups allow-modals"></iframe>`;
+      const go = () => {
+        const p = $('#pvUrl').value.trim() || path;
+        $('#pvOpen').href = p;
+        $('#pvFrame').src = `${p}${p.includes('?') ? '&' : '?'}_preview=${Date.now()}`;
+      };
+      $('#pvGo').onclick = go;
+      $('#pvUrl').addEventListener('keydown', (e) => e.key === 'Enter' && go());
+      go();
+      return;
+    }
+    const st = store.get(`ax-req-${this.name}`, { method: 'GET', url: path, headers: [['', '']], body: '' });
+    box.innerHTML = `<div class="urlbar"><select class="select" id="rqM" aria-label="Method">${['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD']
+      .map((m) => `<option ${m === st.method ? 'selected' : ''}>${m}</option>`)
+      .join('')}</select><input class="input" id="rqU" value="${esc(st.url)}" aria-label="Request path"><button class="btn sm primary" id="rqSend">Send</button></div>
+      <div class="req-section"><div class="label">Headers</div><div id="rqH">${st.headers.map(([k, v]) => this.hdrRow(k, v)).join('')}</div>
+        <button class="btn sm ghost" id="rqAddH" style="align-self:flex-start">${icon('plus')} Header</button></div>
+      <div class="req-section" id="rqBodyWrap"><div class="label">Body</div><textarea class="textarea mono" id="rqB" rows="4" placeholder='{"hello": "world"}'>${esc(st.body)}</textarea></div>
+      <div id="rqOut" class="resp"><div class="empty"><h4>Send a request</h4><p>It reaches your worker exactly like a browser or curl would.</p></div></div>`;
+    const syncBody = () => ($('#rqBodyWrap').style.display = ['GET', 'HEAD'].includes($('#rqM').value) ? 'none' : '');
+    syncBody();
+    $('#rqM').onchange = syncBody;
+    $('#rqAddH').onclick = () => $('#rqH').insertAdjacentHTML('beforeend', this.hdrRow('', ''));
+    $('#rqH').onclick = (e) => e.target.closest('[data-del-h]') && e.target.closest('.kv-edit').remove();
+    $('#rqU').addEventListener('keydown', (e) => e.key === 'Enter' && this.sendRequest());
+    $('#rqSend').onclick = () => this.sendRequest();
+  }
+  hdrRow(k, v) {
+    return `<div class="kv-edit"><input class="input" placeholder="Header" value="${esc(k)}" aria-label="Header name"><input class="input" placeholder="value" value="${esc(v)}" aria-label="Header value"><button class="icon-btn sm" data-del-h title="Remove">${icon('x')}</button></div>`;
+  }
+  async sendRequest() {
+    const method = $('#rqM').value;
+    const url = $('#rqU').value.trim() || '/';
+    const headers = $$('#rqH .kv-edit').map((r) => $$('input', r).map((i) => i.value));
+    const body = $('#rqB').value;
+    store.set(`ax-req-${this.name}`, { method, url, headers: headers.length ? headers : [['', '']], body });
+    const h = new Headers();
+    for (const [k, v] of headers) if (k.trim()) h.set(k.trim(), v);
+    const out = $('#rqOut');
+    out.innerHTML = `<div class="empty"><p>Sending…</p></div>`;
+    const t0 = performance.now();
+    try {
+      const res = await fetch(url, { method, headers: h, body: ['GET', 'HEAD'].includes(method) ? undefined : body, redirect: 'manual' });
+      const text = method === 'HEAD' ? '' : await res.text();
+      const dt = performance.now() - t0;
+      let pretty = text;
+      const ct = res.headers.get('content-type') || '';
+      if (/json/.test(ct)) {
+        try {
+          pretty = JSON.stringify(JSON.parse(text), null, 2);
+        } catch (_) {}
+      }
+      const hdrs = [...res.headers.entries()].map(([k, v]) => `<div><b>${esc(k)}</b>: ${esc(v)}</div>`).join('');
+      out.innerHTML = `<div class="resp-meta"><span class="status ${statusClass(res.status)}">${res.status || 'opaque'} ${esc(res.statusText)}</span><span>${esc(ms(dt))}</span><span>${bytes(new Blob([text]).size)}</span><span class="grow"></span><button class="btn sm ghost" id="rqCopy">${icon('copy')} Copy</button></div>
+        <details class="resp-headers"><summary>${plural([...res.headers.keys()].length, 'header')}</summary>${hdrs}</details>
+        <pre class="resp-body">${esc(pretty) || '<span style="color:var(--muted)">(empty body)</span>'}</pre>`;
+      $('#rqCopy').onclick = () => copy(text);
+    } catch (err) {
+      out.innerHTML = `<div class="empty"><h4>Request failed</h4><p>${esc(err.message)}</p></div>`;
+    }
+  }
+  reloadPreview() {
+    if (this.panel === 'preview' && $('#pvFrame')) $('#pvGo').click();
+  }
+  setTheme(t) {
+    if (this.ed) this.ed.setTheme(t);
+  }
+  dispose() {
+    document.removeEventListener('keydown', this.onKey);
+    if (this.unload) window.removeEventListener('beforeunload', this.unload);
+    if (this.ed) this.ed.dispose();
+  }
+}
+
+async function mountIde(root, w) {
+  const ide = new Ide(root, w);
+  S.ide = ide;
+  await ide.init();
+}
+
+/* ============================================================= logs page */
+async function viewLogs(view) {
+  setTopbar([{ label: 'Live logs' }]);
+  if (!S.overview) await loadOverview();
+  view.innerHTML = `<div class="page">
+    <div class="page-head"><div><h1 class="page-title">Live logs</h1><p class="page-sub">Requests, console output and errors from every worker, as they happen.</p></div></div>
+    <div class="card">${logsToolbar('gl')}<div class="logbox" id="glBox" style="height:calc(100vh - 290px);min-height:320px"></div></div>
+  </div>`;
+  let getFilter = () => ({ levels: new Set(['req', 'info', 'warn', 'error']), q: '' });
+  const tail = createTail({
+    box: $('#glBox'),
+    workers: () => workersList().map((w) => w.name),
+    filter: () => getFilter(),
+    showWorker: true,
+    onCount: (shown, total) => ($('#glCount').textContent = `${num(shown)} of ${num(total)} lines`)
   });
+  getFilter = wireLogsToolbar('gl', tail);
+  tail.start();
+  poll(() => loadOverview().catch(() => {}), 15000);
+}
 
+/* =========================================================== tunnel page */
+async function viewTunnel(view) {
+  setTopbar([{ label: 'Domain & tunnel' }]);
+  await loadOverview();
+  const c = S.overview.config;
+  const host = c.subdomain && c.rootDomain ? `${c.subdomain}.${c.rootDomain}` : c.rootDomain || '';
+  const dnsPill =
+    c.dnsRecordStatus === 'verified'
+      ? '<span class="tag ok"><span class="d"></span>Verified</span>'
+      : c.dnsRecordStatus === 'pending'
+      ? '<span class="tag warn"><span class="d"></span>Pending</span>'
+      : '<span class="tag"><span class="d"></span>Not checked</span>';
+  const connPill = !c.tunnelTokenSet
+    ? '<span class="tag"><span class="d"></span>No token yet</span>'
+    : c.connectorRunning
+    ? '<span class="tag ok"><span class="d"></span>Connected</span>'
+    : c.connectorInstalled
+    ? '<span class="tag err"><span class="d"></span>Not running</span>'
+    : '<span class="tag err"><span class="d"></span>cloudflared missing</span>';
+  const svc = `http://localhost:${c.publicPort}`;
+  view.innerHTML = `<div class="page">
+    <div class="page-head"><div><h1 class="page-title">Domain & tunnel</h1><p class="page-sub">Put your workers on your own domain through a Cloudflare Tunnel. No port forwarding.</p></div></div>
+    <div class="figures three">
+      <div class="fig"><div class="k">Public address</div><div class="v" style="font-size:24px">${host ? esc(host) : '<span style="color:var(--muted)">Not set</span>'}</div><div class="f">${host ? `<a href="https://${esc(host)}" target="_blank" rel="noopener">Open in a new tab</a>` : 'Reachable on your network only'}</div></div>
+      <div class="fig"><div class="k">Tunnel connector</div><div class="v" style="font-size:15px;padding-top:12px">${connPill}</div><div class="f">Restarts itself if it crashes</div></div>
+      <div class="fig"><div class="k">DNS record</div><div class="v" style="font-size:15px;padding-top:12px">${dnsPill}</div><div class="f" title="${esc(c.dnsCheckMessage || '')}">${c.dnsLastChecked ? `Checked ${esc(ago(c.dnsLastChecked))}` : 'Never checked'}</div></div>
+    </div>
+    <div class="grid2" style="align-items:start">
+      <form class="card" id="tunForm">
+        <div class="card-head"><h3>Connection</h3></div>
+        <div class="card-body stack">
+          <div class="grid2"><div class="field"><label for="tSub">Subdomain</label><input class="input mono" id="tSub" value="${esc(c.subdomain || '')}" placeholder="workers"></div>
+          <div class="field"><label for="tRoot">Root domain</label><input class="input mono" id="tRoot" value="${esc(c.rootDomain || '')}" placeholder="example.com"></div></div>
+          <div class="field"><label for="tId">Tunnel ID</label><input class="input mono" id="tId" value="${esc(c.tunnelId || '')}" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"><span class="hint">Used to show the exact DNS record to create.</span></div>
+          <div class="field"><label for="tTok">Tunnel token</label><input class="input mono" id="tTok" type="password" autocomplete="off" placeholder="${c.tunnelTokenSet ? '•••••••• saved. Leave blank to keep it' : 'Paste the token or the whole install command'}">
+            <span class="hint">${c.tunnelTokenSet ? `Saved on the Pi and never sent back to the browser. <button type="button" class="btn sm ghost" id="tClear" style="height:22px;padding:0 6px">Remove token</button>` : 'From “Install and run a connector”. The whole <span class="mono">cloudflared service install …</span> line works too.'}</span></div>
+          <div class="grid2"><div class="field"><label for="tIp">This Pi's LAN IP</label><input class="input mono" id="tIp" value="${esc(c.localIp || '')}"></div>
+          <div class="field"><label for="tCidr">Local networks</label><input class="input mono" id="tCidr" value="${esc(c.networkCidrs || '')}"></div></div>
+        </div>
+        <div class="modal-foot"><button type="button" class="btn" id="tCheck">Check DNS</button><button class="btn primary">Save and connect</button></div>
+      </form>
+      <div class="card">
+        <div class="card-head"><h3>Set it up in Cloudflare</h3></div>
+        <div class="card-body">
+          <ol class="steps">
+            <li><div>In <a href="https://one.dash.cloudflare.com/" target="_blank" rel="noopener">Zero Trust</a> → Networks → Tunnels, create a <b>Cloudflared</b> tunnel.</div></li>
+            <li><div>Copy its token into <b>Tunnel token</b> here and save. Alex-Aero runs the connector and keeps it running.</div></li>
+            <li><div>Add a public hostname ${host ? `<b class="mono">${esc(host)}</b>` : ''} pointing to this service:<div class="copy-line" style="margin-top:6px"><span>${esc(svc)}</span><button type="button" class="icon-btn sm" data-copy="${esc(svc)}">${icon('copy')}</button></div></div></li>
+            <li><div>Cloudflare usually creates the DNS record for you. If not, add a proxied CNAME:<div class="copy-line" style="margin-top:6px"><span>${esc(c.subdomain || '@')} → ${esc(c.tunnelId ? `${c.tunnelId}.cfargotunnel.com` : '<tunnel-id>.cfargotunnel.com')}</span><button type="button" class="icon-btn sm" data-copy="${esc(c.tunnelId ? `${c.tunnelId}.cfargotunnel.com` : '')}">${icon('copy')}</button></div></div></li>
+          </ol>
+          <p class="hint" style="margin:14px 0 0">${esc(c.dnsCheckMessage || '')}</p>
+        </div>
+      </div>
+    </div>
+  </div>`;
+  view.onclick = (e) => {
+    const b = e.target.closest('[data-copy]');
+    if (b && b.dataset.copy) copy(b.dataset.copy);
+  };
+  const payload = () => ({
+    subdomain: $('#tSub').value,
+    rootDomain: $('#tRoot').value,
+    tunnelId: $('#tId').value,
+    tunnelToken: $('#tTok').value,
+    localIp: $('#tIp').value,
+    networkCidrs: $('#tCidr').value
+  });
+  $('#tunForm').onsubmit = async (e) => {
+    e.preventDefault();
+    const r = await attempt(() => api('PUT', '/api/config', payload()));
+    if (r) {
+      toast(r.dnsCheck && r.dnsCheck.status === 'verified' ? 'Saved. DNS is verified' : 'Saved');
+      route();
+    }
+  };
+  $('#tCheck').onclick = async () => {
+    const r = await attempt(() => api('POST', '/api/dns/check'));
+    if (r) {
+      toast(r.dnsCheck.message, r.dnsCheck.status === 'verified' ? 'ok' : 'err');
+      route();
+    }
+  };
+  const clr = $('#tClear');
+  if (clr)
+    clr.onclick = async () => {
+      if (!(await confirmDialog({ title: 'Remove tunnel token?', text: 'The connector stops and your domain stops reaching this Pi.', ok: 'Remove', danger: true }))) return;
+      const r = await attempt(() => api('PUT', '/api/config', { clearTunnelToken: true }), 'Token removed');
+      if (r) route();
+    };
+}
+
+/* =========================================================== system page */
+async function viewSystem(view) {
+  setTopbar([{ label: 'System' }]);
+  const paint = (d) => {
+    const s = d.system;
+    const memPct = s.memoryTotalMb ? Math.round((s.memoryUsedMb / s.memoryTotalMb) * 100) : 0;
+    const diskPct = s.disk ? Math.round(((s.disk.totalGb - s.disk.freeGb) / s.disk.totalGb) * 100) : 0;
+    const tempCol = s.cpuTempC >= 75 ? 'var(--err)' : s.cpuTempC >= 65 ? 'var(--warn)' : 'inherit';
+    view.innerHTML = `<div class="page">
+      <div class="page-head"><div><h1 class="page-title">System</h1><p class="page-sub">${esc(s.hostname)} · ${esc(s.cpuModel)} · ${esc(s.platform)}/${esc(s.arch)}</p></div><div class="tools"><span class="live">live</span></div></div>
+      <div class="figures">
+        <div class="fig"><div class="k">CPU temperature</div><div class="v" style="color:${tempCol}">${s.cpuTempC ?? '—'}<small>°C</small></div><div class="f">${s.cpuTempC >= 80 ? 'Hot, likely throttling' : s.cpuTempC >= 65 ? 'Warm' : 'Cool'}</div></div>
+        <div class="fig"><div class="k">Load</div><div class="v">${(s.loadAvg || [])[0] ?? '—'}</div><div class="f">${(s.loadAvg || [])[1] ?? '—'} · ${(s.loadAvg || [])[2] ?? '—'} over 5 / 15 min</div><div class="meter"><i style="width:${Math.min(100, Math.round((((s.loadAvg || [0])[0] || 0) / (s.cpus || 1)) * 100))}%"></i></div></div>
+        <div class="fig"><div class="k">Memory</div><div class="v">${memPct}<small>%</small></div><div class="f">${num(s.memoryUsedMb)} of ${num(s.memoryTotalMb)} MB</div><div class="meter"><i style="width:${memPct}%"></i></div></div>
+        <div class="fig"><div class="k">Disk</div><div class="v">${s.disk ? `${s.disk.freeGb}<small>GB free</small>` : '—'}</div><div class="f">${s.disk ? `of ${s.disk.totalGb} GB` : ''}</div><div class="meter"><i style="width:${diskPct}%"></i></div></div>
+        <div class="fig"><div class="k">Uptime</div><div class="v">${esc(duration(s.uptimeSeconds))}</div><div class="f">Alex-Aero for ${esc(duration(s.backendUptimeSeconds))}</div></div>
+      </div>
+      <div class="grid2" style="align-items:start">
+        <div class="card"><div class="card-head"><h3>Runtimes</h3></div><div class="card-body"><dl class="kv">
+          <dt>Node.js</dt><dd>${esc(s.node)}</dd><dt>workerd</dt><dd>${esc(s.workerd)}</dd><dt>Python</dt><dd>${esc(s.python)}</dd>
+          <dt>nginx</dt><dd>${esc(s.nginx)}</dd><dt>cloudflared</dt><dd>${esc(s.cloudflared)}</dd><dt>Storage</dt><dd>${esc(s.storageDir)}</dd>
+        </dl></div></div>
+        <div class="card"><div class="card-head"><h3>Running workers</h3><span class="sub">start on first request</span></div>
+          ${
+            s.runningWorkers.length
+              ? `<table class="table"><thead><tr><th>Worker</th><th>Engine</th><th class="num">Port</th></tr></thead><tbody>${s.runningWorkers
+                  .map((r) => `<tr><td><a href="#/w/${enc(r.name)}">${esc(r.name)}</a></td><td>${r.engine === 'workerd' ? '<span class="tag ok"><span class="d"></span>workerd</span>' : `<span class="tag warn" title="workerd failed to start, so the code runs inside Node instead"><span class="d"></span>${esc(r.engine)}</span>`}</td><td class="num">${r.port}</td></tr>`)
+                  .join('')}</tbody></table>`
+              : `<div class="empty"><h4>Nothing running</h4><p>JavaScript workers start on their first request.</p></div>`
+          }
+        </div>
+      </div>
+      <div class="card" style="margin-top:16px"><div class="card-head"><h3>Command line</h3><span class="sub">on the Pi</span></div><div class="card-body stack" style="gap:8px">
+        ${[['ax', 'menu: status, logs, restart, login, domain'], ['ax status', 'what’s running'], ['ax logs -f', 'follow the backend log'], ['ax passwd', 'change the dashboard login'], ['ax autostart on', 'start at boot, restart on crash']]
+          .map(([c, d]) => `<div class="copy-line"><span>${esc(c)} <span style="color:var(--muted)"># ${esc(d)}</span></span><button class="icon-btn sm" data-copy="${esc(c)}">${icon('copy')}</button></div>`)
+          .join('')}
+      </div></div>
+      <div class="card" style="margin-top:16px"><div class="card-head"><h3>Storage files</h3></div>
+        <table class="table"><thead><tr><th>File</th><th>Holds</th><th class="num">Size</th><th>Saved</th><th></th></tr></thead><tbody>${d.storageFiles
+          .map((f, i) => `<tr><td class="mono">${esc(f.path)}</td><td style="color:var(--muted)">${esc(f.category)}</td><td class="num">${bytes(f.sizeBytes)}</td><td style="color:var(--muted)">${esc(ago(f.updatedAt))}</td><td><button class="btn sm ghost" data-peek="${i}">${icon('eye')}</button></td></tr>`)
+          .join('')}</tbody></table></div>
+    </div>`;
+  };
+  let data = await api('GET', '/api/system');
+  paint(data);
+  view.onclick = (e) => {
+    const c = e.target.closest('[data-copy]');
+    if (c) return copy(c.dataset.copy);
+    const p = e.target.closest('[data-peek]');
+    if (p) {
+      const f = data.storageFiles[Number(p.dataset.peek)];
+      modal({ title: f.path, wide: true, body: `<pre class="code-view">${esc(f.preview)}${f.sizeBytes > 1200 ? '\n…' : ''}</pre>` });
+    }
+  };
+  poll(async () => {
+    try {
+      data = await api('GET', '/api/system');
+      if (S.route.page === 'system' && !document.querySelector('.overlay')) paint(data);
+    } catch (_) {}
+  }, 5000);
+}
+
+/* ============================================================ palette */
+function openPalette() {
+  if ($('.overlay .palette')) return;
+  const items = [
+    ...NAV.map((n) => ({ label: n.label, sec: 'Page', ico: icon(n.icon), go: () => (location.hash = n.href) })),
+    { label: 'New worker', sec: 'Action', ico: icon('plus'), go: () => newWorkerDialog() },
+    { label: `Switch to ${S.theme === 'dark' ? 'light' : 'dark'} theme`, sec: 'Action', ico: icon(S.theme === 'dark' ? 'sun' : 'moon'), go: toggleTheme },
+    {
+      label: `Use the ${store.get('ax-editor', 'monaco') === 'basic' ? 'full (Monaco)' : 'basic, offline'} editor`,
+      sec: 'Action',
+      ico: icon('code'),
+      go: () => {
+        store.set('ax-editor', store.get('ax-editor', 'monaco') === 'basic' ? 'monaco' : 'basic');
+        toast('Editor changed. Reopen a worker’s code to use it');
+      }
+    },
+    ...workersList().flatMap((w) => [
+      { label: w.name, sec: 'Overview', ico: langIcon(w.language), go: () => (location.hash = `#/w/${enc(w.name)}`) },
+      { label: `${w.name}: edit code`, sec: 'Code', ico: icon('code'), go: () => (location.hash = `#/w/${enc(w.name)}/code`) },
+      { label: `${w.name}: logs`, sec: 'Logs', ico: icon('logs'), go: () => (location.hash = `#/w/${enc(w.name)}/logs`) }
+    ])
+  ];
+  let sel = 0;
+  let shown = items;
+  modal({
+    title: 'Go to',
+    body: `<input class="input" id="palQ" placeholder="Type a worker, page or action…" autocomplete="off" autofocus aria-label="Search"><div class="palette-list" id="palL" role="listbox"></div>`,
+    onMount(ov, close) {
+      $('.modal', ov).classList.add('palette');
+      $('.modal-head', ov).remove();
+      $('.modal-body', ov).style.padding = '0';
+      $('.modal-body', ov).style.gap = '0';
+      const paint = () => {
+        $('#palL', ov).innerHTML = shown.length
+          ? shown.map((it, i) => `<div class="pitem ${i === sel ? 'sel' : ''}" data-i="${i}" role="option" aria-selected="${i === sel}">${it.ico}<span>${esc(it.label)}</span><span class="sec">${esc(it.sec)}</span></div>`).join('')
+          : '<div class="empty">No matches</div>';
+        const s = $('.pitem.sel', ov);
+        if (s) s.scrollIntoView({ block: 'nearest' });
+      };
+      const run = (it) => {
+        close();
+        it.go();
+      };
+      $('#palQ', ov).addEventListener('input', (e) => {
+        const q = e.target.value.trim().toLowerCase();
+        shown = !q ? items : items.filter((it) => `${it.label} ${it.sec}`.toLowerCase().includes(q));
+        sel = 0;
+        paint();
+      });
+      $('#palQ', ov).addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowDown') sel = Math.min(shown.length - 1, sel + 1);
+        else if (e.key === 'ArrowUp') sel = Math.max(0, sel - 1);
+        else if (e.key === 'Enter' && shown[sel]) return run(shown[sel]);
+        else return;
+        e.preventDefault();
+        paint();
+      });
+      $('#palL', ov).addEventListener('click', (e) => {
+        const it = e.target.closest('[data-i]');
+        if (it) run(shown[Number(it.dataset.i)]);
+      });
+      paint();
+    }
+  });
+}
+
+/* ============================================================== chrome */
+function toggleTheme() {
+  S.theme = S.theme === 'dark' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = S.theme;
+  try {
+    localStorage.setItem('ax-theme', S.theme);
+  } catch (_) {}
+  paintThemeBtn();
+  if (S.ide) S.ide.setTheme(S.theme);
+}
+function paintThemeBtn() {
+  $('#themeBtn').innerHTML = icon(S.theme === 'dark' ? 'sun' : 'moon');
+}
+function openNav() {
+  $('#side').classList.add('open');
+  $('#scrim').classList.remove('hidden');
+}
+function closeNav() {
+  $('#side').classList.remove('open');
+  $('#scrim').classList.add('hidden');
+}
+
+function boot() {
+  paintThemeBtn();
+  $('#themeBtn').onclick = toggleTheme;
+  $('#menuBtn').innerHTML = icon('menu');
+  $('#menuBtn').onclick = openNav;
+  $('#scrim').onclick = closeNav;
+  $('#paletteBtn').onclick = openPalette;
   document.addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
       e.preventDefault();
-      openQuickJumpPalette();
-    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f' && appState.currentView === 'editor') {
-      e.preventDefault();
-      openFindWidget();
+      openPalette();
     }
   });
-
-  // Records / Public links page: Check Record buttons & Settings form
-  async function runDnsRecordCheck() {
-    const topBtn = el('topCheckRecordBtn');
-    const cardBtn = el('cardCheckRecordsBtn');
-    topBtn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Checking...`;
-    cardBtn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Checking...`;
-
-    try {
-      const res = await fetch('/api/dns/check', { method: 'POST' });
-      const data = await res.json();
-      if (data.config) appState.config = data.config;
-      addNotification(`DNS check complete: ${data.dnsCheck?.message || ''}`);
-      renderAll();
-    } finally {
-      topBtn.innerHTML = `<i class="fa-solid fa-rotate"></i> Check record`;
-      cardBtn.innerHTML = `<i class="fa-solid fa-magnifying-glass"></i> Check records`;
-    }
-  }
-
-  el('topCheckRecordBtn').addEventListener('click', runDnsRecordCheck);
-  el('cardCheckRecordsBtn').addEventListener('click', runDnsRecordCheck);
-
-  el('generateTunnelIdBtn').addEventListener('click', () => {
-    const uuid =
-      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-        ? crypto.randomUUID()
-        : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-            const r = (Math.random() * 16) | 0;
-            const v = c === 'x' ? r : (r & 0x3) | 0x8;
-            return v.toString(16);
-          });
-    el('settingTunnelId').value = uuid;
-  });
-
-  el('tunnelSettingsForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const payload = {
-      subdomain: el('settingSubdomain').value.trim(),
-      rootDomain: el('settingRootDomain').value.trim(),
-      tunnelId: el('settingTunnelId').value.trim(),
-      tunnelToken: el('settingTunnelToken').value.trim(),
-      localIp: el('settingLocalIp').value.trim(),
-      networkCidrs: el('settingNetworkCidrs').value.trim()
-    };
-
-    const res = await fetch('/api/config', {
-      method: 'PUT',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    const data = await res.json();
-    if (data.ok) {
-      appState.config = data.config;
-      el('settingsSavedMsg').textContent = 'Settings saved and DNS checked';
-      setTimeout(() => {
-        el('settingsSavedMsg').textContent = '';
-      }, 3000);
-      addNotification(`Updated Tunnel settings`);
-      renderAll();
-    }
-  });
-
-  // Fetch live state from backend after all event listeners are attached
-  try {
-    await fetchAppState();
-    await executeCurrentWorkerHttpRequest();
-  } catch (err) {
-    console.warn('Initial state sync warning:', err);
-  }
-});
+  window.addEventListener('hashchange', route);
+  route();
+}
+boot();
