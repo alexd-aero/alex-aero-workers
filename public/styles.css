@@ -31,6 +31,9 @@
   --err-soft: rgba(230, 154, 139, 0.12);
   --chart: #d9c7a5;
   --chart-2: #8f8778;
+  --chart-3: #8fc4bd;
+  --chart-bar: #d9c7a5;
+  --chart-err: #f0705a;
   --shadow: 0 1px 0 rgba(255, 255, 255, 0.025) inset, 0 24px 60px -30px rgba(0, 0, 0, 0.7);
   --focus: 0 0 0 3px rgba(236, 220, 191, 0.28);
   --r-card: 18px;
@@ -64,6 +67,9 @@
   --err-soft: rgba(180, 80, 61, 0.09);
   --chart: #8a7656;
   --chart-2: #bfb3a0;
+  --chart-3: #2f7d74;
+  --chart-bar: #a38c64;
+  --chart-err: #d62f22;
   --shadow: 0 1px 2px rgba(60, 45, 25, 0.05), 0 24px 60px -34px rgba(60, 45, 25, 0.35);
   --focus: 0 0 0 3px rgba(42, 37, 30, 0.18);
   color-scheme: light;
@@ -207,8 +213,8 @@ code, kbd, pre, .mono { font-family: var(--mono); font-size: 12.5px; }
 /* wells: inset surfaces inside the main card */
 .card, .well { background: var(--well); border-radius: var(--r-well); }
 .card-pad { padding: 20px 22px; }
-.card-head { display: flex; align-items: center; gap: 12px; padding: 16px 20px 6px; }
-.card-head h3 { margin: 0; font-size: 14px; font-weight: 600; }
+.card-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 16px 20px 6px; }
+.card-head h3 { margin: 0; white-space: nowrap; font-size: 14px; font-weight: 600; }
 .card-head .sub { font-size: 12.5px; color: var(--muted); }
 .card-head .tools { margin-left: auto; display: flex; gap: 6px; align-items: center; }
 .card-body { padding: 12px 20px 20px; }
@@ -304,18 +310,32 @@ h1.page-title { margin: 0; font: 600 30px/1.15 var(--display); letter-spacing: -
 .spark-axis { display: flex; justify-content: space-between; font-size: 11px; color: var(--faint); margin-top: 6px; }
 
 /* ---------------------------------------------------------------- charts */
-.chart { width: 100%; display: block; overflow: visible; }
+.chart { display: block; overflow: visible; }
 .chart-wrap { position: relative; }
-.chart .grid { stroke: var(--line); stroke-width: 1; }
-.chart text { fill: var(--muted); font: 10.5px var(--mono); }
-.chart .bar { fill: var(--chart); }
-.chart .bar.err { fill: var(--err); }
-.chart .line { fill: none; stroke: var(--chart-2); stroke-width: 1.6; stroke-linejoin: round; stroke-dasharray: 3 3; }
+.ch-plot { min-height: 120px; }
+.ch-plot.empty { min-height: 0; }
+.ch-sum { display: flex; flex-wrap: wrap; gap: 6px 22px; margin: 0 0 12px; font-size: 12.5px; color: var(--muted); }
+.ch-sum b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ch-sub { margin: 10px 0 2px; font-size: 12px; color: var(--muted); }
+.chart .grid { stroke: var(--line); stroke-width: 1; shape-rendering: crispEdges; }
+.chart .grid.base { stroke: var(--line-2); }
+.chart .tick { fill: var(--muted); font: 10.5px var(--mono); font-variant-numeric: tabular-nums; }
+.chart .bar { fill: var(--chart-bar); }
+.chart .bar.err { fill: var(--chart-err); }
+.chart .col { fill: var(--hover); }
+.chart .hit { fill: transparent; }
+.chart .lat { fill: none; stroke: var(--chart-3); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.chart .lat-area { fill: var(--chart-3); opacity: 0.1; }
+.chart .lat-dot { fill: var(--chart-3); stroke: var(--card); stroke-width: 2; }
 .chart-tip {
-  position: absolute; pointer-events: none; padding: 7px 11px; border-radius: 10px; font-size: 12.5px;
+  position: absolute; pointer-events: none; padding: 9px 12px; border-radius: 12px; font-size: 12.5px; min-width: 190px;
   background: var(--card); border: 1px solid var(--line-2); box-shadow: var(--shadow); white-space: nowrap; z-index: 5;
 }
-.legend { display: flex; gap: 16px; font-size: 12.5px; color: var(--muted); }
+.chart-tip .tt-h { font-weight: 600; margin-bottom: 6px; color: var(--text); }
+.chart-tip .tt-r { display: flex; align-items: center; gap: 8px; color: var(--muted); line-height: 1.75; }
+.chart-tip .tt-r i { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+.chart-tip .tt-r b { margin-left: auto; padding-left: 14px; color: var(--text); font: 500 12px var(--mono); }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 12.5px; color: var(--muted); }
 .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 7px; }
 
 /* ---------------------------------------------------------------- tables */
@@ -554,3 +574,4 @@ h1.page-title { margin: 0; font: 600 30px/1.15 var(--display); letter-spacing: -
 .scrim.hidden { display: none; }
 .hide-lg { display: none; }
 @media (max-width: 860px) { .hide-sm { display: none !important; } .hide-lg { display: inline; } }
+.legend span { white-space: nowrap; }

@@ -416,71 +416,127 @@ function sparkStrip(hourly) {
 }
 
 let chartSeq = 0;
-// Bars = requests (errors stacked in red), line = average response time.
-function hourChart(hourly, { height = 190 } = {}) {
+// The last 24 hours, as two charts on one time axis (never two scales on one
+// chart): requests per hour (errors stacked on top, in red) and, below, the
+// average response time, a line that breaks where an hour had no requests.
+// Drawn at the card's real width (redrawn when it changes), so text stays
+// its size; hovering an hour lights it in both and tells everything about it.
+const niceStep = (max, n = 3) => {
+  const raw = Math.max(max, 1e-9) / n, p = 10 ** Math.floor(Math.log10(raw)), f = raw / p;
+  return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * p;
+};
+const niceTicks = (max, n = 3, whole = false) => {
+  const st = whole ? Math.max(1, Math.round(niceStep(max, n))) : niceStep(max, n), top = Math.max(st, Math.ceil(max / st) * st);
+  const out = [];
+  for (let v = 0; v <= top + st / 2; v += st) out.push(+v.toFixed(6));
+  return out;
+};
+// a bar whose top corners are rounded (the baseline end stays square)
+const barPath = (x, y, w, h, r) => {
+  if (h <= 0) return '';
+  r = Math.min(r, w / 2, h);
+  return `M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h}Z`;
+};
+const fmtCount = (v) => (v >= 1000 ? `${+(v / 1000).toFixed(v >= 1e4 ? 0 : 1)}k` : String(v));
+
+function hourChart(hourly) {
   const id = `ch${++chartSeq}`;
   const series = hourSeries(hourly);
-  const W = 720;
-  const H = height;
-  const pad = { l: 34, r: 40, t: 12, b: 22 };
-  const iw = W - pad.l - pad.r;
-  const ih = H - pad.t - pad.b;
-  const maxR = Math.max(1, ...series.map((s) => s.requests));
-  const lat = series.map((s) => s.avgMs).filter((v) => v !== null);
-  const maxL = Math.max(1, ...lat);
-  const bw = iw / series.length;
-  const y = (v) => pad.t + ih - (v / maxR) * ih;
-  const yl = (v) => pad.t + ih - (v / maxL) * ih;
-  const ticks = [0, Math.ceil(maxR / 2), maxR];
-  let bars = '';
-  let pts = [];
-  series.forEach((s, i) => {
-    const x = pad.l + i * bw;
-    if (s.requests) {
-      const okH = ((s.requests - s.errors) / maxR) * ih;
-      const errH = (s.errors / maxR) * ih;
-      const bwid = Math.min(12, Math.max(2, bw - 8));
-      const bx = x + (bw - bwid) / 2;
-      bars += `<rect class="bar" x="${bx}" y="${pad.t + ih - okH - errH}" width="${bwid}" height="${Math.max(okH, 0)}" rx="${Math.min(4, bwid / 2)}"/>`;
-      if (s.errors) bars += `<rect class="bar err" x="${bx}" y="${pad.t + ih - errH}" width="${bwid}" height="${errH}" rx="${Math.min(4, bwid / 2)}"/>`;
+  const total = series.reduce((a, s) => a + s.requests, 0);
+  const errs = series.reduce((a, s) => a + s.errors, 0);
+  const lat = series.filter((s) => s.avgMs !== null);
+  const peak = series.reduce((a, s) => (s.requests > a.requests ? s : a), series[0]);
+  const draw = (wrap) => {
+    const W = Math.max(280, Math.round(wrap.clientWidth));
+    const narrow = W < 520;
+    const pad = { l: 44, r: 10 };
+    const iw = W - pad.l - pad.r, slot = iw / series.length;
+    const xOf = (i) => pad.l + i * slot + slot / 2;
+    // requests
+    const H1 = !total ? 44 : narrow ? 150 : 180, t1 = 10, b1 = 8, ih1 = H1 - t1 - b1;
+    const rt = niceTicks(Math.max(1, ...series.map((s) => s.requests)), 3, true);
+    const rMax = rt[rt.length - 1], y1 = (v) => t1 + ih1 - (v / rMax) * ih1;
+    const bw = Math.max(3, Math.min(26, slot * 0.64));
+    let g1 = !total ? `<line class="grid base" x1="${pad.l}" x2="${W - pad.r}" y1="${y1(0)}" y2="${y1(0)}"/><text class="tick" x="${pad.l - 8}" y="${y1(0) + 3.5}" text-anchor="end">0</text>` : rt.map((t) => `<line class="grid${t ? '' : ' base'}" x1="${pad.l}" x2="${W - pad.r}" y1="${y1(t)}" y2="${y1(t)}"/><text class="tick" x="${pad.l - 8}" y="${y1(t) + 3.5}" text-anchor="end">${fmtCount(t)}</text>`).join('');
+    let bars = '';
+    series.forEach((s, i) => {
+      if (!s.requests) return;
+      const x = xOf(i) - bw / 2, ok = s.requests - s.errors;
+      const hOk = (ok / rMax) * ih1, hErr = (s.errors / rMax) * ih1, base = t1 + ih1;
+      const gap = ok && s.errors ? 2 : 0;
+      if (ok) bars += `<path class="bar${s.errors ? '' : ' top'}" d="${s.errors ? `M${x},${base}V${base - hOk}H${x + bw}V${base}Z` : barPath(x, base - Math.max(hOk, 2), bw, Math.max(hOk, 2), 4)}"/>`;
+      if (s.errors) bars += `<path class="bar err" d="${barPath(x, base - hOk - gap - Math.max(hErr, 2), bw, Math.max(hErr, 2), 4)}"/>`;
+    });
+    // response time
+    const H2 = lat.length ? (narrow ? 96 : 110) : 0, t2 = 14, b2 = 6, ih2 = H2 - t2 - b2;
+    const lt = niceTicks(Math.max(0.1, ...lat.map((s) => s.avgMs)), 2);
+    const lMax = lt[lt.length - 1], y2 = (v) => t2 + ih2 - (v / lMax) * ih2;
+    let g2 = '', line = '';
+    if (lat.length) {
+      g2 = lt.map((t) => `<line class="grid${t ? '' : ' base'}" x1="${pad.l}" x2="${W - pad.r}" y1="${y2(t)}" y2="${y2(t)}"/><text class="tick" x="${pad.l - 8}" y="${y2(t) + 3.5}" text-anchor="end">${t ? esc(ms(t)) : '0'}</text>`).join('');
+      // runs of hours that had requests; a gap breaks the line
+      const runs = [];
+      let cur = null;
+      series.forEach((s, i) => {
+        if (s.avgMs === null) { cur = null; return; }
+        if (!cur) runs.push((cur = []));
+        cur.push([xOf(i), y2(s.avgMs)]);
+      });
+      for (const r of runs) {
+        if (r.length > 1) {
+          const pts = r.map((p) => p.join(',')).join(' ');
+          line += `<polygon class="lat-area" points="${r[0][0]},${y2(0)} ${pts} ${r[r.length - 1][0]},${y2(0)}"/><polyline class="lat" points="${pts}"/>`;
+        }
+        line += r.map(([x, y]) => `<circle class="lat-dot" cx="${x}" cy="${y}" r="${r.length > 1 ? 2.5 : 3.5}"/>`).join('');
+      }
     }
-    if (s.avgMs !== null) pts.push(`${x + bw / 2},${yl(s.avgMs)}`);
-  });
-  const xLabels = series
-    .map((s, i) => (i % 4 === 0 ? `<text x="${pad.l + i * bw + bw / 2}" y="${H - 6}" text-anchor="middle">${esc(s.label)}</text>` : ''))
-    .join('');
-  const grid = ticks
-    .map((t) => `<line class="grid" x1="${pad.l}" x2="${W - pad.r}" y1="${y(t)}" y2="${y(t)}"/><text x="${pad.l - 6}" y="${y(t) + 3}" text-anchor="end">${t}</text>`)
-    .join('');
-  const latAxis = lat.length ? `<text x="${W - pad.r + 6}" y="${pad.t + 8}">${esc(ms(maxL))}</text><text x="${W - pad.r + 6}" y="${pad.t + ih}">0</text>` : '';
-  const hits = series
-    .map((s, i) => `<rect x="${pad.l + i * bw}" y="${pad.t}" width="${bw}" height="${ih}" fill="transparent" data-i="${i}"/>`)
-    .join('');
+    // time axis (shared), every 3 hours, "now" at the end
+    const H3 = 22;
+    const every = narrow ? 6 : 3;
+    const axis = series.map((s, i) => (i === series.length - 1 ? `<text class="tick" x="${xOf(i)}" y="15" text-anchor="end" dx="${slot / 2}">now</text>`
+      : (series.length - 1 - i) % every === 0 && i < series.length - 2 ? `<text class="tick" x="${xOf(i)}" y="15" text-anchor="middle">${esc(s.label)}:00</text>` : '')).join('');
+    const svg = (h, body, label) => `<svg class="chart" width="${W}" height="${h}" viewBox="0 0 ${W} ${h}" role="img" aria-label="${label}">${body}</svg>`;
+    const hit = (h) => series.map((s, i) => `<rect class="hit" x="${pad.l + i * slot}" y="0" width="${slot}" height="${h}" data-i="${i}"/>`).join('');
+    const col = (h) => `<rect class="col" x="0" y="0" width="${slot}" height="${h}" rx="6" style="display:none"/>`;
+    wrap.querySelector('.ch-plot').innerHTML =
+      `<div class="ch-panel">${svg(H1, col(H1) + g1 + bars + hit(H1), 'Requests per hour, last 24 hours')}</div>` +
+      (lat.length ? `<div class="ch-sub">Average response time</div><div class="ch-panel">${svg(H2, col(H2) + g2 + line + hit(H2), 'Average response time per hour')}</div>` : '') +
+      svg(H3, axis, 'Hours');
+    wrap._geo = { slot, padL: pad.l };
+  };
   setTimeout(() => {
     const wrap = document.getElementById(id);
     if (!wrap) return;
+    draw(wrap);
+    let lastW = wrap.clientWidth;
+    const ro = new ResizeObserver(() => { if (!document.body.contains(wrap)) return ro.disconnect(); if (Math.abs(wrap.clientWidth - lastW) > 2) { lastW = wrap.clientWidth; draw(wrap); } });
+    ro.observe(wrap);
     const tip = wrap.querySelector('.chart-tip');
+    const hide = () => { tip.style.display = 'none'; wrap.querySelectorAll('.col').forEach((c) => (c.style.display = 'none')); wrap.querySelectorAll('.on').forEach((e) => e.classList.remove('on')); };
     wrap.addEventListener('mousemove', (e) => {
-      const r = e.target.closest('rect[data-i]');
-      if (!r) return (tip.style.display = 'none');
-      const s = series[Number(r.dataset.i)];
-      tip.innerHTML = `<b>${esc(s.label)}:00</b> · ${plural(s.requests, 'request')}${s.errors ? ` · <span style="color:var(--err)">${s.errors} failed</span>` : ''}${s.avgMs !== null ? ` · avg ${esc(ms(s.avgMs))}` : ''}`;
+      const r = e.target.closest('rect.hit');
+      if (!r) return hide();
+      const i = Number(r.dataset.i), s = series[i], g = wrap._geo;
+      wrap.querySelectorAll('.col').forEach((c) => { c.setAttribute('x', g.padL + i * g.slot); c.style.display = ''; });
+      const next = series[i + 1]?.label ?? 'now';
+      tip.innerHTML = `<div class="tt-h">${esc(s.label)}:00 – ${esc(next)}${next === 'now' ? '' : ':00'}</div>
+        <div class="tt-r"><i style="background:var(--chart-bar)"></i>Requests<b>${s.requests.toLocaleString()}</b></div>
+        <div class="tt-r"><i style="background:var(--chart-err)"></i>Failed<b>${s.errors ? `${s.errors.toLocaleString()} · ${Math.round((100 * s.errors) / s.requests)}%` : '0'}</b></div>
+        <div class="tt-r"><i style="background:var(--chart-3)"></i>Avg response<b>${s.avgMs !== null ? esc(ms(s.avgMs)) : '—'}</b></div>
+        ${s.bytes ? `<div class="tt-r"><i style="background:transparent"></i>Served<b>${esc(bytes(s.bytes))}</b></div>` : ''}`;
       tip.style.display = 'block';
       const box = wrap.getBoundingClientRect();
-      tip.style.left = `${Math.min(box.width - tip.offsetWidth - 4, Math.max(4, e.clientX - box.left + 12))}px`;
-      tip.style.top = `${e.clientY - box.top - 34}px`;
+      const cx = g.padL + (i + 0.5) * g.slot;
+      const left = cx + 14 + tip.offsetWidth > box.width ? cx - 14 - tip.offsetWidth : cx + 14;
+      tip.style.left = `${Math.max(4, left)}px`;
+      tip.style.top = `${Math.max(0, e.clientY - box.top - tip.offsetHeight / 2)}px`;
     });
-    wrap.addEventListener('mouseleave', () => (tip.style.display = 'none'));
+    wrap.addEventListener('mouseleave', hide);
   });
-  return `<div class="chart-wrap" id="${id}">
-    <svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Requests and average response time per hour, last 24 hours">
-      ${grid}${bars}
-      ${pts.length > 1 ? `<polyline class="line" points="${pts.join(' ')}"/>` : ''}
-      ${pts.length === 1 ? `<circle cx="${pts[0].split(',')[0]}" cy="${pts[0].split(',')[1]}" r="3" fill="var(--violet)"/>` : ''}
-      ${latAxis}${xLabels}${hits}
-    </svg>
-    <div class="chart-tip" style="display:none"></div>
-  </div>`;
+  const sum = total
+    ? `<div class="ch-sum"><span><b>${total.toLocaleString()}</b> requests</span><span><b>${errs ? errs.toLocaleString() : '0'}</b> failed${errs ? ` (${((100 * errs) / total).toFixed(errs * 100 < total ? 1 : 0)}%)` : ''}</span><span>busiest <b>${esc(peak.label)}:00</b> · ${peak.requests.toLocaleString()}</span></div>`
+    : '<div class="ch-sum"><span>No requests in the last 24 hours</span></div>';
+  return `<div class="chart-wrap" id="${id}">${sum}<div class="ch-plot${total ? '' : ' empty'}"></div><div class="chart-tip" style="display:none"></div></div>`;
 }
 
 /* ======================================================= sliding indicator */
@@ -878,7 +934,7 @@ function renderWorkerOverview(body, w) {
         <div class="fig"><div class="k">Last request</div><div class="v">${esc(ago(sm.lastRunAt))}</div><div class="f">${bytes(sm.totalBytesServed)} served so far</div></div>
       </div>
       <div class="card" style="margin-bottom:16px">
-        <div class="card-head"><h3>Last 24 hours</h3><div class="tools legend"><span><i style="background:var(--chart)"></i>requests</span><span><i style="background:var(--err)"></i>errors</span><span><i style="background:var(--chart-2);height:2px"></i>average response</span></div></div>
+        <div class="card-head"><h3>Last 24 hours</h3><div class="tools legend"><span><i style="background:var(--chart-bar)"></i>requests</span><span><i style="background:var(--chart-err)"></i>errors</span><span><i style="background:var(--chart-3);height:2px;border-radius:1px"></i>avg response</span></div></div>
         <div class="card-body">${hourChart(w.hourly)}</div>
       </div>
       ${
