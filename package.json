@@ -1,6 +1,6 @@
 {
   "name": "alex-aero",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "private": true,
   "description": "Self-hosted Cloudflare-Workers-style platform: write JavaScript, TypeScript, Python or Shell workers in the browser and run them on your own machine.",
   "main": "server.js",

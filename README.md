@@ -97,7 +97,13 @@ export default {
 
 ### Updates
 
-`ax update` installs the newest version from GitHub (`ax update --check` only looks), and the dashboard's **System** page has the same thing as a button, with what changed in each version; it checks every 6 hours and never installs by itself. Only Alex-Aero's own code is replaced (server.js, public/, bin/, the scripts): workers, settings, the login and logs in `storage/` are kept. The version before is saved in `storage/backups/`, and if the new one doesn't come up the old one is put back on its own; `ax update --rollback` goes back by hand. Docker installs update on the host: `git pull && docker compose up -d --build`. A fork: `AX_UPDATE_REPO=you/your-fork`.
+`ax update` installs the newest version from GitHub (`ax update --check` only looks), and the dashboard's **System** page has the same thing as a button, with what changed in each version; it checks every 6 hours and never installs by itself. Only Alex-Aero's own code is replaced (server.js, public/, bin/, the scripts): workers, settings, the login and logs in `storage/` are kept. The version before is saved in `storage/backups/`, and if the new one doesn't come up the old one is put back on its own; `ax update --rollback` goes back by hand. Docker installs update on the host: `git pull && docker compose up -d --build`. An install from before 2.3 (no `ax update` yet) catches up with one line, run on its machine:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/alexd-aero/alex-aero-workers/master/update.sh | bash
+```
+
+It finds the install by itself (or give the folder: `… | bash -s -- /path/to/alex-aero`). A fork: `AX_UPDATE_REPO=you/your-fork`.
 
 ## 🚀 Performance
 

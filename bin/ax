@@ -679,12 +679,21 @@ UPDATE_REPO="${AX_UPDATE_REPO:-alexd-aero/alex-aero-workers}"
 UPDATE_BRANCH="${AX_UPDATE_BRANCH:-master}"
 BACKUP_DIR="$STORAGE_DIR/backups"
 UPDATE_STATUS="$RUNTIME_DIR/update.json"
-CODE_ITEMS=(server.js package.json public bin install.sh run.sh kill.sh Dockerfile docker-compose.yml README.md docs LICENSE .gitignore .dockerignore)
+CODE_ITEMS=(server.js package.json public bin install.sh update.sh run.sh kill.sh Dockerfile docker-compose.yml README.md docs LICENSE .gitignore .dockerignore)
 
 pkg_version() { sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -1; }
 ver_newer() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]; }   # is $1 newer than $2
+# The branch's newest commit, from GitHub's API: raw.githubusercontent.com keeps
+# a branch's files cached for minutes, a commit's are always what they are.
+UPDATE_REF=""
+latest_ref() {
+  local sha
+  sha="$(curl -fsSL -m 15 -H 'Accept: application/vnd.github.sha' "https://api.github.com/repos/$UPDATE_REPO/commits/$UPDATE_BRANCH" 2>/dev/null)"
+  if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then echo "$sha"; else echo "$UPDATE_BRANCH"; fi
+}
 latest_version() {
-  curl -fsSL -m 15 -H 'Cache-Control: no-cache' "https://raw.githubusercontent.com/$UPDATE_REPO/$UPDATE_BRANCH/package.json" 2>/dev/null |
+  UPDATE_REF="$(latest_ref)"
+  curl -fsSL -m 15 "https://raw.githubusercontent.com/$UPDATE_REPO/$UPDATE_REF/package.json" 2>/dev/null |
     sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' | head -1
 }
 ustatus() {  # ustatus STATE [MESSAGE]: what the dashboard shows while it runs
@@ -745,6 +754,7 @@ cmd_update() {
   UFROM="$cur"; ustatus checking "Asking GitHub for the newest version"
   spin_start "asking GitHub ($UPDATE_REPO) for the newest version"
   new="$(latest_version)"; spin_stop
+  export UPDATE_REF
   [ -n "$new" ] || fail_update "GitHub didn't answer (github.com/$UPDATE_REPO). Is this machine online?"
   if ! ver_newer "$new" "$cur" && [ "$force" != 1 ]; then
     ok "up to date ${DIM}(v$cur)${NC}"; UTO="$cur" ustatus current "Up to date (v$cur)"; return 0
@@ -764,7 +774,8 @@ do_update() {
   tmp="$RUNTIME_DIR/update-download"
   rm -rf "$tmp"; mkdir -p "$tmp" || fail_update "no room for a temporary folder"
   step "Downloading v$new" downloading
-  curl -fsSL -m 300 "https://codeload.github.com/$UPDATE_REPO/tar.gz/refs/heads/$UPDATE_BRANCH" -o "$tmp/src.tgz" ||
+  local ref="${UPDATE_REF:-refs/heads/$UPDATE_BRANCH}"; [ "$ref" = "$UPDATE_BRANCH" ] && ref="refs/heads/$UPDATE_BRANCH"
+  curl -fsSL -m 300 "https://codeload.github.com/$UPDATE_REPO/tar.gz/$ref" -o "$tmp/src.tgz" ||
     fail_update "the download from GitHub failed"
   mkdir -p "$tmp/src" && tar -xzf "$tmp/src.tgz" -C "$tmp/src" --strip-components=1 || fail_update "the download isn't a readable archive"
   src="$tmp/src"

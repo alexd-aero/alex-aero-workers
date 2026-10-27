@@ -3931,7 +3931,14 @@ function checkForUpdate(force) {
   const ua = { 'user-agent': `alex-aero/${APP_VERSION}`, 'cache-control': 'no-cache' };
   updateChecking = (async () => {
     try {
-      const r = await fetch(`https://raw.githubusercontent.com/${UPDATE_REPO}/${UPDATE_BRANCH}/package.json`, { headers: ua, signal: AbortSignal.timeout(10000) });
+      // the branch's newest commit first: raw.githubusercontent.com caches a branch's files for minutes
+      let ref = UPDATE_BRANCH;
+      try {
+        const h = await fetch(`https://api.github.com/repos/${UPDATE_REPO}/commits/${encodeURIComponent(UPDATE_BRANCH)}`, { headers: { ...ua, accept: 'application/vnd.github.sha' }, signal: AbortSignal.timeout(10000) });
+        const sha = h.ok ? (await h.text()).trim() : '';
+        if (/^[0-9a-f]{40}$/.test(sha)) ref = sha;
+      } catch (_) { /* the branch it is */ }
+      const r = await fetch(`https://raw.githubusercontent.com/${UPDATE_REPO}/${ref}/package.json`, { headers: ua, signal: AbortSignal.timeout(10000) });
       if (!r.ok) throw new Error(`GitHub answered ${r.status}`);
       const latest = String((await r.json()).version || '');
       if (!/^\d+(\.\d+){0,3}$/.test(latest)) throw new Error("GitHub's copy has no version");
