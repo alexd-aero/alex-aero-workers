@@ -591,7 +591,7 @@ function renderSide() {
     (n) =>
       `<a class="nav-item ${page === n.id ? 'active' : ''}" href="${n.href}">${icon(n.icon)}<span>${n.label}</span>${
         n.id === 'workers' && S.overview ? `<span class="count">${S.overview.workers.length}</span>` : ''
-      }</a>`
+      }${n.id === 'system' && S.overview?.update ? `<span class="count upd" title="Alex-Aero v${esc(S.overview.update.latest)} is available">new</span>` : ''}</a>`
   ).join('');
   slideInd($('#nav'));
   const ws = [...workersList()].sort((a, b) => a.name.localeCompare(b.name));
@@ -2571,9 +2571,10 @@ async function viewSystem(view) {
           }
         </div>
       </div>
+      <div class="card" style="margin-top:16px" id="updates"></div>
       <div class="card" style="margin-top:16px" id="account"></div>
       <div class="card" style="margin-top:16px"><div class="card-head"><h3>Command line</h3><span class="sub">on the Pi</span></div><div class="card-body stack" style="gap:8px">
-        ${[['ax', 'menu: status, logs, restart, login, domain'], ['ax status', 'what’s running'], ['ax logs -f', 'follow the backend log'], ['ax passwd', 'change the dashboard login'], ['ax autostart on', 'start at boot, restart on crash']]
+        ${[['ax', 'menu: status, logs, restart, login, domain'], ['ax status', 'what’s running'], ['ax logs -f', 'follow the backend log'], ['ax passwd', 'change the dashboard login'], ['ax autostart on', 'start at boot, restart on crash'], ['ax update', 'the newest version from GitHub']]
           .map(([c, d]) => `<div class="copy-line"><span>${esc(c)} <span style="color:var(--muted)"># ${esc(d)}</span></span><button class="icon-btn sm" data-copy="${esc(c)}">${icon('copy')}</button></div>`)
           .join('')}
       </div></div>
@@ -2586,6 +2587,7 @@ async function viewSystem(view) {
   let data = await api('GET', '/api/system');
   paint(data);
   renderAccount();
+  renderUpdates();
   view.onclick = (e) => {
     const c = e.target.closest('[data-copy]');
     if (c) return copy(c.dataset.copy);
@@ -2601,9 +2603,69 @@ async function viewSystem(view) {
       if (S.route.page === 'system' && !document.querySelector('.overlay') && !$('#account')?.contains(document.activeElement)) {
         paint(data);
         renderAccount();
+        renderUpdates();
       }
     } catch (_) {}
   }, 5000);
+}
+
+/* ============================================================ updates */
+let updateCache = null, updatePoll = null;
+const UPDATE_BUSY = ['checking', 'downloading', 'installing', 'restarting'];
+async function renderUpdates(fresh) {
+  const box = $('#updates');
+  if (!box) return;
+  if (!updateCache || fresh) updateCache = await api('GET', '/api/update').catch(() => updateCache);
+  const u = updateCache;
+  if (!u) { box.innerHTML = `<div class="card-head"><h3>Updates</h3><span class="sub">couldn't ask the backend</span></div>`; return; }
+  const job = u.job;
+  const busy = job && UPDATE_BUSY.includes(job.state);
+  const recent = job && job.at && Date.now() - new Date(job.at).getTime() < 10 * 60e3;
+  const failed = recent && job.state === 'failed';
+  const head = busy
+    ? `<span class="tag warn"><span class="d"></span>Updating</span>`
+    : u.available ? `<span class="tag ok"><span class="d"></span>v${esc(u.latest)} available</span>`
+    : u.error ? `<span class="tag warn" title="${esc(u.error)}"><span class="d"></span>Couldn't check</span>`
+    : u.latest ? `<span class="tag ok"><span class="d"></span>Up to date</span>` : '';
+  const notes = (u.notes || []).map((n) => `<div class="upd-note"><div class="row" style="gap:8px"><b class="mono">v${esc(n.version)}</b><span class="grow">${esc(n.title)}</span>${n.date ? `<span class="hint">${esc(ago(n.date))}</span>` : ''}</div>${n.body ? `<pre class="upd-body">${esc(n.body)}</pre>` : ''}</div>`).join('');
+  box.innerHTML = `<div class="card-head"><h3>Updates</h3><span class="sub">Alex-Aero <b class="mono">v${esc(u.current)}</b>${u.checkedAt ? ` · checked ${esc(ago(u.checkedAt))}` : ''}</span><span class="tools">${head}</span></div>
+    <div class="card-body stack" style="gap:12px">
+      ${busy ? `<div class="upd-progress"><div class="row" style="gap:10px"><span class="spinner"></span><b>${esc(job.message || 'Updating')}</b></div>
+          <div class="hint">${job.state === 'restarting' ? 'Alex-Aero restarts now; this page comes back by itself.' : `v${esc(job.from || u.current)} → v${esc(job.to || u.latest || '…')}. Workers, settings and the login are kept.`}</div></div>` : ''}
+      ${failed ? `<div class="upd-fail"><b>The update didn't finish.</b> ${esc(job.message || '')}</div>` : ''}
+      ${recent && job.state === 'done' && !u.available ? `<div class="hint">${esc(job.message || 'Updated')}. The version before is kept: <span class="mono">ax update --rollback</span></div>` : ''}
+      ${u.available && !busy ? `${notes ? `<div class="stack" style="gap:8px">${notes}</div>` : `<div class="hint">A newer version is on GitHub.</div>`}` : ''}
+      ${u.docker ? `<div class="hint">This copy runs in Docker. On the host: <span class="mono">git pull && docker compose up -d --build</span></div>` : ''}
+      <div class="upd-foot"><span class="grow hint">From <a href="https://github.com/${esc(u.repo)}" target="_blank" rel="noopener" class="mono">github.com/${esc(u.repo)}</a>. Installed only when you say so; it restarts for a few seconds.</span>
+        <button class="btn sm ghost" id="updCheck" ${busy ? 'disabled' : ''}>Check now</button>
+        ${u.available && !u.docker ? `<button class="btn sm primary" id="updGo" ${busy ? 'disabled' : ''}>Update to v${esc(u.latest)}</button>` : ''}</div>
+    </div>`;
+  $('#updCheck').onclick = async (e) => {
+    e.currentTarget.disabled = true;
+    const r = await attempt(() => api('POST', '/api/update/check'));
+    if (r) { updateCache = r; toast(r.error ? `Couldn't check: ${r.error}` : r.available ? `v${r.latest} is available` : 'Up to date', r.error ? 'err' : 'ok'); }
+    renderUpdates();
+  };
+  const go = $('#updGo');
+  if (go) go.onclick = async () => {
+    if (!(await confirmDialog({ title: `Update to v${u.latest}?`, text: `Alex-Aero downloads v${esc(u.latest)} from GitHub and restarts for a few seconds. Your workers, settings and login are kept, and so is v${esc(u.current)} (to go back to).`, ok: 'Update' }))) return;
+    const r = await attempt(() => api('POST', '/api/update/apply'));
+    if (r) { updateCache = r; watchUpdate(); renderUpdates(); }
+  };
+  if (busy) watchUpdate();
+}
+// while it updates: follow its status; when the backend comes back on the new version, reload
+function watchUpdate() {
+  if (updatePoll) return;
+  const from = updateCache?.current;
+  updatePoll = setInterval(async () => {
+    const r = await fetch('/api/update', { credentials: 'same-origin' }).then((x) => (x.ok ? x.json() : null)).catch(() => null);
+    if (!r) return;      // restarting
+    updateCache = r;
+    if (r.current !== from) { clearInterval(updatePoll); updatePoll = null; toast(`Updated to v${r.current}`); setTimeout(() => location.reload(), 900); return; }
+    if (!r.job || !UPDATE_BUSY.includes(r.job.state)) { clearInterval(updatePoll); updatePoll = null; if (r.job?.state === 'failed') toast(r.job.message || "The update didn't finish", 'err'); }
+    if (S.route.page === 'system') renderUpdates();
+  }, 1500);
 }
 
 /* ============================================================ account */

@@ -3899,6 +3899,105 @@ function readDiskUsage() {
   }
 }
 
+/* ------------------------------------------------------------- updates
+ * The newest Alex-Aero on GitHub, checked every 6 hours (and on demand).
+ * Installing runs `bin/ax update --yes` outside this process, since the
+ * update restarts it; that script reports in storage/runtime/update.json. */
+const APP_VERSION = (() => { try { return JSON.parse(fs.readFileSync(path.join(ROOT_DIR, 'package.json'), 'utf8')).version || '0.0.0'; } catch (_) { return '0.0.0'; } })();
+const UPDATE_REPO = /^[\w.-]+\/[\w.-]+$/.test(process.env.AX_UPDATE_REPO || '') ? process.env.AX_UPDATE_REPO : 'alexd-aero/alex-aero-workers';
+const UPDATE_BRANCH = /^[\w./-]+$/.test(process.env.AX_UPDATE_BRANCH || '') ? process.env.AX_UPDATE_BRANCH : 'master';
+const UPDATE_STATUS_FILE = path.join(RUNTIME_DIR, 'update.json');
+const IN_DOCKER = fs.existsSync('/.dockerenv');
+const updateInfo = { latest: null, notes: [], checkedAt: null, error: null };
+let updateChecking = null;
+
+function versionNewer(a, b) {  // is a newer than b (1.2.10 > 1.2.9)
+  const pa = String(a || '').split('.').map((n) => parseInt(n, 10) || 0), pb = String(b || '').split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+  return false;
+}
+function readUpdateStatus() {
+  let st = null;
+  try { st = JSON.parse(fs.readFileSync(UPDATE_STATUS_FILE, 'utf8')); } catch (_) { return null; }
+  // an update that restarted us into its new version is done, whatever the script got to write
+  if (st && ['installing', 'restarting'].includes(st.state) && st.to && st.to === APP_VERSION) st = { ...st, state: 'done', message: `Updated to v${APP_VERSION}` };
+  // one that stopped answering long ago didn't finish
+  if (st && ['checking', 'downloading', 'installing', 'restarting'].includes(st.state) && Date.now() - new Date(st.at).getTime() > 15 * 60e3) st = { ...st, state: 'failed', message: 'The update stopped without finishing. Try again, or run: ax update' };
+  return st;
+}
+function checkForUpdate(force) {
+  if (!force && updateInfo.checkedAt && Date.now() - updateInfo.checkedAt < 6 * 3600e3) return Promise.resolve(updateInfo);
+  if (updateChecking) return updateChecking;
+  const ua = { 'user-agent': `alex-aero/${APP_VERSION}`, 'cache-control': 'no-cache' };
+  updateChecking = (async () => {
+    try {
+      const r = await fetch(`https://raw.githubusercontent.com/${UPDATE_REPO}/${UPDATE_BRANCH}/package.json`, { headers: ua, signal: AbortSignal.timeout(10000) });
+      if (!r.ok) throw new Error(`GitHub answered ${r.status}`);
+      const latest = String((await r.json()).version || '');
+      if (!/^\d+(\.\d+){0,3}$/.test(latest)) throw new Error("GitHub's copy has no version");
+      let notes = [];
+      if (versionNewer(latest, APP_VERSION)) {
+        // what changed: the release commits ("2.3.0: title") newer than this one
+        try {
+          const c = await fetch(`https://api.github.com/repos/${UPDATE_REPO}/commits?sha=${encodeURIComponent(UPDATE_BRANCH)}&per_page=30`, { headers: { ...ua, accept: 'application/vnd.github+json' }, signal: AbortSignal.timeout(10000) });
+          if (c.ok) {
+            for (const x of await c.json()) {
+              const msg = String(x?.commit?.message || '');
+              const m = /^(\d+\.\d+\.\d+):\s*(.+)/.exec(msg.split('\n')[0]);
+              if (!m || !versionNewer(m[1], APP_VERSION)) continue;
+              // git wraps at ~72 columns: join the lines of a paragraph back up (list items stay their own)
+              const body = msg.split('\n').slice(1).filter((l) => !/^Co-Authored-By:/i.test(l)).join('\n').trim()
+                .split(/\n{2,}/).map((par) => par.replace(/\n(?!\s*[-*•] )\s*/g, ' ')).join('\n\n');
+              notes.push({ version: m[1], title: m[2].slice(0, 160), body: body.slice(0, 1500), date: x.commit?.author?.date || null });
+            }
+          }
+        } catch (_) { /* the notes are a nicety */ }
+      }
+      Object.assign(updateInfo, { latest, notes: notes.slice(0, 15), checkedAt: Date.now(), error: null });
+    } catch (err) {
+      Object.assign(updateInfo, { checkedAt: Date.now(), error: err.name === 'TimeoutError' ? "GitHub didn't answer" : err.message });
+    } finally {
+      updateChecking = null;
+    }
+    return updateInfo;
+  })();
+  return updateChecking;
+}
+function updateView() {
+  return {
+    current: APP_VERSION, latest: updateInfo.latest, available: Boolean(updateInfo.latest && versionNewer(updateInfo.latest, APP_VERSION)),
+    notes: updateInfo.notes, checkedAt: updateInfo.checkedAt, error: updateInfo.error, repo: UPDATE_REPO, branch: UPDATE_BRANCH,
+    docker: IN_DOCKER, job: readUpdateStatus()
+  };
+}
+function startUpdate() {
+  const job = readUpdateStatus();
+  if (job && ['checking', 'downloading', 'installing', 'restarting'].includes(job.state)) throw new HttpError(409, 'An update is already running.');
+  if (IN_DOCKER) throw new HttpError(409, 'This copy runs in Docker: update it on the host with  git pull && docker compose up -d --build');
+  const ax = path.join(ROOT_DIR, 'bin', 'ax');
+  if (!fs.existsSync(ax)) throw new HttpError(500, 'bin/ax is missing, so this copy can\'t update itself.');
+  fs.writeFileSync(UPDATE_STATUS_FILE, JSON.stringify({ state: 'checking', from: APP_VERSION, at: new Date().toISOString(), message: 'Starting the update', log: ['Starting the update'] }));
+  const pass = ['PATH', 'HOME', 'USER', 'LANG', 'AX_NODE', 'AX_PROXY', 'PUBLIC_PORT', 'BACKEND_PORT', 'AX_UPDATE_REPO', 'AX_UPDATE_BRANCH', 'TZ'];
+  const env = { AX_NONINTERACTIVE: '1', AX_NODE: process.env.AX_NODE || process.execPath };
+  for (const k of pass) if (process.env[k] && !env[k]) env[k] = process.env[k];
+  let cmd = 'bash', args = [ax, 'update', '--yes'];
+  // Under the autostart service the restart ends everything in the service's
+  // own group, the updater too: it runs as a unit of its own instead.
+  if (process.env.AX_FROM_SYSTEMD === '1') {
+    try {
+      execSync('sudo -n true', { stdio: 'ignore', timeout: 4000 });
+      args = ['-n', 'systemd-run', '--quiet', '--collect', `--unit=alex-aero-update-${Date.now()}`, `--uid=${process.getuid()}`, `--gid=${process.getgid()}`,
+        `--working-directory=${ROOT_DIR}`, ...Object.entries(env).map(([k, v]) => `--setenv=${k}=${v}`), '/bin/bash', ax, 'update', '--yes'];
+      cmd = 'sudo';
+    } catch (_) { /* no sudo: run it directly and hope the restart lets it finish */ }
+  }
+  const log = fs.openSync(path.join(RUNTIME_DIR, 'update.log'), 'a');
+  const child = spawn(cmd, args, { cwd: ROOT_DIR, env, detached: true, stdio: ['ignore', log, log] });
+  child.on('error', (err) => { try { fs.writeFileSync(UPDATE_STATUS_FILE, JSON.stringify({ state: 'failed', from: APP_VERSION, at: new Date().toISOString(), message: `Couldn't start the updater: ${err.message}` })); } catch (_) {} });
+  child.unref();
+  fs.closeSync(log);
+}
+
 function systemSnapshot() {
   return {
     ...RUNTIME_VERSIONS,
@@ -4097,6 +4196,8 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, {
         config: publicConfig(),
         system: systemSnapshot(),
+        version: APP_VERSION,
+        update: updateInfo.latest && versionNewer(updateInfo.latest, APP_VERSION) ? { latest: updateInfo.latest } : null,
         activeWorker: state.activeWorker,
         defaultWorker: state.defaultWorker || '',
         editorPreferences: state.editorPreferences,
@@ -4113,6 +4214,22 @@ const server = http.createServer(async (req, res) => {
         clientDevice: parseClientAndDevice(req, true),
         authEnabled: Boolean(loadAuthConfig())
       });
+      return;
+    }
+
+    if (pathname === '/api/update' && req.method === 'GET') {
+      if (!updateInfo.checkedAt) await checkForUpdate(false);
+      sendJson(res, 200, updateView());
+      return;
+    }
+    if (pathname === '/api/update/check' && req.method === 'POST') {
+      await checkForUpdate(true);
+      sendJson(res, 200, updateView());
+      return;
+    }
+    if (pathname === '/api/update/apply' && req.method === 'POST') {
+      startUpdate();
+      sendJson(res, 202, updateView());
       return;
     }
 
@@ -5025,4 +5142,7 @@ server.listen(BACKEND_PORT, BIND_HOST, () => {
     .slice(0, 8);
   recent.forEach((w, i) => setTimeout(() => isWorkerdWorker(w.name) && ensureWorkerdInstance(w.name).catch(() => {}), 500 + i * 400).unref());
   setInterval(manageTunnelConnector, 60 * 1000).unref();
+  // is there a newer Alex-Aero? (shown on the System page; never installed by itself)
+  setTimeout(() => checkForUpdate(true).catch(() => {}), 20 * 1000).unref();
+  setInterval(() => checkForUpdate(true).catch(() => {}), 6 * 3600e3).unref();
 });

@@ -575,3 +575,14 @@ h1.page-title { margin: 0; font: 600 30px/1.15 var(--display); letter-spacing: -
 .hide-lg { display: none; }
 @media (max-width: 860px) { .hide-sm { display: none !important; } .hide-lg { display: inline; } }
 .legend span { white-space: nowrap; }
+
+/* updates (System page) */
+.nav-item .count.upd { color: var(--ac-ink); background: var(--ac); border-radius: 999px; padding: 1px 7px; font-size: 10.5px; font-weight: 600; letter-spacing: 0.02em; }
+.upd-note { padding: 10px 12px; border-radius: 12px; background: var(--well); }
+.upd-body { margin: 6px 0 0; white-space: pre-wrap; font-family: var(--font); font-size: 13px; line-height: 1.55; color: var(--text-2); max-height: 180px; overflow: auto; }
+.upd-progress { padding: 12px 14px; border-radius: 12px; background: var(--warn-soft); }
+.upd-fail { padding: 10px 14px; border-radius: 12px; background: rgba(230, 154, 139, 0.12); color: var(--err); }
+.spinner { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--line-2); border-top-color: var(--ac); animation: updSpin 0.8s linear infinite; flex: none; }
+@keyframes updSpin { to { transform: rotate(360deg); } }
+.upd-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.upd-foot .hint { flex: 1 1 260px; min-width: 0; overflow-wrap: anywhere; }

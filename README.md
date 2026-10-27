@@ -93,7 +93,11 @@ export default {
 
 ## ⌨️ The command line
 
-`ax` shows status and an arrow-key menu: start, stop, logs, domain, login, autostart, doctor. It only ever touches its own processes (found by pidfile and command line): it never stops system services, never kills whatever sits on a port, and never touches other cloudflared tunnels. If a port is taken by something else it says who has it and stops.
+`ax` shows status and an arrow-key menu: start, stop, logs, domain, login, autostart, doctor, updates. It only ever touches its own processes (found by pidfile and command line): it never stops system services, never kills whatever sits on a port, and never touches other cloudflared tunnels. If a port is taken by something else it says who has it and stops.
+
+### Updates
+
+`ax update` installs the newest version from GitHub (`ax update --check` only looks), and the dashboard's **System** page has the same thing as a button, with what changed in each version; it checks every 6 hours and never installs by itself. Only Alex-Aero's own code is replaced (server.js, public/, bin/, the scripts): workers, settings, the login and logs in `storage/` are kept. The version before is saved in `storage/backups/`, and if the new one doesn't come up the old one is put back on its own; `ax update --rollback` goes back by hand. Docker installs update on the host: `git pull && docker compose up -d --build`. A fork: `AX_UPDATE_REPO=you/your-fork`.
 
 ## 🚀 Performance
 

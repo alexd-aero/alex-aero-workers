@@ -13,6 +13,8 @@
 #   ax domain                  Cloudflare domain + tunnel settings
 #   ax doctor [--fix]          check node, nginx, workerd, cloudflared, ports
 #   ax autostart on|off        a systemd service: starts at boot, restarts on crash
+#   ax update [--check|--yes]  the newest version from GitHub (workers, settings, login kept)
+#   ax update --rollback       back to the version before the last update
 #   ax version | help
 #
 # The one rule: ax only ever touches Alex-Aero's own processes, found by its
@@ -36,7 +38,7 @@ NGINX_PID_FILE="${RUNTIME_DIR}/nginx.pid"
 BACKEND_LOG_FILE="${RUNTIME_DIR}/backend.log"
 NGINX_TMP="/tmp/robo-workers-nginx"
 UNIT="alex-aero.service"
-VERSION="2.1.0"
+VERSION="$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$ROOT_DIR/package.json" 2>/dev/null | head -1)"
 
 export BACKEND_PORT="${BACKEND_PORT:-17156}"
 export PUBLIC_PORT="${PUBLIC_PORT:-27715}"
@@ -667,6 +669,159 @@ EOF
   esac
 }
 
+# ------------------------------------------------------------------ update
+# The newest Alex-Aero from GitHub. Only its own code is replaced (server.js,
+# package.json, public/, bin/, the install scripts and docs); storage/ (workers,
+# settings, login, logs), .node, .bin, .workerd-local, nginx/nginx.conf and .env
+# are never touched. The code before is kept in storage/backups/ (newest 5), and
+# if the new version doesn't come up the old one is put back by itself.
+UPDATE_REPO="${AX_UPDATE_REPO:-alexd-aero/alex-aero-workers}"
+UPDATE_BRANCH="${AX_UPDATE_BRANCH:-master}"
+BACKUP_DIR="$STORAGE_DIR/backups"
+UPDATE_STATUS="$RUNTIME_DIR/update.json"
+CODE_ITEMS=(server.js package.json public bin install.sh run.sh kill.sh Dockerfile docker-compose.yml README.md docs LICENSE .gitignore .dockerignore)
+
+pkg_version() { sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -1; }
+ver_newer() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]; }   # is $1 newer than $2
+latest_version() {
+  curl -fsSL -m 15 -H 'Cache-Control: no-cache' "https://raw.githubusercontent.com/$UPDATE_REPO/$UPDATE_BRANCH/package.json" 2>/dev/null |
+    sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' | head -1
+}
+ustatus() {  # ustatus STATE [MESSAGE]: what the dashboard shows while it runs
+  [ -n "$NODE" ] || return 0
+  "$NODE" -e 'const fs=require("fs");const [f,st,msg,from,to]=process.argv.slice(1);let d={};try{d=JSON.parse(fs.readFileSync(f,"utf8"))}catch{}
+    if(st==="checking"||st==="downloading")d={startedAt:new Date().toISOString(),log:[]};
+    Object.assign(d,{state:st,at:new Date().toISOString()},from?{from}:{},to?{to}:{});if(msg){d.message=msg;(d.log=d.log||[]).push(msg);d.log=d.log.slice(-40)}
+    fs.writeFileSync(f+".tmp",JSON.stringify(d,null,2));fs.renameSync(f+".tmp",f)' "$UPDATE_STATUS" "$1" "${2:-}" "${UFROM:-}" "${UTO:-}" 2>/dev/null || true
+}
+step() { say "$1"; ustatus "$2" "$1"; }
+fail_update() { ustatus failed "$1"; die "$1"; }
+
+backup_code() {  # backup_code VERSION -> the folder
+  local dest="$BACKUP_DIR/v$1-$(date +%Y%m%d-%H%M%S)" item
+  mkdir -p "$dest" || return 1
+  for item in "${CODE_ITEMS[@]}"; do [ -e "$ROOT_DIR/$item" ] && cp -a "$ROOT_DIR/$item" "$dest/"; done
+  # newest 5 kept
+  ls -1dt "$BACKUP_DIR"/v* 2>/dev/null | tail -n +6 | while read -r old; do rm -rf "$old"; done
+  echo "$dest"
+}
+put_code() {  # put_code FROM_DIR: its code items replace ours. Removed first, then copied:
+  local from="$1" item     # a new file, never an overwrite, so this running script keeps its old copy
+  for item in "${CODE_ITEMS[@]}"; do
+    [ -e "$from/$item" ] || continue
+    rm -rf "${ROOT_DIR:?}/$item.ax-new"
+    cp -a "$from/$item" "$ROOT_DIR/$item.ax-new" || return 1
+  done
+  for item in "${CODE_ITEMS[@]}"; do
+    [ -e "$ROOT_DIR/$item.ax-new" ] || continue
+    rm -rf "${ROOT_DIR:?}/$item" && mv "$ROOT_DIR/$item.ax-new" "$ROOT_DIR/$item" || return 1
+  done
+  chmod +x "$ROOT_DIR"/bin/* "$ROOT_DIR"/*.sh 2>/dev/null
+  return 0
+}
+running_now() { healthy || [ -n "$(backend_pid)" ]; }
+restart_new() {  # the new bin/ax restarts it, and we wait for it to answer
+  AX_NONINTERACTIVE=1 bash "$ROOT_DIR/bin/ax" restart </dev/null >>"$RUNTIME_DIR/update.log" 2>&1
+  local i; for i in $(seq 1 120); do healthy && return 0; sleep 0.25; done
+  return 1
+}
+
+cmd_update() {
+  local mode=apply yes=0 force=0 a
+  for a in "$@"; do
+    case "$a" in
+      --check|check) mode=check ;;
+      --rollback|rollback) mode=rollback ;;
+      --yes|-y) yes=1 ;;
+      --force) force=1 ;;
+      *) die "unknown option: $a (ax update [--check|--yes|--rollback|--force])" ;;
+    esac
+  done
+  need_node
+  if [ -f /.dockerenv ]; then die "this copy runs in Docker: update it on the host with  git pull && docker compose up -d --build"; fi
+  [ "$mode" = rollback ] && { do_rollback; return; }
+
+  local cur new; cur="$(pkg_version "$ROOT_DIR/package.json")"
+  UFROM="$cur"; ustatus checking "Asking GitHub for the newest version"
+  spin_start "asking GitHub ($UPDATE_REPO) for the newest version"
+  new="$(latest_version)"; spin_stop
+  [ -n "$new" ] || fail_update "GitHub didn't answer (github.com/$UPDATE_REPO). Is this machine online?"
+  if ! ver_newer "$new" "$cur" && [ "$force" != 1 ]; then
+    ok "up to date ${DIM}(v$cur)${NC}"; UTO="$cur" ustatus current "Up to date (v$cur)"; return 0
+  fi
+  UTO="$new"
+  info "v$cur → ${B}v$new${NC}  ${DIM}github.com/$UPDATE_REPO${NC}"
+  if [ "$mode" = check ]; then ustatus available "v$new is available"; dim "  ax update installs it"; return 0; fi
+  if [ "$yes" != 1 ] && interactive; then
+    confirm "Update now? It restarts for a few seconds; workers, settings and the login are kept." y || { ustatus available "v$new is available"; return 1; }
+  fi
+  do_update "$cur" "$new"
+}
+
+do_update() {
+  local cur="$1" new="$2" tmp src bak was
+  : >"$RUNTIME_DIR/update.log"
+  tmp="$RUNTIME_DIR/update-download"
+  rm -rf "$tmp"; mkdir -p "$tmp" || fail_update "no room for a temporary folder"
+  step "Downloading v$new" downloading
+  curl -fsSL -m 300 "https://codeload.github.com/$UPDATE_REPO/tar.gz/refs/heads/$UPDATE_BRANCH" -o "$tmp/src.tgz" ||
+    fail_update "the download from GitHub failed"
+  mkdir -p "$tmp/src" && tar -xzf "$tmp/src.tgz" -C "$tmp/src" --strip-components=1 || fail_update "the download isn't a readable archive"
+  src="$tmp/src"
+  [ -f "$src/server.js" ] && [ -f "$src/package.json" ] && [ -f "$src/bin/ax" ] || fail_update "the download doesn't look like Alex-Aero"
+  new="$(pkg_version "$src/package.json")"; UTO="$new"
+  "$NODE" --check "$src/server.js" 2>>"$RUNTIME_DIR/update.log" || fail_update "v$new's server.js doesn't parse with this Node.js ($("$NODE" -v)); nothing was changed"
+
+  step "Keeping a copy of v$cur" installing
+  bak="$(backup_code "$cur")" || fail_update "couldn't back up the current version (disk full?)"
+  printf '%s\n' "$bak" >"$BACKUP_DIR/.last"
+  was=0; running_now && was=1
+
+  step "Installing v$new" installing
+  if ! put_code "$src"; then
+    put_code "$bak"; fail_update "copying v$new failed; v$cur was put back"
+  fi
+  rm -rf "$tmp"
+  # a git checkout follows along (only forward: commits of its own are never dropped)
+  if [ -d "$ROOT_DIR/.git" ] && command -v git >/dev/null 2>&1 && git -C "$ROOT_DIR" fetch -q origin "$UPDATE_BRANCH" 2>/dev/null &&
+     git -C "$ROOT_DIR" merge-base --is-ancestor HEAD FETCH_HEAD 2>/dev/null; then
+    git -C "$ROOT_DIR" reset -q --mixed FETCH_HEAD 2>/dev/null || true
+  fi
+
+  if [ "$was" = 1 ]; then
+    step "Restarting with v$new" restarting
+    if restart_new; then
+      ok "updated to ${B}v$new${NC} and running"; ustatus done "Updated to v$new"
+    else
+      bad "v$new didn't come up; putting v$cur back"; ustatus restarting "v$new didn't come up; putting v$cur back"
+      put_code "$bak"
+      if restart_new; then fail_update "v$new didn't start, so v$cur is back and running. The log: $RUNTIME_DIR/update.log"
+      else fail_update "neither version answered after the update. Check: ax logs"; fi
+    fi
+  else
+    ok "updated to ${B}v$new${NC} ${DIM}(it wasn't running: ax up starts it)${NC}"; ustatus done "Updated to v$new"
+  fi
+  dim "  the old version is kept: ax update --rollback"
+}
+
+do_rollback() {
+  local bak cur old
+  bak="$(cat "$BACKUP_DIR/.last" 2>/dev/null)"
+  [ -n "$bak" ] && [ -d "$bak" ] || bak="$(ls -1dt "$BACKUP_DIR"/v* 2>/dev/null | head -1)"
+  [ -n "$bak" ] && [ -f "$bak/server.js" ] || die "there's no earlier version kept in $BACKUP_DIR"
+  cur="$(pkg_version "$ROOT_DIR/package.json")"; old="$(pkg_version "$bak/package.json")"
+  info "v$cur → ${B}v$old${NC} ${DIM}($bak)${NC}"
+  if interactive; then confirm "Go back to v$old?" y || return 1; fi
+  UFROM="$cur" UTO="$old" ustatus installing "Going back to v$old"
+  local was=0; running_now && was=1
+  put_code "$bak" || die "copying v$old back failed"
+  rm -f "$BACKUP_DIR/.last"
+  if [ "$was" = 1 ]; then
+    if restart_new; then ok "back on ${B}v$old${NC} and running"; UFROM="$cur" UTO="$old" ustatus done "Back on v$old"
+    else UFROM="$cur" UTO="$old" ustatus failed "v$old didn't answer after going back"; die "v$old didn't answer: ax logs"; fi
+  else ok "back on ${B}v$old${NC}"; UFROM="$cur" UTO="$old" ustatus done "Back on v$old"; fi
+}
+
 # -------------------------------------------------------------------- home
 cmd_home() {
   banner "$VERSION"
@@ -688,6 +843,7 @@ cmd_home() {
     if autostart_on; then items+=($'autooff\tTurn autostart off\tno service, start by hand')
     else items+=($'autoon\tTurn autostart on\tstart at boot, restart on crash'); fi
     items+=($'doctor\tCheck this machine\tnode, nginx, workerd, ports')
+    items+=($'update\tCheck for updates\tthe newest version from GitHub')
     items+=($'setup\tStart over\treset login & domain, keep workers')
     items+=($'quit\tQuit\t')
     ch="$(menu_choose "What would you like to do?" "${items[@]}")" || { printf '\n  %sbye%s\n\n' "$DIM" "$NC"; return 0; }
@@ -703,6 +859,7 @@ cmd_home() {
       autoon)  cmd_autostart on; pause ;;
       autooff) confirm "Turn autostart off? This also stops Alex-Aero." n && cmd_autostart off; pause ;;
       doctor)  cmd_doctor; pause ;;
+      update)  cmd_update; pause ;;
       setup)   cmd_setup && start_now; pause ;;
       quit)    printf '  %sbye%s\n\n' "$DIM" "$NC"; return 0 ;;
     esac
@@ -724,6 +881,7 @@ usage() {
   ${B}ax domain${NC}                 Cloudflare domain + tunnel
   ${B}ax doctor${NC} [--fix]         check / install node, nginx, workerd, cloudflared
   ${B}ax autostart${NC} on|off       start at boot, restart on crash
+  ${B}ax update${NC} [--check]       the newest version from GitHub ${DIM}(--rollback: the one before)${NC}
 
   ${DIM}ports: PUBLIC_PORT=$PUBLIC_PORT BACKEND_PORT=$BACKEND_PORT (env to change)
   ax only touches its own processes; other apps on this box are left alone.${NC}
@@ -744,6 +902,7 @@ case "${1:-}" in
   domain|tunnel)   cmd_domain ;;
   doctor)          shift; cmd_doctor "$@" ;;
   autostart|service) shift; cmd_autostart "$@" ;;
+  update|upgrade)  shift; cmd_update "$@" ;;
   version|-v|--version) echo "$VERSION" ;;
   help|-h|--help)  usage ;;
   *)               bad "unknown command: $1"; usage; exit 2 ;;
