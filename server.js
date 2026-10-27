@@ -3753,18 +3753,22 @@ function isProtectedManagementPath(pathname) {
 // Without this check a random website could create a Python worker = run
 // code on the Pi. Browsers send Sec-Fetch-Site and/or Origin; curl sends neither.
 function isCrossSiteRequest(req) {
-  const site = String(req.headers['sec-fetch-site'] || '');
-  if (site && site !== 'same-origin' && site !== 'none') return true;
+  // Browsers say where a request comes from themselves (Sec-Fetch-Site), and
+  // pages can't fake it: trust that when it's there. A proxy in front (Aegis ×
+  // Burrow, nginx, Cloudflare) may rewrite Origin to the address it reaches
+  // this server on while X-Forwarded-Host keeps the public name, so comparing
+  // the two would turn away every sign-in.
+  const site = String(req.headers['sec-fetch-site'] || '').toLowerCase();
+  if (site) return site !== 'same-origin' && site !== 'none';
+  // No Sec-Fetch-Site (an older browser): Origin must be one of the names we're reached by.
   const origin = req.headers.origin;
-  if (origin && origin !== 'null') {
-    try {
-      const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
-      return new URL(origin).host !== host;
-    } catch (_) {
-      return true;
-    }
-  }
-  return origin === 'null';
+  if (!origin) return false;
+  if (origin === 'null') return true;
+  let oh;
+  try { oh = new URL(origin).host.toLowerCase(); } catch (_) { return true; }
+  const names = [req.headers.host, ...String(req.headers['x-forwarded-host'] || '').split(',')]
+    .map((x) => String(x || '').trim().toLowerCase()).filter(Boolean);
+  return !names.includes(oh);
 }
 
 class HttpError extends Error {
