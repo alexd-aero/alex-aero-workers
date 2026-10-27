@@ -43,7 +43,10 @@ say "found it in $DIR ($(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$DIR/packa
 # the newest ax first: older installs don't have `ax update` yet
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 say "downloading the newest version from github.com/$REPO"
-curl -fsSL -m 300 "https://codeload.github.com/$REPO/tar.gz/refs/heads/$BRANCH" -o "$tmp/src.tgz" || die "the download from GitHub failed"
+# the branch's newest commit (GitHub's API): branch downloads are cached for minutes, a commit's never go stale
+ref="$(curl -fsSL -m 15 -H 'Accept: application/vnd.github.sha' "https://api.github.com/repos/$REPO/commits/$BRANCH" 2>/dev/null)"
+[[ "$ref" =~ ^[0-9a-f]{40}$ ]] || ref="refs/heads/$BRANCH"
+curl -fsSL -m 300 "https://codeload.github.com/$REPO/tar.gz/$ref" -o "$tmp/src.tgz" || die "the download from GitHub failed"
 tar -xzf "$tmp/src.tgz" -C "$tmp" --strip-components=1 || die "the download isn't a readable archive"
 [ -f "$tmp/bin/ax" ] && [ -f "$tmp/bin/ui.sh" ] || die "the download doesn't look like Alex-Aero"
 for f in ax ui.sh; do
